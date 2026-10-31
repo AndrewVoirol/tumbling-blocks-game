@@ -1,10 +1,15 @@
 :root {
-  --bg-obsidian: rgba(14, 13, 16, 0.76);
-  --bg-obsidian-strong: rgba(16, 14, 19, 0.88);
-  --border-brass: rgba(218, 178, 108, 0.28);
-  --border-brass-bright: rgba(238, 198, 124, 0.58);
+  --bg-obsidian: rgba(15, 13, 18, 0.78);
+  --bg-obsidian-strong: rgba(17, 15, 21, 0.89);
+  --came-copper: rgba(208, 160, 96, 0.56);
+  --came-copper-bright: rgba(238, 196, 126, 0.76);
+  --came-pewter-dark: rgba(10, 8, 11, 0.94);
+  --bevel-top: rgba(255, 248, 230, 0.16);
+  --bevel-left: rgba(242, 208, 150, 0.11);
+  --bevel-right: rgba(6, 5, 9, 0.36);
+  --bevel-bottom: rgba(4, 3, 7, 0.46);
   --text-ivory: #f6f1e7;
-  --text-muted: #b6aca0;
+  --text-muted: #b8aea2;
   --accent-gold: #eab308;
   --accent-amber: #f59e0b;
   --accent-ruby: #ef4444;
@@ -63,22 +68,56 @@ body,
   flex-wrap: wrap;
 }
 
+/* Beveled Stained-Glass Block Panel:
+ * Zero rounded corners; outer patinated pewter + copper-foil came frame,
+ * 4px 45-degree mitered cut-glass bevel facets, and crisp inner bevel ridge shoulder.
+ */
 .glass-panel {
+  position: relative;
   pointer-events: auto;
+  border-radius: 0;
   background: var(--bg-obsidian);
-  backdrop-filter: blur(14px) saturate(135%);
-  -webkit-backdrop-filter: blur(14px) saturate(135%);
-  border: 1px solid var(--border-brass);
-  border-radius: 14px;
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1.5px solid var(--came-copper);
+  outline: 1px solid var(--came-pewter-dark);
   box-shadow:
-    0 12px 32px rgba(0, 0, 0, 0.45),
-    inset 0 1px 0 rgba(255, 244, 218, 0.08);
+    0 14px 34px rgba(0, 0, 0, 0.52),
+    0 2px 6px rgba(0, 0, 0, 0.42);
+}
+
+/* 45-degree mitered sloped cut-glass bevel facets around all 4 edges */
+.glass-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+  border-style: solid;
+  border-width: 4px;
+  border-top-color: var(--bevel-top);
+  border-left-color: var(--bevel-left);
+  border-right-color: var(--bevel-right);
+  border-bottom-color: var(--bevel-bottom);
+}
+
+/* Crisp inner cut-glass bevel shoulder hairline */
+.glass-panel::after {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  pointer-events: none;
+  z-index: 2;
+  border-top: 1px solid rgba(255, 245, 220, 0.22);
+  border-left: 1px solid rgba(238, 202, 140, 0.16);
+  border-right: 1px solid rgba(218, 178, 108, 0.10);
+  border-bottom: 1px solid rgba(218, 178, 108, 0.12);
 }
 
 /* Top-Left Brand & Score Card */
 .brand-panel {
-  padding: 14px 16px;
-  min-width: 300px;
+  padding: 15px 17px;
+  min-width: 306px;
   display: flex;
   flex-direction: column;
   gap: 11px;
@@ -110,34 +149,41 @@ body,
 
 .mode-tabs {
   display: flex;
-  gap: 4px;
-  background: rgba(0, 0, 0, 0.36);
-  padding: 3px;
-  border-radius: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  gap: 2px;
+  background: rgba(5, 4, 7, 0.52);
+  padding: 2px;
+  border-radius: 0;
+  border: 1px solid rgba(208, 160, 96, 0.24);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
 }
 
 .mode-tab {
   flex: 1;
   background: transparent;
-  border: none;
+  border: 1px solid transparent;
+  border-radius: 0;
   color: var(--text-muted);
   font-size: 0.76rem;
   font-weight: 500;
   padding: 5px 10px;
-  border-radius: 6px;
   cursor: pointer;
-  transition: all 0.16s ease;
+  transition: background-color 0.14s ease, color 0.14s ease, border-color 0.14s ease;
 }
 
 .mode-tab:hover {
   color: var(--text-ivory);
+  background: rgba(255, 248, 230, 0.05);
 }
 
 .mode-tab.active {
-  background: rgba(218, 178, 108, 0.22);
-  color: #fde6b0;
-  box-shadow: inset 0 0 0 1px rgba(238, 198, 124, 0.38);
+  background: linear-gradient(180deg, rgba(226, 182, 108, 0.26) 0%, rgba(180, 132, 64, 0.18) 100%);
+  color: #fde8b4;
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 245, 214, 0.48);
+  border-left-color: rgba(242, 206, 142, 0.36);
+  border-right-color: rgba(120, 84, 34, 0.5);
+  border-bottom-color: rgba(96, 66, 24, 0.6);
 }
 
 .turn-banner {
@@ -145,8 +191,10 @@ body,
   align-items: center;
   justify-content: space-between;
   padding: 6px 10px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.04);
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(208, 160, 96, 0.22);
+  box-shadow: inset 1px 1px 0 rgba(255, 248, 230, 0.06);
   font-size: 0.8rem;
 }
 
@@ -157,10 +205,13 @@ body,
   font-weight: 600;
 }
 
+/* Diamond lozenge stained-glass jewel indicator */
 .player-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 0;
+  transform: rotate(45deg);
+  border: 1px solid rgba(255, 255, 255, 0.5);
   box-shadow: 0 0 8px currentColor;
 }
 
@@ -173,12 +224,17 @@ body,
 }
 
 .mini-btn {
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.07);
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 246, 224, 0.28);
+  border-left-color: rgba(238, 202, 140, 0.2);
+  border-right-color: rgba(10, 8, 12, 0.65);
+  border-bottom-color: rgba(8, 6, 10, 0.75);
+  border-radius: 0;
   color: var(--text-ivory);
   width: 20px;
   height: 20px;
-  border-radius: 5px;
   cursor: pointer;
   font-size: 0.75rem;
   display: inline-flex;
@@ -187,28 +243,35 @@ body,
 }
 
 .mini-btn:hover {
-  background: rgba(218, 178, 108, 0.25);
+  background: rgba(218, 178, 108, 0.26);
+  border-color: var(--came-copper-bright);
 }
 
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
+  gap: 7px;
   padding-top: 2px;
 }
 
 .stat-cell {
-  background: rgba(0, 0, 0, 0.26);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 8px;
+  background: rgba(6, 5, 9, 0.38);
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 245, 220, 0.16);
+  border-left-color: rgba(238, 202, 140, 0.12);
+  border-right-color: rgba(0, 0, 0, 0.5);
+  border-bottom-color: rgba(0, 0, 0, 0.6);
+  border-radius: 0;
   padding: 6px 8px;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  box-shadow: inset 1px 1px 0 rgba(255, 248, 230, 0.04);
 }
 
 .stat-label {
-  font-size: 0.65rem;
+  font-size: 0.64rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-muted);
@@ -235,53 +298,72 @@ body,
 }
 
 .toolbar-panel {
-  padding: 8px 10px;
+  padding: 9px 11px;
   display: flex;
   align-items: center;
   gap: 7px;
 }
 
 .icon-btn {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.055);
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 246, 224, 0.24);
+  border-left-color: rgba(238, 202, 140, 0.18);
+  border-right-color: rgba(8, 6, 10, 0.62);
+  border-bottom-color: rgba(6, 5, 8, 0.72);
+  border-radius: 0;
   color: var(--text-ivory);
-  height: 34px;
+  height: 32px;
   padding: 0 10px;
-  border-radius: 8px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 0.76rem;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  box-shadow: inset 1px 1px 0 rgba(255, 248, 230, 0.06);
+  transition: background-color 0.14s ease, border-color 0.14s ease;
 }
 
 .icon-btn:hover {
-  background: rgba(218, 178, 108, 0.2);
-  border-color: var(--border-brass-bright);
+  background: rgba(218, 178, 108, 0.22);
+  border-color: var(--came-copper-bright);
 }
 
 .icon-btn.danger-accent {
-  background: rgba(239, 68, 68, 0.16);
-  border-color: rgba(239, 68, 68, 0.42);
+  background: rgba(225, 43, 56, 0.18);
+  border-top-color: rgba(255, 165, 165, 0.48);
+  border-left-color: rgba(248, 113, 113, 0.38);
+  border-right-color: rgba(127, 29, 29, 0.65);
+  border-bottom-color: rgba(99, 20, 20, 0.75);
   color: #fecaca;
 }
 
 .icon-btn.danger-accent:hover {
-  background: rgba(239, 68, 68, 0.28);
+  background: rgba(225, 43, 56, 0.3);
 }
 
 .light-select {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.055);
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 246, 224, 0.24);
+  border-left-color: rgba(238, 202, 140, 0.18);
+  border-right-color: rgba(8, 6, 10, 0.62);
+  border-bottom-color: rgba(6, 5, 8, 0.72);
+  border-radius: 0;
   color: var(--text-ivory);
-  height: 34px;
+  height: 32px;
   padding: 0 9px;
-  border-radius: 8px;
   font-size: 0.75rem;
   cursor: pointer;
   outline: none;
+}
+
+.light-select:hover,
+.light-select:focus {
+  border-color: var(--came-copper-bright);
 }
 
 .light-select option {
@@ -289,9 +371,9 @@ body,
   color: var(--text-ivory);
 }
 
-/* Plumb-Bob Stability Spirit Level */
+/* Plumb-Bob Stability Gauge — Square Leaded Quarry matching the 7.5 x 7.5 cm Tower Base Inlay */
 .plumb-panel {
-  padding: 10px 14px;
+  padding: 11px 15px;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -301,9 +383,17 @@ body,
   position: relative;
   width: 44px;
   height: 44px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(238, 198, 124, 0.09) 0%, rgba(0, 0, 0, 0.5) 100%);
-  border: 1px solid var(--border-brass-bright);
+  border-radius: 0;
+  background:
+    linear-gradient(to right, transparent 49%, rgba(218, 178, 108, 0.16) 49%, rgba(218, 178, 108, 0.16) 51%, transparent 51%),
+    linear-gradient(to bottom, transparent 49%, rgba(218, 178, 108, 0.16) 49%, rgba(218, 178, 108, 0.16) 51%, transparent 51%),
+    radial-gradient(circle, rgba(238, 198, 124, 0.1) 0%, rgba(4, 3, 7, 0.62) 100%);
+  border-style: solid;
+  border-width: 1.5px;
+  border-top-color: rgba(255, 242, 204, 0.58);
+  border-left-color: rgba(238, 198, 124, 0.48);
+  border-right-color: rgba(140, 102, 48, 0.52);
+  border-bottom-color: rgba(116, 82, 36, 0.62);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -312,18 +402,19 @@ body,
 .plumb-ring-inner {
   width: 20px;
   height: 20px;
-  border-radius: 50%;
-  border: 1px dashed rgba(238, 198, 124, 0.35);
+  border-radius: 0;
+  border: 1px dashed rgba(238, 198, 124, 0.38);
 }
 
 .plumb-dot {
   position: absolute;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 8px;
+  border-radius: 0;
+  transform: translate(-50%, -50%) rotate(45deg);
+  border: 1px solid rgba(255, 255, 255, 0.65);
   transition: background-color 0.15s ease;
-  box-shadow: 0 0 10px currentColor;
+  box-shadow: 0 0 9px currentColor;
 }
 
 .plumb-readout {
@@ -358,8 +449,8 @@ body,
 }
 
 .coach-pill {
-  padding: 12px 20px;
-  max-width: 680px;
+  padding: 13px 22px;
+  max-width: 690px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -382,16 +473,24 @@ body,
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 3px 8px;
-  border-radius: 999px;
+  padding: 3px 9px;
+  border-radius: 0;
   background: rgba(234, 179, 8, 0.18);
-  border: 1px solid rgba(234, 179, 8, 0.45);
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(254, 240, 138, 0.62);
+  border-left-color: rgba(250, 204, 21, 0.48);
+  border-right-color: rgba(161, 98, 7, 0.58);
+  border-bottom-color: rgba(133, 77, 14, 0.68);
   color: #fde68a;
 }
 
 .step-chip.place {
   background: rgba(16, 185, 129, 0.2);
-  border-color: rgba(16, 185, 129, 0.5);
+  border-top-color: rgba(167, 243, 208, 0.62);
+  border-left-color: rgba(52, 211, 153, 0.48);
+  border-right-color: rgba(6, 95, 70, 0.62);
+  border-bottom-color: rgba(6, 78, 59, 0.72);
   color: #a7f3d0;
 }
 
@@ -414,18 +513,26 @@ body,
 .swatch-tag {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
+  gap: 7px;
+  padding: 2px 9px;
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.065);
+  border: 1px solid rgba(208, 160, 96, 0.28);
   color: var(--text-ivory);
   font-size: 0.73rem;
 }
 
+/* Miniature 3:1 glass block swatch preview */
 .swatch-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  width: 14px;
+  height: 7px;
+  border-radius: 0;
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 255, 255, 0.65);
+  border-left-color: rgba(255, 255, 255, 0.45);
+  border-right-color: rgba(0, 0, 0, 0.45);
+  border-bottom-color: rgba(0, 0, 0, 0.55);
 }
 
 /* Resistance Meter Bar */
@@ -438,31 +545,40 @@ body,
 
 .resistance-track {
   flex: 1;
-  height: 6px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.12);
+  height: 8px;
+  border-radius: 0;
+  background: rgba(4, 3, 7, 0.62);
+  border: 1px solid rgba(208, 160, 96, 0.32);
   overflow: hidden;
 }
 
 .resistance-fill {
   height: 100%;
-  border-radius: 999px;
+  border-radius: 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
   transition: width 0.06s linear;
 }
 
+/* Silver-Stain Amber Beveled Glass Block CTA Button */
 .primary-action-btn {
-  background: linear-gradient(135deg, #eab308 0%, #d97706 100%);
-  border: 1px solid rgba(255, 245, 210, 0.45);
-  color: #14110b;
+  background: linear-gradient(180deg, #f3be26 0%, #d97706 100%);
+  border-style: solid;
+  border-width: 2px;
+  border-top-color: rgba(255, 251, 232, 0.78);
+  border-left-color: rgba(255, 236, 178, 0.58);
+  border-right-color: rgba(146, 82, 12, 0.78);
+  border-bottom-color: rgba(114, 58, 8, 0.88);
+  outline: 1px solid var(--came-pewter-dark);
+  border-radius: 0;
+  color: #141008;
   font-weight: 600;
   font-size: 0.82rem;
-  padding: 7px 16px;
-  border-radius: 9px;
+  padding: 6px 16px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  box-shadow: 0 4px 16px rgba(234, 179, 8, 0.3);
+  box-shadow: 0 4px 16px rgba(234, 179, 8, 0.28);
   transition: transform 0.12s ease, filter 0.12s ease;
 }
 
@@ -471,17 +587,27 @@ body,
   transform: translateY(-1px);
 }
 
-/* Collapse Summary Card */
+/* Collapse Summary Card (Selenium Ruby Came Accent) */
 .collapse-card {
-  padding: 18px 24px;
-  max-width: 480px;
+  padding: 19px 25px;
+  max-width: 486px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 12px;
   text-align: center;
-  background: rgba(18, 14, 20, 0.9);
-  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(19, 13, 18, 0.91);
+  border-color: rgba(225, 72, 78, 0.62);
+}
+
+.collapse-card::before {
+  border-top-color: rgba(255, 196, 196, 0.18);
+  border-left-color: rgba(248, 148, 148, 0.12);
+}
+
+.collapse-card::after {
+  border-top-color: rgba(252, 165, 165, 0.24);
+  border-left-color: rgba(248, 113, 113, 0.16);
 }
 
 .collapse-title {
@@ -494,14 +620,14 @@ body,
 .collapse-desc {
   font-size: 0.83rem;
   color: var(--text-muted);
-  line-height: 1.4;
+  line-height: 1.42;
 }
 
 /* Quick Help Modal Popover */
 .help-modal-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(6, 5, 8, 0.62);
+  background: rgba(6, 5, 8, 0.66);
   backdrop-filter: blur(5px);
   display: flex;
   align-items: center;
@@ -512,9 +638,9 @@ body,
 }
 
 .help-card {
-  max-width: 520px;
+  max-width: 526px;
   width: 100%;
-  padding: 24px 26px;
+  padding: 25px 27px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -536,25 +662,35 @@ body,
 .help-steps {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 11px;
 }
 
 .help-step {
   display: flex;
   gap: 12px;
   align-items: flex-start;
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(6, 5, 9, 0.42);
   padding: 10px 12px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 0;
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(255, 245, 220, 0.16);
+  border-left-color: rgba(238, 202, 140, 0.12);
+  border-right-color: rgba(0, 0, 0, 0.5);
+  border-bottom-color: rgba(0, 0, 0, 0.6);
 }
 
 .help-num {
   width: 24px;
   height: 24px;
-  border-radius: 50%;
+  border-radius: 0;
   background: rgba(234, 179, 8, 0.22);
-  border: 1px solid rgba(234, 179, 8, 0.5);
+  border-style: solid;
+  border-width: 1px;
+  border-top-color: rgba(254, 240, 138, 0.65);
+  border-left-color: rgba(250, 204, 21, 0.48);
+  border-right-color: rgba(161, 98, 7, 0.6);
+  border-bottom-color: rgba(133, 77, 14, 0.7);
   color: #fde68a;
   font-size: 0.78rem;
   font-weight: 700;
@@ -593,12 +729,12 @@ body,
   }
   .brand-panel {
     min-width: 240px;
-    padding: 10px 12px;
+    padding: 11px 13px;
   }
   .plumb-panel {
     display: none;
   }
   .coach-pill {
-    padding: 10px 14px;
+    padding: 11px 15px;
   }
 }

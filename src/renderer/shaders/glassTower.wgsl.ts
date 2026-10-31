@@ -206,14 +206,23 @@ fn traceTowerGlassRayDispersed(
   var throughput = exp(-sigma0 * pathLen0 * 0.88);
   throughput *= (1.0 - vitrailExit.cameMask * 0.65);
 
-  // Suspended 3D seed air bubbles & internal stress fractures inside block 0!
+  // Suspended 3D seed air bubbles & internal planar cleavage cracks inside block 0!
   let bubbleSparkle = evaluateSeedBubbles(roLocal, rdLocal, box0.tFar, seed0);
-  let midLocal = roLocal + rdLocal * (box0.tFar * 0.5);
+  let midLocal = roLocal + rdLocal * (box0.tFar * 0.38);
+  let farLocal = roLocal + rdLocal * (box0.tFar * 0.74);
   let crackMask = max(
     evaluateInternalCracks(roLocal, blk0.crackAndDamage.xyz, blk0.crackAndDamage.w, seed0),
-    evaluateInternalCracks(midLocal, blk0.crackAndDamage.xyz, blk0.crackAndDamage.w, seed0)
+    max(
+      evaluateInternalCracks(midLocal, blk0.crackAndDamage.xyz, blk0.crackAndDamage.w, seed0),
+      evaluateInternalCracks(farLocal, blk0.crackAndDamage.xyz, blk0.crackAndDamage.w, seed0)
+    )
   );
-  let internalScatter = (bubbleSparkle * 0.42 + crackMask * 1.15) * (sunColor * 0.32 + skyTint * 0.45) * throughput;
+  // Air-film internal cleavage planes: subtle transmission shadow + oblique TIR silver glint (never flat white paint!)
+  let crackOblique = pow(1.0 - abs(rdLocal.x * 0.6 + rdLocal.z * 0.8), 2.0);
+  throughput *= (1.0 - crackMask * 0.32);
+  let internalScatter =
+    bubbleSparkle * 0.42 * (sunColor * 0.32 + skyTint * 0.45) * throughput +
+    crackMask * (0.28 + 0.65 * crackOblique) * (sunColor * 0.28 + skyTint * 0.52) * mix(vec3<f32>(1.0), throughput, 0.55);
 
   // 2. Continue ray through up to 2 stained-glass blocks behind primaryIdx in the Jenga tower!
   let blockCount = u32(uScene.sunDirAndBlockCount.w);
@@ -346,9 +355,10 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
 
   var glassFinal = mix(refractedRGB, envReflection, fresnel) + sunSpec + glassSheen;
 
-  // Surface craze highlight if block has internal stress fractures
+  // Crisp grazing-angle Fresnel glint along surface-breaking hairline cleavage cracks
   let surfCrack = evaluateInternalCracks(input.localPos, blk.crackAndDamage.xyz, blk.crackAndDamage.w, seed);
-  glassFinal += surfCrack * (sunColor * 0.45 + vec3<f32>(0.35, 0.4, 0.48)) * (0.4 + 0.6 * (1.0 - cosTheta));
+  let crackSpec = pow(max(0.0, dot(normalize(glassNormal + vec3<f32>(0.22, 0.08, -0.18)), H)), 56.0);
+  glassFinal += surfCrack * (sunColor * crackSpec * 1.15 + skyTint * 0.32 * pow(1.0 - cosTheta, 2.0));
 
   // Blend soldered came over stained glass with smooth anti-aliased transition
   let smoothCame = smoothstep(0.15 - aaFilter * 2.0, 0.85 + aaFilter * 2.0, vitrail.cameMask);

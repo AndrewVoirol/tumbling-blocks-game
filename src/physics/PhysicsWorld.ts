@@ -65,6 +65,11 @@ export interface GlassShardState {
   rippleSeed: number;
   position: Vec3;
   rotation: Quat;
+  volume: number;
+  preVy: number;
+  impactLocalPos: Vec3;
+  planes: Float32Array;
+  planeCount: number;
   /** Offset & vertex count inside the shared GPU shard vertex buffer */
   firstVertex: number;
   vertexCount: number;
@@ -121,9 +126,9 @@ export interface ShardMeshAppendEvent {
 const GROUP_TABLE = (0x0001 << 16) | 0xffff;
 const GROUP_BLOCK_ON_TABLE = (0x0002 << 16) | 0xffff;
 const GROUP_FREEFALL_OFF_RIM = (0x0002 << 16) | 0xfffe; // Excludes GROUP_TABLE once past circular table radius!
-const GROUP_SHARD_ON_TABLE = (0x0004 << 16) | 0x0003;   // Collides with Table + Intact Blocks (zero O(N^2) shard-pile GJK stalls!)
-const GROUP_SHARD_OFF_RIM = (0x0004 << 16) | 0x0002;
-const MAX_ACTIVE_SHARDS = 180;
+const GROUP_SHARD_ON_TABLE = (0x0004 << 16) | 0x0007;   // Collides with Table + Intact Blocks + Other Shards!
+const GROUP_SHARD_OFF_RIM = (0x0004 << 16) | 0x0006;    // Excludes Table once past circular rim
+const MAX_ACTIVE_SHARDS = 220;
 const MAX_SHARD_VERTICES = 65536;
 const MAX_SPLINTERS = 320;
 
@@ -763,9 +768,67 @@ export class PhysicsWorld {
       const rb = this.world.getRigidBody(b.bodyHandle);
       if (!rb) continue;
       const lv = rb.linvel();
+      const av = rb.angvel();
       b.linVel[0] = lv.x;
       b.linVel[1] = lv.y;
       b.linVel[2] = lv.z;
+      b.angVel[0] = av.x;
+      b.angVel[1] = av.y;
+      b.angVel[2] = av.z;
+    }
+    for (let i = 0; i < this.shards.length; i++) {
+      const s = this.shards[i];
+      const rb = this.world.getRigidBody(s.bodyHandle);
+      if (rb && !rb.isSleeping()) {
+        s.preVy = rb.linvel().y;
+      } else {
+        s.preVy = 0;
+      }
+    }
+  }
+
+  private spawnGlassCulletChips(
+    worldOrigin: Vec3,
+    baseLinVelSim: { x: number; y: number; z: number },
+    impactNormal: Vec3,
+    swatchId: number,
+    count: number,
+    speedScale: number
+  ): void {
+    for (let i = 0; i < count; i++) {
+      if (this.splinters.length >= MAX_SPLINTERS) {
+        this.splinters.shift();
+      }
+      const theta = Math.random() * Math.PI * 2;
+      const latSpd = (0.8 + Math.random() * 4.6) * speedScale;
+      // Tangent splay + modest bounce along impactNormal (all in real wall-clock dm/s)
+      const vx =
+        baseLinVelSim.x * SIM_TIME_SCALE * 0.35 +
+        Math.cos(theta) * latSpd +
+        impactNormal[0] * latSpd * 0.25;
+      const vy =
+        Math.max(-1.5, baseLinVelSim.y * SIM_TIME_SCALE * 0.15) +
+        (0.45 + Math.random() * 2.1) * speedScale +
+        Math.max(0, impactNormal[1]) * 0.8;
+      const vz =
+        baseLinVelSim.z * SIM_TIME_SCALE * 0.35 +
+        Math.sin(theta) * latSpd +
+        impactNormal[2] * latSpd * 0.25;
+
+      this.splinters.push({
+        pos: [
+          worldOrigin[0] + (Math.random() - 0.5) * 0.10,
+          Math.max(0.012, worldOrigin[1] + (Math.random() - 0.5) * 0.05),
+          worldOrigin[2] + (Math.random() - 0.5) * 0.10,
+        ],
+        vel: [vx, vy, vz],
+        rot: Math.random() * Math.PI * 2,
+        rotSpeed: (Math.random() - 0.5) * 28,
+        scale: 0.008 + Math.random() * 0.013,
+        swatchId,
+        life: 0,
+        maxLife: 6.5 + Math.random() * 4.5,
+      });
     }
   }
 
@@ -777,6 +840,7 @@ export class PhysicsWorld {
       localHit: Vec3;
       impactSpeed: number;
       worldNormal: Vec3;
+      hitTable: boolean;
     }> = [];
 
     for (let i = 0; i < this.blocks.length; i++) {
@@ -786,14 +850,20 @@ export class PhysicsWorld {
       if (!rb || rb.isSleeping()) continue;
 
       const post = rb.linvel();
+      const postAv = rb.angvel();
       const dvx = post.x - blk.linVel[0];
       const dvy = post.y - blk.linVel[1];
       const dvz = post.z - blk.linVel[2];
+      const dawx = postAv.x - blk.angVel[0];
+      const dawy = postAv.y - blk.angVel[1];
+      const dawz = postAv.z - blk.angVel[2];
+
       // Subtract free-fall gravity delta over 1 substep so pure airborne free-fall doesn't count as contact shock
       const nonGravDvy = dvy - SIM_GRAVITY_Y * PHYSICS_DT;
-      const shock = Math.hypot(dvx, nonGravDvy, dvz) * SIM_TIME_SCALE;
+      const comShock = Math.hypot(dvx, nonGravDvy, dvz) * SIM_TIME_SCALE;
+      const rotShockApprox = Math.hypot(dawx, dawy, dawz) * 0.22 * SIM_TIME_SCALE;
 
-      if (shock < 1.55) continue;
+      if (comShock + rotShockApprox < 1.55) continue;
 
       // Only query narrowphase contacts for this specific impacting block!
       const col = this.world.getCollider(blk.colliderHandle);
@@ -823,54 +893,94 @@ export class PhysicsWorld {
 
       if (!hasRealContact) continue;
 
+      // Evaluate local contact-point shock including angular slap (dw x r_hit) for corner/end impacts
+      const rot = rb.rotation();
+      const q: Quat = [rot.x, rot.y, rot.z, rot.w];
+      const rWorld = quatRotateVec3(q, localHit);
+      const pvx = dvx + (dawy * rWorld[2] - dawz * rWorld[1]) * 0.65;
+      const pvy = nonGravDvy + (dawz * rWorld[0] - dawx * rWorld[2]) * 0.65;
+      const pvz = dvz + (dawx * rWorld[1] - dawy * rWorld[0]) * 0.65;
+      const pointShock = Math.hypot(pvx, pvy, pvz) * SIM_TIME_SCALE;
+      const shock = comShock * 0.48 + pointShock * 0.52;
+
       if (shock > 1.75) {
         const clinkIntensity = Math.min(1.0, (shock - 1.5) / 14.0);
         this.audio.playGlassImpact(clinkIntensity, hitTable ? 0.92 : 1.08);
       }
 
       const effectiveShock = shock * (hitTable ? 1.12 : 0.94);
-      if (effectiveShock >= SHATTER_IMPACT_SPEED) {
+      // Griffith brittle crack propagation: pre-crazed glass has reduced fracture toughness on subsequent impacts
+      const shatterThreshold = SHATTER_IMPACT_SPEED * (1.0 - Math.min(0.85, blk.damage) * 0.42);
+
+      if (effectiveShock >= shatterThreshold) {
         blocksToShatter.push({
           blk,
           localHit,
           impactSpeed: effectiveShock,
           worldNormal,
+          hitTable,
         });
       } else if (effectiveShock >= CRAZE_IMPACT_SPEED) {
+        const prevDamage = blk.damage;
         const addedDamage =
           0.38 +
           ((effectiveShock - CRAZE_IMPACT_SPEED) /
             (SHATTER_IMPACT_SPEED - CRAZE_IMPACT_SPEED)) *
             0.52;
         blk.damage += addedDamage;
-        blk.crackLocalOrigin = [...localHit];
+        if (prevDamage < 0.05 || addedDamage > 0.52) {
+          blk.crackLocalOrigin = [...localHit];
+        }
         if (blk.damage >= 1.0) {
           blocksToShatter.push({
             blk,
             localHit,
             impactSpeed: effectiveShock,
             worldNormal,
+            hitTable,
           });
         } else {
+          // Spall a few tiny glass micro-chips right off the crazed impact point
+          const pos = rb.translation();
+          const hitWorld: Vec3 = [pos.x + rWorld[0], pos.y + rWorld[1], pos.z + rWorld[2]];
+          this.spawnGlassCulletChips(hitWorld, post, worldNormal, blk.swatchId, 5, 0.55);
           this.audio.playGlassCrack(Math.min(1.0, blk.damage));
         }
       }
     }
 
+    // Secondary crystalline shard-on-table clink tinks as airborne Voronoi shards bounce on the oak table
+    for (let i = 0; i < this.shards.length; i++) {
+      const s = this.shards[i];
+      if (s.preVy > -0.85) continue;
+      const rb = this.world.getRigidBody(s.bodyHandle);
+      if (!rb || rb.isSleeping()) continue;
+      const t = rb.translation();
+      if (t.y > 0.24 || t.y < -0.1) continue;
+      const postVy = rb.linvel().y;
+      const dVyReal = (postVy - s.preVy - SIM_GRAVITY_Y * PHYSICS_DT) * SIM_TIME_SCALE;
+      if (dVyReal > 3.2) {
+        const intensity = Math.min(1.0, (dVyReal - 2.8) / 14.0);
+        this.audio.playShardTableTink(intensity, s.volume);
+        s.preVy = postVy;
+      }
+    }
+
     for (const item of blocksToShatter) {
-      this.shatterBlock(item.blk, item.localHit, item.impactSpeed, item.worldNormal);
+      this.shatterBlock(item.blk, item.localHit, item.impactSpeed, item.worldNormal, item.hitTable);
     }
   }
 
   /**
    * Executes exact 3D Voronoi brittle fracture on `block`, replacing it with dynamic convex glass shards
-   * and sparkling micro-splinters while conserving momentum.
+   * and grounded cullet chips while conserving momentum.
    */
   public shatterBlock(
     block: GlassBlockState,
     localImpactPoint: Vec3,
     impactSpeed: number = 16.0,
-    impactNormal: Vec3 = [0, 1, 0]
+    impactNormal: Vec3 = [0, 1, 0],
+    hitTable: boolean = true
   ): void {
     if (block.shattered) return;
     const rb = this.world.getRigidBody(block.bodyHandle);
@@ -892,22 +1002,40 @@ export class PhysicsWorld {
     this.colliderToBlock.delete(block.colliderHandle);
     this.world.removeRigidBody(rb);
 
-    // Dynamically scale shard count based on remaining active shard budget so 30-block collapses stay locked at 60 FPS!
+    // Scale shard count & crush-zone density by BOTH impact kinetic energy and active shard budget:
+    // Moderate snap (~14 dm/s) -> 8-10 larger recognizable stained-glass pieces + wedges;
+    // High-velocity oak smash (22+ dm/s) -> 14-17 sharp lancet splinters, wedges, and crushed cullet!
+    const impactEnergy01 = Math.max(0.0, Math.min(1.0, (impactSpeed - 12.5) / 15.0));
+    const energyTargetShards = Math.round(8 + impactEnergy01 * 8);
     const headroom = MAX_ACTIVE_SHARDS - this.shards.length;
-    const desiredShards = headroom > 90 ? 11 : headroom > 45 ? 8 : 6;
+    const budgetCap = headroom > 110 ? 17 : headroom > 55 ? 12 : 8;
+    const desiredShards = Math.min(energyTargetShards, budgetCap);
 
-    // Retire oldest sleeping shards if needed to stay within physics & vertex buffer caps
+    // Retire sleeping shards first (then oldest) if needed to stay within physics & vertex buffer caps
     while (this.shards.length + desiredShards > MAX_ACTIVE_SHARDS && this.shards.length > 0) {
-      const oldest = this.shards.shift()!;
-      this.colliderToShard.delete(oldest.colliderHandle);
-      const oldRb = this.world.getRigidBody(oldest.bodyHandle);
+      let removeIdx = 0;
+      for (let k = 0; k < this.shards.length; k++) {
+        const candRb = this.world.getRigidBody(this.shards[k].bodyHandle);
+        if (!candRb || candRb.isSleeping()) {
+          removeIdx = k;
+          break;
+        }
+      }
+      const retired = this.shards.splice(removeIdx, 1)[0];
+      this.colliderToShard.delete(retired.colliderHandle);
+      const oldRb = this.world.getRigidBody(retired.bodyHandle);
       if (oldRb) this.world.removeRigidBody(oldRb);
     }
 
     const shardGeoms = fractureBlockVoronoi(
       localImpactPoint,
       desiredShards,
-      block.id * 977 + Math.floor(this.simTime * 1000)
+      block.id * 977 + Math.floor(this.simTime * 1000),
+      BLOCK_HALF_X,
+      BLOCK_HALF_Y,
+      BLOCK_HALF_Z,
+      block.motif,
+      impactEnergy01
     );
 
     const worldImpact = quatRotateVec3(q, localImpactPoint);
@@ -930,57 +1058,83 @@ export class PhysicsWorld {
       const shardRbDesc = RAPIER.RigidBodyDesc.dynamic()
         .setTranslation(sx, sy, sz)
         .setRotation({ x: q[0], y: q[1], z: q[2], w: q[3] })
-        .setLinearDamping(0.15)
-        .setAngularDamping(0.2)
+        .setLinearDamping(0.24)
+        .setAngularDamping(0.34)
         .setCcdEnabled(false);
 
       const shardBody = this.world.createRigidBody(shardRbDesc);
-      // Compute tight analytical SAT bounding box of the convex Voronoi shard for ultra-fast 60fps rigid-body contacts
+
+      // Build exact 3D polyhedral convex-hull collider (with 0.982 seam margin so sibling shards never
+      // depenetrate-pop at t=0, while settling flat onto their true geometric cleavage facets on the oak table!)
+      const collisionHull = new Float32Array(geom.hullPoints.length);
       let maxHx = 0.012, maxHy = 0.012, maxHz = 0.012;
       for (let p = 0; p < geom.hullPoints.length; p += 3) {
-        maxHx = Math.max(maxHx, Math.abs(geom.hullPoints[p]));
-        maxHy = Math.max(maxHy, Math.abs(geom.hullPoints[p + 1]));
-        maxHz = Math.max(maxHz, Math.abs(geom.hullPoints[p + 2]));
+        const hxVal = geom.hullPoints[p] * 0.982;
+        const hyVal = geom.hullPoints[p + 1] * 0.982;
+        const hzVal = geom.hullPoints[p + 2] * 0.982;
+        collisionHull[p] = hxVal;
+        collisionHull[p + 1] = hyVal;
+        collisionHull[p + 2] = hzVal;
+        maxHx = Math.max(maxHx, Math.abs(hxVal));
+        maxHy = Math.max(maxHy, Math.abs(hyVal));
+        maxHz = Math.max(maxHz, Math.abs(hzVal));
       }
 
-      const shardColDesc = RAPIER.ColliderDesc.cuboid(maxHx * 0.86, maxHy * 0.86, maxHz * 0.86)
+      const rawHullDesc = RAPIER.ColliderDesc.convexHull(collisionHull);
+      const shardColDesc = (
+        rawHullDesc ?? RAPIER.ColliderDesc.cuboid(maxHx * 0.85, maxHy * 0.85, maxHz * 0.85)
+      )
         .setDensity(GLASS_DENSITY)
-        .setFriction(0.42)
-        .setRestitution(0.18)
+        .setFriction(0.48)
+        .setRestitution(0.10)
         .setCollisionGroups(GROUP_SHARD_ON_TABLE);
 
       const shardCol = this.world.createCollider(shardColDesc, shardBody);
 
-      // Exact rigid body velocity inheritance v_0 + w_0 x r + subtle brittle strain release from impact point
+      // Physical momentum inheritance (v_0 + w_0 x r) + proximity-weighted lateral wedge splay
+      // (eliminates artificial upward grenade explosions; crush-core splinters skitter laterally while
+      // heavy far-end stained-glass chunks crack off and topple naturally under gravity!)
       const rx = sx - impactWorldPos[0];
       const ry = sy - impactWorldPos[1];
       const rz = sz - impactWorldPos[2];
-      const rLen = Math.hypot(rx, ry, rz) || 0.05;
-      const burstSpeedSim =
-        (Math.min(4.8, 0.8 + impactSpeed * 0.14) * (0.65 + Math.random() * 0.6)) / SIM_TIME_SCALE;
+      const rDotN = rx * impactNormal[0] + ry * impactNormal[1] + rz * impactNormal[2];
+      // Project radial vector onto contact tangent plane for realistic lateral splatter
+      let tx = rx - impactNormal[0] * rDotN;
+      let ty = ry - impactNormal[1] * rDotN;
+      let tz = rz - impactNormal[2] * rDotN;
+      const tLen = Math.hypot(tx, ty, tz);
+      if (tLen > 1e-4) {
+        tx /= tLen;
+        ty /= tLen;
+        tz /= tLen;
+      } else {
+        const randAng = Math.random() * Math.PI * 2;
+        tx = Math.cos(randAng);
+        ty = 0;
+        tz = Math.sin(randAng);
+      }
 
-      const vx =
-        lv.x +
-        (av.y * worldOffset[2] - av.z * worldOffset[1]) +
-        (rx / rLen) * burstSpeedSim +
-        impactNormal[0] * burstSpeedSim * 0.25;
-      const vy =
-        lv.y +
-        (av.z * worldOffset[0] - av.x * worldOffset[2]) +
-        Math.abs(ry / rLen) * burstSpeedSim * 0.55 +
-        0.22;
-      const vz =
-        lv.z +
-        (av.x * worldOffset[1] - av.y * worldOffset[0]) +
-        (rz / rLen) * burstSpeedSim +
-        impactNormal[2] * burstSpeedSim * 0.25;
+      const proximity = Math.exp(-geom.impactDist / 0.22);
+      const splaySpeedSim =
+        ((0.45 + impactEnergy01 * 2.35) * (0.28 + 0.72 * proximity) * (0.75 + Math.random() * 0.5)) /
+        SIM_TIME_SCALE;
+      const normalReboundSim = (0.12 + impactEnergy01 * 0.28) * proximity / SIM_TIME_SCALE;
 
+      const rigidVx = lv.x + (av.y * worldOffset[2] - av.z * worldOffset[1]);
+      const rigidVy = lv.y + (av.z * worldOffset[0] - av.x * worldOffset[2]);
+      const rigidVz = lv.z + (av.x * worldOffset[1] - av.y * worldOffset[0]);
+
+      const vx = rigidVx + tx * splaySpeedSim + impactNormal[0] * normalReboundSim;
+      const vy = rigidVy + ty * splaySpeedSim + impactNormal[1] * normalReboundSim;
+      const vz = rigidVz + tz * splaySpeedSim + impactNormal[2] * normalReboundSim;
+
+      const spinScale = 1.4 + proximity * (3.2 + impactEnergy01 * 3.8);
       shardBody.setLinvel({ x: vx, y: vy, z: vz }, true);
       shardBody.setAngvel(
         {
-          x: av.x + (Math.random() - 0.5) * 4.5,
-          y: av.y + (Math.random() - 0.5) * 4.5,
-          z: av.z + (Math.random() - 0.5) * 4.5,
+          x: av.x + (Math.random() - 0.5) * spinScale,
+          y: av.y + (Math.random() - 0.5) * spinScale,
+          z: av.z + (Math.random() - 0.5) * spinScale,
         },
         true
       );
@@ -1001,6 +1155,11 @@ export class PhysicsWorld {
         rippleSeed: block.rippleSeed,
         position: [sx, sy, sz],
         rotation: [...q],
+        volume: geom.volume,
+        preVy: vy,
+        impactLocalPos: [...localImpactPoint],
+        planes: geom.planes,
+        planeCount: geom.planeCount,
         firstVertex,
         vertexCount: geom.vertexCount,
       };
@@ -1008,35 +1167,18 @@ export class PhysicsWorld {
       this.colliderToShard.set(shardCol.handle, shardState);
     }
 
-    // Spawn 22 glittering micro-splinters at the fracture point
-    const splinterBurst = 22;
-    for (let i = 0; i < splinterBurst; i++) {
-      if (this.splinters.length >= MAX_SPLINTERS) {
-        this.splinters.shift();
-      }
-      const theta = Math.random() * Math.PI * 2;
-      const spd = 2.0 + Math.random() * 8.5;
-      this.splinters.push({
-        pos: [
-          impactWorldPos[0] + (Math.random() - 0.5) * 0.14,
-          Math.max(0.02, impactWorldPos[1] + (Math.random() - 0.5) * 0.08),
-          impactWorldPos[2] + (Math.random() - 0.5) * 0.14,
-        ],
-        vel: [
-          lv.x * 0.4 + Math.cos(theta) * spd,
-          1.5 + Math.random() * 5.5,
-          lv.z * 0.4 + Math.sin(theta) * spd,
-        ],
-        rot: Math.random() * Math.PI * 2,
-        rotSpeed: (Math.random() - 0.5) * 24,
-        scale: 0.012 + Math.random() * 0.018,
-        swatchId: block.swatchId,
-        life: 0,
-        maxLife: 4.5 + Math.random() * 3.5,
-      });
-    }
+    // Spawn 14-20 tiny grounded cullet glass chips right at the impact crush zone
+    const chipCount = Math.round(12 + impactEnergy01 * 10);
+    this.spawnGlassCulletChips(
+      impactWorldPos,
+      lv,
+      impactNormal,
+      block.swatchId,
+      chipCount,
+      0.75 + impactEnergy01 * 0.55
+    );
 
-    this.audio.playGlassShatter(Math.min(1.0, impactSpeed / 22.0));
+    this.audio.playGlassShatter(Math.min(1.0, impactSpeed / 22.0), hitTable);
     this.wakeAllTowerBlocks();
   }
 

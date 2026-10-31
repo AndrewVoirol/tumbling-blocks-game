@@ -26,10 +26,10 @@ const CAUSTIC_MAP_SIZE = 2048;
 const MAX_BLOCKS_GPU = 64;
 const BLOCK_FLOATS = 48; // 192 bytes per GPUBlockData
 const MAX_SHARDS_GPU = 256;
-const SHARD_FLOATS = 24; // 96 bytes per GPUShardInstance
+const SHARD_FLOATS = 76; // 304 bytes per GPUShardInstance (mat4 + 3 vec4 + 12 convex planes)
 const MAX_SHARD_VERTICES = 65536;
 const SHARD_VERTEX_FLOATS = 10; // 40 bytes per shard vertex
-const MAX_SPLINTERS_GPU = 400; // 320 splinters + 64 floating cathedral dust motes
+const MAX_SPLINTERS_GPU = 320; // Grounded glass cullet chips (zero floating dust motes)
 const SPLINTER_FLOATS = 8; // 32 bytes per GPUSplinter
 
 export class WebGPURenderer {
@@ -301,11 +301,6 @@ export class WebGPURenderer {
       alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
     };
 
-    const additiveGlowBlend: GPUBlendState = {
-      color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-      alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-    };
-
     const [
       pipeBlockCaustic,
       pipeShardCaustic,
@@ -384,10 +379,10 @@ export class WebGPURenderer {
         fragment: {
           module: modShard,
           entryPoint: 'fs_splinter',
-          targets: [{ format: 'rgba16float', blend: additiveGlowBlend }],
+          targets: [{ format: 'rgba16float', blend: premulAlphaBlend }],
         },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
-        depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'less' },
+        depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'less-equal' },
         multisample: { count: 4 },
       }),
       d.createRenderPipelineAsync({
@@ -729,7 +724,7 @@ export class WebGPURenderer {
       );
     }
 
-    // 3. Pack active 3D Voronoi glass shards
+    // 3. Pack active 3D Voronoi glass shards (including exact convex polyhedron half-space planes)
     const shardCount = Math.min(physics.shards.length, MAX_SHARDS_GPU);
     for (let i = 0; i < shardCount; i++) {
       const s = physics.shards[i];
@@ -747,6 +742,13 @@ export class WebGPURenderer {
       this.shardStorageData[base + 21] = swatch.accentAbsorption[1];
       this.shardStorageData[base + 22] = swatch.accentAbsorption[2];
       this.shardStorageData[base + 23] = s.rippleSeed;
+
+      this.shardStorageData[base + 24] = s.impactLocalPos[0];
+      this.shardStorageData[base + 25] = s.impactLocalPos[1];
+      this.shardStorageData[base + 26] = s.impactLocalPos[2];
+      this.shardStorageData[base + 27] = s.planeCount;
+
+      this.shardStorageData.set(s.planes, base + 28);
     }
     if (shardCount > 0) {
       this.device.queue.writeBuffer(
@@ -758,50 +760,34 @@ export class WebGPURenderer {
       );
     }
 
-    // 4. Pack glittering micro-splinters + 48 sunlit cathedral dust motes floating in sunbeams!
+    // 4. Pack grounded glass cullet chips (zero floating cathedral dust motes)
     let particleCount = 0;
     for (let i = 0; i < physics.splinters.length && particleCount < MAX_SPLINTERS_GPU; i++) {
       const sp = physics.splinters[i];
       const base = particleCount * SPLINTER_FLOATS;
-      const fade = 1.0 - Math.pow(sp.life / sp.maxLife, 2);
+      const fade = 1.0 - Math.pow(sp.life / sp.maxLife, 3);
       this.splinterStorageData[base + 0] = sp.pos[0];
       this.splinterStorageData[base + 1] = sp.pos[1];
       this.splinterStorageData[base + 2] = sp.pos[2];
       this.splinterStorageData[base + 3] = sp.scale * fade;
 
       const sw = STAINED_GLASS_PALETTE[sp.swatchId];
-      this.splinterStorageData[base + 4] = Math.exp(-sw.absorption[0] * 0.12) * 1.4;
-      this.splinterStorageData[base + 5] = Math.exp(-sw.absorption[1] * 0.12) * 1.4;
-      this.splinterStorageData[base + 6] = Math.exp(-sw.absorption[2] * 0.12) * 1.4;
+      this.splinterStorageData[base + 4] = Math.exp(-sw.absorption[0] * 0.11);
+      this.splinterStorageData[base + 5] = Math.exp(-sw.absorption[1] * 0.11);
+      this.splinterStorageData[base + 6] = Math.exp(-sw.absorption[2] * 0.11);
       this.splinterStorageData[base + 7] = sp.rot;
       particleCount++;
     }
 
-    // Ambient sunlit cathedral dust motes gently drifting around the stained-glass tower
-    const moteCount = 44;
-    for (let m = 0; m < moteCount && particleCount < MAX_SPLINTERS_GPU; m++) {
-      const base = particleCount * SPLINTER_FLOATS;
-      const seed = m * 3.719;
-      const r = 0.65 + (m % 7) * 0.42;
-      const theta = seed + elapsedSec * (0.04 + (m % 5) * 0.012);
-      const y = 0.35 + ((seed * 0.41 + elapsedSec * 0.05) % 3.6);
-      this.splinterStorageData[base + 0] = Math.cos(theta) * r;
-      this.splinterStorageData[base + 1] = y;
-      this.splinterStorageData[base + 2] = Math.sin(theta) * r;
-      this.splinterStorageData[base + 3] = 0.016 + (m % 3) * 0.006;
-      this.splinterStorageData[base + 4] = this.lightingPreset.sunColor[0] * 0.38;
-      this.splinterStorageData[base + 5] = this.lightingPreset.sunColor[1] * 0.36;
-      this.splinterStorageData[base + 6] = this.lightingPreset.sunColor[2] * 0.32;
-      this.splinterStorageData[base + 7] = -100.0; // Dust flag
-      particleCount++;
+    if (particleCount > 0) {
+      this.device.queue.writeBuffer(
+        this.splinterStorageBuffer,
+        0,
+        this.splinterStorageData.buffer,
+        0,
+        particleCount * SPLINTER_FLOATS * 4
+      );
     }
-    this.device.queue.writeBuffer(
-      this.splinterStorageBuffer,
-      0,
-      this.splinterStorageData.buffer,
-      0,
-      particleCount * SPLINTER_FLOATS * 4
-    );
 
     // 5. Pack spatial overlays (Top Placement Slot Guides & Spring Pull Filament)
     let slotDrawCount = 0;

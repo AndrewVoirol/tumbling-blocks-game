@@ -15,8 +15,9 @@ export class GlassAudioEngine {
 
   private muted: boolean = false;
   private lastClinkTime: number = 0;
+  private lastShardTinkTime: number = 0;
   private activeVoices: number = 0;
-  private readonly MAX_VOICES = 28;
+  private readonly MAX_VOICES = 36;
 
   public unlock(): void {
     if (typeof window === 'undefined') return;
@@ -194,53 +195,123 @@ export class GlassAudioEngine {
   }
 
   /**
-   * Full 3D glass block fracture burst + cascading crystalline shard tinks.
+   * Full 3D glass block fracture burst + oak table thud + inharmonic shard cascade.
    */
-  public playGlassShatter(energy01: number = 1.0): void {
+  public playGlassShatter(energy01: number = 1.0, hitTable: boolean = true): void {
     if (!this.ctx || !this.masterGain || !this.noiseBuffer || this.muted) return;
     const now = this.ctx.currentTime;
 
-    // Primary brittle fracture snap
+    // 1. Razor-sharp initial brittle fracture snap transient (2-8 kHz bandpass crackle)
     const burst = this.ctx.createBufferSource();
     burst.buffer = this.noiseBuffer;
     const hp = this.ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 2900;
+    hp.type = 'bandpass';
+    hp.frequency.value = 3800;
+    hp.Q.value = 1.1;
 
     const bg = this.ctx.createGain();
-    const amp = Math.min(0.55, 0.3 + energy01 * 0.25);
+    const amp = Math.min(0.52, 0.26 + energy01 * 0.26);
     bg.gain.setValueAtTime(amp, now);
-    bg.gain.exponentialRampToValueAtTime(0.0001, now + 0.065);
+    bg.gain.exponentialRampToValueAtTime(0.0001, now + 0.042);
 
     burst.connect(hp);
     hp.connect(bg);
     bg.connect(this.masterGain);
-    burst.start(now, Math.random(), 0.08);
+    burst.start(now, Math.random(), 0.055);
 
-    // Staggered high-frequency shard tinks
-    const tinkCount = Math.min(10, Math.floor(6 + energy01 * 5));
+    // 2. Subtle quarter-sawn oak tabletop impact resonance when smashing onto wood
+    if (hitTable && this.activeVoices < this.MAX_VOICES) {
+      const thud = this.ctx.createOscillator();
+      const tg = this.ctx.createGain();
+      thud.type = 'triangle';
+      thud.frequency.setValueAtTime(195, now);
+      thud.frequency.exponentialRampToValueAtTime(88, now + 0.055);
+      tg.gain.setValueAtTime(amp * 0.34, now);
+      tg.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+      this.activeVoices++;
+      thud.connect(tg);
+      tg.connect(this.masterGain);
+      thud.start(now);
+      thud.stop(now + 0.07);
+      thud.onended = () => {
+        this.activeVoices = Math.max(0, this.activeVoices - 1);
+      };
+    }
+
+    // 3. Staggered inharmonic dual-mode crystalline shard clinks
+    const tinkCount = Math.min(8, Math.floor(4 + energy01 * 4));
     for (let i = 0; i < tinkCount; i++) {
-      if (this.activeVoices >= this.MAX_VOICES) break;
-      const delay = 0.008 + Math.pow(Math.random(), 1.5) * 0.22;
-      const freq = 4200 + Math.random() * 6800;
-      const dur = 0.035 + Math.random() * 0.065;
+      if (this.activeVoices + 2 > this.MAX_VOICES) break;
+      const delay = 0.006 + Math.pow(Math.random(), 1.6) * 0.16;
+      const baseFreq = 3600 + Math.random() * 5200;
+      const overtoneRatio = 2.18 + Math.random() * 0.36; // Non-integer flexural plate/wedge mode ratio
+      const dur = 0.026 + Math.random() * 0.048;
+      const startT = now + delay;
+      const tinkAmp = amp * (0.12 + Math.random() * 0.16) * (1 - i / (tinkCount + 3));
 
+      const freqs = [baseFreq, Math.min(15800, baseFreq * overtoneRatio)];
+      const weights = [1.0, 0.42];
+      for (let m = 0; m < 2; m++) {
+        const osc = this.ctx.createOscillator();
+        const g = this.ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freqs[m];
+        const mDur = m === 0 ? dur : dur * 0.55;
+        g.gain.setValueAtTime(0.0001, startT);
+        g.gain.linearRampToValueAtTime(tinkAmp * weights[m], startT + 0.0008);
+        g.gain.exponentialRampToValueAtTime(0.0001, startT + mDur);
+
+        this.activeVoices++;
+        osc.connect(g);
+        g.connect(this.masterGain);
+        osc.start(startT);
+        osc.stop(startT + mDur + 0.008);
+        osc.onended = () => {
+          this.activeVoices = Math.max(0, this.activeVoices - 1);
+        };
+      }
+    }
+  }
+
+  /**
+   * Physics-driven secondary crystalline clink when an individual Voronoi glass shard strikes the oak table.
+   * Pitch scales inversely with shard cube-root dimension so tiny splinters clink bright and large chunks ring lower.
+   */
+  public playShardTableTink(intensity01: number, volumeDm3: number): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    if (this.activeVoices + 2 > this.MAX_VOICES) return;
+
+    const now = this.ctx.currentTime;
+    if (now - this.lastShardTinkTime < 0.018) return;
+    this.lastShardTinkTime = now;
+
+    // Characteristic shard dimension relative to ~2.5 cm^3 (0.0025 dm^3) medium wedge
+    const sizeRatio = Math.cbrt(Math.max(0.00015, volumeDm3) / 0.0025);
+    const pitchScale = Math.max(0.72, Math.min(2.35, 1.0 / sizeRatio));
+    const f0 = Math.min(13500, (3450 + Math.random() * 950) * pitchScale);
+    const f1 = Math.min(16200, f0 * (2.27 + Math.random() * 0.22));
+
+    const peak = Math.min(0.18, Math.max(0.012, intensity01 * 0.16));
+    const dur = (0.038 + Math.random() * 0.032) / Math.sqrt(pitchScale);
+
+    const modes = [
+      { f: f0, w: 1.0, d: dur },
+      { f: f1, w: 0.38, d: dur * 0.52 },
+    ];
+    for (const m of modes) {
       const osc = this.ctx.createOscillator();
       const g = this.ctx.createGain();
       osc.type = 'sine';
-      osc.frequency.value = freq;
-
-      const startT = now + delay;
-      const tinkAmp = amp * (0.14 + Math.random() * 0.2) * (1 - i / (tinkCount + 3));
-      g.gain.setValueAtTime(0.0001, startT);
-      g.gain.linearRampToValueAtTime(tinkAmp, startT + 0.001);
-      g.gain.exponentialRampToValueAtTime(0.0001, startT + dur);
+      osc.frequency.value = m.f;
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.linearRampToValueAtTime(peak * m.w, now + 0.0008);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + m.d);
 
       this.activeVoices++;
       osc.connect(g);
       g.connect(this.masterGain);
-      osc.start(startT);
-      osc.stop(startT + dur + 0.01);
+      osc.start(now);
+      osc.stop(now + m.d + 0.008);
       osc.onended = () => {
         this.activeVoices = Math.max(0, this.activeVoices - 1);
       };

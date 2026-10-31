@@ -135,7 +135,8 @@ fn evaluateVitrailPattern(pLocal: vec3<f32>, motifId: i32, seed: f32) -> Vitrail
 }
 
 /**
- * Evaluates internal brittle spiderweb crazing fractures radiating from crackOrigin when damage > 0.
+ * Evaluates asymmetric, sparse (< 0.25 mm) 3D brittle glass fracture planes & chordal
+ * cross-cracks radiating from crackOrigin when damage > 0 (no symmetric spiderwebs or circular rings).
  */
 fn evaluateInternalCracks(pLocal: vec3<f32>, crackOrigin: vec3<f32>, damage: f32, seed: f32) -> f32 {
   if (damage <= 0.01) {
@@ -143,18 +144,60 @@ fn evaluateInternalCracks(pLocal: vec3<f32>, crackOrigin: vec3<f32>, damage: f32
   }
   let rel = pLocal - crackOrigin;
   let dist = length(rel);
-  let maxRadius = 0.08 + damage * 0.42;
-  if (dist > maxRadius) {
+  let maxRadius = 0.10 + damage * 0.46;
+  if (dist > maxRadius || dist < 1e-4) {
     return 0.0;
   }
-  let dir = rel / max(dist, 1e-4);
-  let ang1 = atan2(dir.z, dir.x);
-  let ang2 = asin(clamp(dir.y, -1.0, 1.0));
-  let spokeWave = abs(sin(ang1 * 7.0 + seed * 4.0 + noise3D(pLocal * 42.0) * 2.8));
-  let ringWave = abs(sin(dist * 65.0 - seed * 2.0 + ang2 * 3.0));
-  let crackLine = (1.0 - smoothstep(0.0, 0.14, spokeWave)) + (1.0 - smoothstep(0.0, 0.11, ringWave)) * 0.65;
-  let falloff = (1.0 - smoothstep(maxRadius * 0.35, maxRadius, dist)) * clamp(damage * 1.25, 0.0, 1.0);
-  return clamp(crackLine * falloff, 0.0, 1.0);
+
+  // Dual-octave 3D noise warp gives natural brittle glass jinks rather than ruler-straight spokes
+  let warpCoarse = (noise3D(pLocal * 21.0 + vec3<f32>(seed * 2.3)) - 0.5) * 0.0085;
+  let warpFine = (noise3D(pLocal * 58.0 - vec3<f32>(seed * 4.1)) - 0.5) * 0.0028;
+  let warp = warpCoarse + warpFine;
+
+  let theta = atan2(rel.z + rel.y * 0.34, rel.x - rel.y * 0.24);
+  let numSectors: f32 = 7.0;
+  let sectorCoord = ((theta + PI) / (2.0 * PI)) * numSectors + seed * 1.73;
+  let sectorId = floor(sectorCoord);
+  let sectorFrac = fract(sectorCoord) - 0.5;
+
+  let hSec = hash31(vec3<f32>(sectorId, seed * 3.17, 2.0));
+  // Sparse fracture propagation: ~40% of angular sectors remain uncracked so cracks never look like a pinwheel!
+  if (fract(hSec * 19.37) < 0.38) {
+    let hertzOnly = (1.0 - smoothstep(0.005, 0.024, dist)) * 0.45;
+    return hertzOnly * clamp(damage * 1.2, 0.0, 1.0);
+  }
+
+  let sectorReach = maxRadius * (0.35 + 0.65 * fract(hSec * 7.91));
+  if (dist > sectorReach) {
+    return 0.0;
+  }
+
+  let spokeOffset = (hSec - 0.5) * 0.38;
+  let perpDistDm = abs((sectorFrac - spokeOffset) * (2.0 * PI / numSectors) * dist + warp);
+
+  // Ultra-fine hairline cleavage plane (~0.20 mm physical thickness)
+  var crack = 1.0 - smoothstep(0.0005, 0.0022, perpDistDm);
+
+  // Secondary oblique bifurcating fork on high-stress sectors
+  if (fract(hSec * 13.3) > 0.46 && dist > 0.05) {
+    let forkSpread = (dist - 0.05) * (0.20 + 0.14 * fract(hSec * 3.7));
+    let forkDistDm = abs(perpDistDm - forkSpread + warpFine * 0.8);
+    crack = max(crack, (1.0 - smoothstep(0.0004, 0.0018, forkDistDm)) * 0.78);
+  }
+
+  // Planar chordal cross-fracture (straight angled cleavage plane across the sector, never a circular arc!)
+  if (fract(hSec * 29.7) > 0.56 && perpDistDm < 0.022) {
+    let secCenterAng = ((sectorId + 0.5 - seed * 1.73) / numSectors) * 2.0 * PI - PI;
+    let chordDir = normalize(vec3<f32>(cos(secCenterAng + 0.28), 0.18, sin(secCenterAng + 0.28)));
+    let projChord = dot(rel, chordDir);
+    let chordStep = 0.065 + fract(hSec * 5.3) * 0.085;
+    let chordDistDm = abs(projChord - chordStep + warpFine);
+    crack = max(crack, (1.0 - smoothstep(0.0004, 0.0017, chordDistDm)) * 0.65);
+  }
+
+  let hertzCore = (1.0 - smoothstep(0.005, 0.025, dist)) * 0.45;
+  let tipFade = 1.0 - smoothstep(sectorReach * 0.62, sectorReach, dist);
+  return clamp(max(crack * tipFade, hertzCore) * clamp(damage * 1.25, 0.0, 1.0), 0.0, 1.0);
 }
 
 /**
