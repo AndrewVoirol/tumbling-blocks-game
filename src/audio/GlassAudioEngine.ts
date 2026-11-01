@@ -655,6 +655,123 @@ export class GlassAudioEngine {
     });
   }
 
+  /**
+   * Tactile cut-glass prism key-down transient (brass/pewter came seat + polished bevel click).
+   */
+  public playUiKeyDown(
+    tone: 'default' | 'tab' | 'primary' | 'danger' | 'step' = 'default'
+  ): void {
+    this.unlock();
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    if (this.activeVoices + 2 > this.MAX_VOICES) return;
+
+    const now = this.ctx.currentTime;
+    const pitchMap: Record<typeof tone, number> = {
+      default: 1.0,
+      tab: 1.08,
+      primary: 0.94,
+      danger: 0.82,
+      step: 1.18,
+    };
+    const pScale = pitchMap[tone];
+
+    // 1. Subtle weighted brass/pewter socket seat thock
+    const seat = this.ctx.createOscillator();
+    const sg = this.ctx.createGain();
+    seat.type = 'triangle';
+    seat.frequency.setValueAtTime(210 * pScale, now);
+    seat.frequency.exponentialRampToValueAtTime(92 * pScale, now + 0.022);
+    sg.gain.setValueAtTime(0.068, now);
+    sg.gain.exponentialRampToValueAtTime(0.0001, now + 0.024);
+    this.activeVoices++;
+    seat.connect(sg);
+    const cleanupSeat = this.connectPanned(sg);
+    seat.start(now);
+    seat.stop(now + 0.028);
+    seat.onended = () => {
+      this.activeVoices = Math.max(0, this.activeVoices - 1);
+      try {
+        seat.disconnect();
+      } catch {
+        // Ignore
+      }
+      cleanupSeat();
+    };
+
+    // 2. Crisp glass bevel contact tick
+    if (this.noiseBuffer && this.activeVoices < this.MAX_VOICES) {
+      const tick = this.ctx.createBufferSource();
+      tick.buffer = this.noiseBuffer;
+      const bp = this.ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 3450 * pScale;
+      bp.Q.value = 8.5;
+      const tg = this.ctx.createGain();
+      tg.gain.setValueAtTime(0.075, now);
+      tg.gain.exponentialRampToValueAtTime(0.0001, now + 0.008);
+      this.activeVoices++;
+      tick.connect(bp);
+      bp.connect(tg);
+      const cleanupTick = this.connectPanned(tg);
+      tick.start(now, Math.random() * 1.2, 0.012);
+      tick.onended = () => {
+        this.activeVoices = Math.max(0, this.activeVoices - 1);
+        try {
+          tick.disconnect();
+          bp.disconnect();
+        } catch {
+          // Ignore
+        }
+        cleanupTick();
+      };
+    }
+  }
+
+  /**
+   * Delicate crystalline glass key-up harmonic chime when a pressed UI glass block rebounds.
+   */
+  public playUiKeyUp(
+    tone: 'default' | 'tab' | 'primary' | 'danger' | 'step' = 'default'
+  ): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    if (this.activeVoices >= this.MAX_VOICES) return;
+
+    const now = this.ctx.currentTime;
+    const freqMap: Record<typeof tone, number> = {
+      default: 2480,
+      tab: 2640,
+      primary: 2220,
+      danger: 1960,
+      step: 2940,
+    };
+    const f0 = freqMap[tone] * (0.99 + Math.random() * 0.02);
+    const dur = tone === 'primary' ? 0.072 : 0.048;
+
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(f0, now);
+    osc.frequency.exponentialRampToValueAtTime(f0 * 1.018, now + dur);
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.linearRampToValueAtTime(tone === 'primary' ? 0.062 : 0.045, now + 0.0012);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    this.activeVoices++;
+    osc.connect(g);
+    const cleanup = this.connectPanned(g);
+    osc.start(now);
+    osc.stop(now + dur + 0.008);
+    osc.onended = () => {
+      this.activeVoices = Math.max(0, this.activeVoices - 1);
+      try {
+        osc.disconnect();
+      } catch {
+        // Ignore
+      }
+      cleanup();
+    };
+  }
+
   public dispose(): void {
     if (this.ctx) {
       void this.ctx.close();

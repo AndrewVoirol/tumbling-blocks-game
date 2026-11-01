@@ -1,20 +1,39 @@
 :root {
-  --bg-obsidian: rgba(15, 13, 18, 0.78);
-  --bg-obsidian-strong: rgba(17, 15, 21, 0.89);
-  --came-copper: rgba(208, 160, 96, 0.56);
-  --came-copper-bright: rgba(238, 196, 126, 0.76);
-  --came-pewter-dark: rgba(10, 8, 11, 0.94);
-  --bevel-top: rgba(255, 248, 230, 0.16);
-  --bevel-left: rgba(242, 208, 150, 0.11);
-  --bevel-right: rgba(6, 5, 9, 0.36);
-  --bevel-bottom: rgba(4, 3, 7, 0.46);
-  --text-ivory: #f6f1e7;
-  --text-muted: #b8aea2;
-  --accent-gold: #eab308;
-  --accent-amber: #f59e0b;
-  --accent-ruby: #ef4444;
-  --accent-emerald: #10b981;
-  --accent-cobalt: #3b82f6;
+  --lead-came: #100e14;
+  --lead-came-deep: #08070b;
+  --pewter-fillet: rgba(235, 222, 198, 0.36);
+
+  /* Sunbeam & skylight aura cast by the left stained-glass lancet window */
+  --lancet-halo: rgba(96, 152, 248, 0.22);
+  --sunbeam-ray-a: rgba(96, 165, 250, 0.09);
+  --sunbeam-ray-b: rgba(251, 191, 36, 0.06);
+
+  /* Etched silica & kiln-fired trace ink */
+  --silica-bright: rgba(253, 250, 244, 0.95);
+  --silica-soft: rgba(232, 225, 212, 0.78);
+  --silica-faint: rgba(218, 210, 196, 0.52);
+  --kiln-ink: #191518;
+
+  /* Subtle antique glass ream striae */
+  --waterglass-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='68' height='68' viewBox='0 0 68 68'%3E%3Cg transform='rotate(-20 34 34)'%3E%3Cpath d='M-10 15 Q24 11 78 17' fill='none' stroke='%23ffffff' stroke-opacity='0.09' stroke-width='1.6'/%3E%3Cpath d='M-10 42 Q34 46 78 39' fill='none' stroke='%23ffffff' stroke-opacity='0.06' stroke-width='1.1'/%3E%3C/g%3E%3Ccircle cx='18' cy='21' r='1.05' fill='none' stroke='%23ffffff' stroke-opacity='0.24' stroke-width='0.6'/%3E%3Ccircle cx='49' cy='14' r='0.7' fill='%23ffffff' fill-opacity='0.18'/%3E%3Ccircle cx='39' cy='51' r='1.15' fill='none' stroke='%23ffffff' stroke-opacity='0.20' stroke-width='0.6'/%3E%3C/svg%3E");
+
+  /* 3D cut-glass 45-degree corner bevel miters for the bottom prism bar */
+  --prism-corner-tl: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cline x1='0' y1='0' x2='6' y2='6' stroke='%23ffffff' stroke-opacity='0.42' stroke-width='0.9'/%3E%3Cpath d='M6,10 L6,6 L10,6' fill='none' stroke='%23ffffff' stroke-opacity='0.22' stroke-width='0.75'/%3E%3C/svg%3E");
+  --prism-corner-tr: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cline x1='10' y1='0' x2='4' y2='6' stroke='%23ffffff' stroke-opacity='0.42' stroke-width='0.9'/%3E%3Cpath d='M0,6 L4,6 L4,10' fill='none' stroke='%23ffffff' stroke-opacity='0.22' stroke-width='0.75'/%3E%3C/svg%3E");
+  --prism-corner-bl: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cline x1='0' y1='10' x2='6' y2='4' stroke='%23ffffff' stroke-opacity='0.30' stroke-width='0.9'/%3E%3Cpath d='M6,0 L6,4 L10,4' fill='none' stroke='%23ffffff' stroke-opacity='0.18' stroke-width='0.75'/%3E%3C/svg%3E");
+  --prism-corner-br: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cline x1='10' y1='10' x2='4' y2='4' stroke='%23ffffff' stroke-opacity='0.30' stroke-width='0.9'/%3E%3Cpath d='M0,4 L4,4 L4,0' fill='none' stroke='%23ffffff' stroke-opacity='0.18' stroke-width='0.75'/%3E%3C/svg%3E");
+}
+
+.app-shell[data-lighting='golden-vespers'] {
+  --lancet-halo: rgba(245, 158, 11, 0.24);
+  --sunbeam-ray-a: rgba(245, 158, 11, 0.10);
+  --sunbeam-ray-b: rgba(225, 29, 72, 0.06);
+}
+
+.app-shell[data-lighting='high-clerestory'] {
+  --lancet-halo: rgba(56, 189, 248, 0.22);
+  --sunbeam-ray-a: rgba(94, 234, 212, 0.09);
+  --sunbeam-ray-b: rgba(186, 230, 253, 0.08);
 }
 
 * {
@@ -31,9 +50,10 @@ body,
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #0d0c0f;
+  background: #141212;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  color: var(--text-ivory);
+  color: var(--silica-bright);
+  -webkit-font-smoothing: antialiased;
 }
 
 .app-shell {
@@ -49,7 +69,9 @@ body,
   touch-action: none;
 }
 
-/* HUD Layout */
+/* ============================================================================
+ * SPATIAL GALLERY LAYOUT (.hud-layer)
+ * ============================================================================ */
 .hud-layer {
   position: absolute;
   inset: 0;
@@ -57,684 +79,1223 @@ body,
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 18px 22px;
+  padding: 18px 24px 18px;
 }
 
-.hud-top-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-
-/* Beveled Stained-Glass Block Panel:
- * Zero rounded corners; outer patinated pewter + copper-foil came frame,
- * 4px 45-degree mitered cut-glass bevel facets, and crisp inner bevel ridge shoulder.
- */
-.glass-panel {
-  position: relative;
-  pointer-events: auto;
-  border-radius: 0;
-  background: var(--bg-obsidian);
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-  border: 1.5px solid var(--came-copper);
-  outline: 1px solid var(--came-pewter-dark);
-  box-shadow:
-    0 14px 34px rgba(0, 0, 0, 0.52),
-    0 2px 6px rgba(0, 0, 0, 0.42);
-}
-
-/* 45-degree mitered sloped cut-glass bevel facets around all 4 edges */
-.glass-panel::before {
-  content: '';
+/* Oblique atmospheric sunbeam softly coupling the left stained-glass window to the room */
+.lancet-sunbeam-veil {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
+  width: 520px;
+  height: 620px;
   pointer-events: none;
-  z-index: 2;
-  border-style: solid;
-  border-width: 4px;
-  border-top-color: var(--bevel-top);
-  border-left-color: var(--bevel-left);
-  border-right-color: var(--bevel-right);
-  border-bottom-color: var(--bevel-bottom);
-}
-
-/* Crisp inner cut-glass bevel shoulder hairline */
-.glass-panel::after {
-  content: '';
-  position: absolute;
-  inset: 4px;
-  pointer-events: none;
-  z-index: 2;
-  border-top: 1px solid rgba(255, 245, 220, 0.22);
-  border-left: 1px solid rgba(238, 202, 140, 0.16);
-  border-right: 1px solid rgba(218, 178, 108, 0.10);
-  border-bottom: 1px solid rgba(218, 178, 108, 0.12);
-}
-
-/* Top-Left Brand & Score Card */
-.brand-panel {
-  padding: 15px 17px;
-  min-width: 306px;
-  display: flex;
-  flex-direction: column;
-  gap: 11px;
-}
-
-.brand-header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.brand-title {
-  font-family: 'Cinzel', Georgia, serif;
-  font-size: 1.22rem;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  background: linear-gradient(135deg, #fff5df 0%, #e7c27d 55%, #f59e0b 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.scale-badge {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.68rem;
-  color: var(--text-muted);
-  letter-spacing: 0.03em;
-}
-
-.mode-tabs {
-  display: flex;
-  gap: 2px;
-  background: rgba(5, 4, 7, 0.52);
-  padding: 2px;
-  border-radius: 0;
-  border: 1px solid rgba(208, 160, 96, 0.24);
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
-}
-
-.mode-tab {
-  flex: 1;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 0;
-  color: var(--text-muted);
-  font-size: 0.76rem;
-  font-weight: 500;
-  padding: 5px 10px;
-  cursor: pointer;
-  transition: background-color 0.14s ease, color 0.14s ease, border-color 0.14s ease;
-}
-
-.mode-tab:hover {
-  color: var(--text-ivory);
-  background: rgba(255, 248, 230, 0.05);
-}
-
-.mode-tab.active {
-  background: linear-gradient(180deg, rgba(226, 182, 108, 0.26) 0%, rgba(180, 132, 64, 0.18) 100%);
-  color: #fde8b4;
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 245, 214, 0.48);
-  border-left-color: rgba(242, 206, 142, 0.36);
-  border-right-color: rgba(120, 84, 34, 0.5);
-  border-bottom-color: rgba(96, 66, 24, 0.6);
-}
-
-.turn-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  border-radius: 0;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(208, 160, 96, 0.22);
-  box-shadow: inset 1px 1px 0 rgba(255, 248, 230, 0.06);
-  font-size: 0.8rem;
-}
-
-.player-indicator {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-}
-
-/* Diamond lozenge stained-glass jewel indicator */
-.player-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 0;
-  transform: rotate(45deg);
-  border: 1px solid rgba(255, 255, 255, 0.5);
-  box-shadow: 0 0 8px currentColor;
-}
-
-.player-stepper {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 0.72rem;
-  color: var(--text-muted);
-}
-
-.mini-btn {
-  background: rgba(255, 255, 255, 0.07);
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 246, 224, 0.28);
-  border-left-color: rgba(238, 202, 140, 0.2);
-  border-right-color: rgba(10, 8, 12, 0.65);
-  border-bottom-color: rgba(8, 6, 10, 0.75);
-  border-radius: 0;
-  color: var(--text-ivory);
-  width: 20px;
-  height: 20px;
-  cursor: pointer;
-  font-size: 0.75rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.mini-btn:hover {
-  background: rgba(218, 178, 108, 0.26);
-  border-color: var(--came-copper-bright);
-}
-
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 7px;
-  padding-top: 2px;
-}
-
-.stat-cell {
-  background: rgba(6, 5, 9, 0.38);
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 245, 220, 0.16);
-  border-left-color: rgba(238, 202, 140, 0.12);
-  border-right-color: rgba(0, 0, 0, 0.5);
-  border-bottom-color: rgba(0, 0, 0, 0.6);
-  border-radius: 0;
-  padding: 6px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  box-shadow: inset 1px 1px 0 rgba(255, 248, 230, 0.04);
-}
-
-.stat-label {
-  font-size: 0.64rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-}
-
-.stat-value {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.92rem;
-  font-weight: 600;
-  color: var(--text-ivory);
-}
-
-.stat-sub {
-  font-size: 0.66rem;
-  color: var(--text-muted);
-}
-
-/* Top-Right Plumb Level & Toolbar */
-.right-controls-stack {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 10px;
-}
-
-.toolbar-panel {
-  padding: 9px 11px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.icon-btn {
-  background: rgba(255, 255, 255, 0.055);
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 246, 224, 0.24);
-  border-left-color: rgba(238, 202, 140, 0.18);
-  border-right-color: rgba(8, 6, 10, 0.62);
-  border-bottom-color: rgba(6, 5, 8, 0.72);
-  border-radius: 0;
-  color: var(--text-ivory);
-  height: 32px;
-  padding: 0 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.76rem;
-  font-weight: 500;
-  cursor: pointer;
-  box-shadow: inset 1px 1px 0 rgba(255, 248, 230, 0.06);
-  transition: background-color 0.14s ease, border-color 0.14s ease;
-}
-
-.icon-btn:hover {
-  background: rgba(218, 178, 108, 0.22);
-  border-color: var(--came-copper-bright);
-}
-
-.icon-btn.danger-accent {
-  background: rgba(225, 43, 56, 0.18);
-  border-top-color: rgba(255, 165, 165, 0.48);
-  border-left-color: rgba(248, 113, 113, 0.38);
-  border-right-color: rgba(127, 29, 29, 0.65);
-  border-bottom-color: rgba(99, 20, 20, 0.75);
-  color: #fecaca;
-}
-
-.icon-btn.danger-accent:hover {
-  background: rgba(225, 43, 56, 0.3);
-}
-
-.light-select {
-  background: rgba(255, 255, 255, 0.055);
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 246, 224, 0.24);
-  border-left-color: rgba(238, 202, 140, 0.18);
-  border-right-color: rgba(8, 6, 10, 0.62);
-  border-bottom-color: rgba(6, 5, 8, 0.72);
-  border-radius: 0;
-  color: var(--text-ivory);
-  height: 32px;
-  padding: 0 9px;
-  font-size: 0.75rem;
-  cursor: pointer;
-  outline: none;
-}
-
-.light-select:hover,
-.light-select:focus {
-  border-color: var(--came-copper-bright);
-}
-
-.light-select option {
-  background: #17151c;
-  color: var(--text-ivory);
-}
-
-/* Plumb-Bob Stability Gauge — Square Leaded Quarry matching the 7.5 x 7.5 cm Tower Base Inlay */
-.plumb-panel {
-  padding: 11px 15px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.plumb-dial {
-  position: relative;
-  width: 44px;
-  height: 44px;
-  border-radius: 0;
   background:
-    linear-gradient(to right, transparent 49%, rgba(218, 178, 108, 0.16) 49%, rgba(218, 178, 108, 0.16) 51%, transparent 51%),
-    linear-gradient(to bottom, transparent 49%, rgba(218, 178, 108, 0.16) 49%, rgba(218, 178, 108, 0.16) 51%, transparent 51%),
-    radial-gradient(circle, rgba(238, 198, 124, 0.1) 0%, rgba(4, 3, 7, 0.62) 100%);
-  border-style: solid;
-  border-width: 1.5px;
-  border-top-color: rgba(255, 242, 204, 0.58);
-  border-left-color: rgba(238, 198, 124, 0.48);
-  border-right-color: rgba(140, 102, 48, 0.52);
-  border-bottom-color: rgba(116, 82, 36, 0.62);
+    radial-gradient(65% 58% at 24% 34%, var(--sunbeam-ray-a), transparent 72%),
+    linear-gradient(122deg, var(--sunbeam-ray-b) 0%, transparent 56%);
+  transition: background 400ms ease;
+}
+
+.hud-upper-space {
+  position: relative;
+  z-index: 2;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
 }
 
-.plumb-ring-inner {
-  width: 20px;
-  height: 20px;
-  border-radius: 0;
-  border: 1px dashed rgba(238, 198, 124, 0.38);
-}
-
-.plumb-dot {
-  position: absolute;
-  width: 8px;
-  height: 8px;
-  border-radius: 0;
-  transform: translate(-50%, -50%) rotate(45deg);
-  border: 1px solid rgba(255, 255, 255, 0.65);
-  transition: background-color 0.15s ease;
-  box-shadow: 0 0 9px currentColor;
-}
-
-.plumb-readout {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.plumb-title {
-  font-size: 0.66rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-}
-
-.plumb-Numbers {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.84rem;
-  font-weight: 600;
-}
-
-.plumb-status {
-  font-size: 0.7rem;
-}
-
-/* Bottom-Center Intuitive Coach / Action Bar */
 .hud-bottom-row {
+  position: relative;
+  z-index: 2;
   display: flex;
   justify-content: center;
   align-items: flex-end;
-  position: relative;
+  pointer-events: none;
 }
 
-.coach-pill {
-  padding: 13px 22px;
-  max-width: 690px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 7px;
-  text-align: center;
-  background: var(--bg-obsidian-strong);
+/* ============================================================================
+ * TACTILE KINEMATIC GLASS QUARRY (<QuarryButton>)
+ * Stationary lead-came / crystal socket; inner glass pane physically recesses
+ * on pointerdown and rebounds via an underdamped spring + refractive sweep.
+ * ============================================================================ */
+@keyframes quarrySpringReturn {
+  0% {
+    transform: translateY(1.6px) scale(0.955);
+  }
+  45% {
+    transform: translateY(-0.65px) scale(1.015);
+  }
+  76% {
+    transform: translateY(0.2px) scale(0.997);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+  }
 }
 
-.coach-main-line {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  justify-content: center;
+@keyframes quarryCausticSweep {
+  0% {
+    transform: translateX(-130%) skewX(-24deg);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translateX(160%) skewX(-24deg);
+    opacity: 0;
+  }
 }
 
-.step-chip {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.68rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 3px 9px;
-  border-radius: 0;
-  background: rgba(234, 179, 8, 0.18);
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(254, 240, 138, 0.62);
-  border-left-color: rgba(250, 204, 21, 0.48);
-  border-right-color: rgba(161, 98, 7, 0.58);
-  border-bottom-color: rgba(133, 77, 14, 0.68);
-  color: #fde68a;
-}
-
-.step-chip.place {
-  background: rgba(16, 185, 129, 0.2);
-  border-top-color: rgba(167, 243, 208, 0.62);
-  border-left-color: rgba(52, 211, 153, 0.48);
-  border-right-color: rgba(6, 95, 70, 0.62);
-  border-bottom-color: rgba(6, 78, 59, 0.72);
-  color: #a7f3d0;
-}
-
-.coach-instruction {
-  font-size: 0.9rem;
-  font-weight: 500;
-  color: var(--text-ivory);
-}
-
-.coach-subline {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-
-.swatch-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 2px 9px;
-  border-radius: 0;
-  background: rgba(255, 255, 255, 0.065);
-  border: 1px solid rgba(208, 160, 96, 0.28);
-  color: var(--text-ivory);
-  font-size: 0.73rem;
-}
-
-/* Miniature 3:1 glass block swatch preview */
-.swatch-dot {
-  width: 14px;
-  height: 7px;
-  border-radius: 0;
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 255, 255, 0.65);
-  border-left-color: rgba(255, 255, 255, 0.45);
-  border-right-color: rgba(0, 0, 0, 0.45);
-  border-bottom-color: rgba(0, 0, 0, 0.55);
-}
-
-/* Resistance Meter Bar */
-.resistance-bar-wrap {
-  width: 260px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.resistance-track {
-  flex: 1;
-  height: 8px;
-  border-radius: 0;
-  background: rgba(4, 3, 7, 0.62);
-  border: 1px solid rgba(208, 160, 96, 0.32);
-  overflow: hidden;
-}
-
-.resistance-fill {
-  height: 100%;
-  border-radius: 0;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
-  transition: width 0.06s linear;
-}
-
-/* Silver-Stain Amber Beveled Glass Block CTA Button */
-.primary-action-btn {
-  background: linear-gradient(180deg, #f3be26 0%, #d97706 100%);
-  border-style: solid;
-  border-width: 2px;
-  border-top-color: rgba(255, 251, 232, 0.78);
-  border-left-color: rgba(255, 236, 178, 0.58);
-  border-right-color: rgba(146, 82, 12, 0.78);
-  border-bottom-color: rgba(114, 58, 8, 0.88);
-  outline: 1px solid var(--came-pewter-dark);
-  border-radius: 0;
-  color: #141008;
-  font-weight: 600;
-  font-size: 0.82rem;
-  padding: 6px 16px;
+.quarry-btn {
+  --qx: 50%;
+  --qy: 45%;
+  appearance: none;
+  border: none;
+  outline: none;
+  background: var(--lead-came-deep);
+  padding: 0;
   cursor: pointer;
+  position: relative;
   display: inline-flex;
+  align-items: stretch;
+  justify-content: stretch;
+  color: var(--silica-bright);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.quarry-btn:focus-visible {
+  z-index: 4;
+  outline: 1.5px solid rgba(253, 230, 138, 0.9);
+  outline-offset: 1px;
+}
+
+.quarry-glass-pane {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  box-shadow: 0 4px 16px rgba(234, 179, 8, 0.28);
-  transition: transform 0.12s ease, filter 0.12s ease;
+  justify-content: center;
+  transform-origin: center center;
+  transition:
+    transform 95ms cubic-bezier(0.22, 1, 0.36, 1),
+    filter 130ms ease,
+    box-shadow 120ms ease;
+
+  background-image:
+    radial-gradient(
+      90px circle at var(--qx) var(--qy),
+      rgba(255, 251, 235, var(--hover-bloom, 0)),
+      transparent 72%
+    ),
+    linear-gradient(
+      128deg,
+      rgba(255, 255, 255, 0.24) 0%,
+      rgba(255, 255, 255, 0.04) 38%,
+      rgba(0, 0, 0, 0.14) 100%
+    ),
+    var(--waterglass-grain),
+    linear-gradient(165deg, var(--q-top, rgba(148, 156, 168, 0.28)), var(--q-bot, rgba(48, 52, 60, 0.56)));
+  box-shadow:
+    inset 0 0 6px rgba(6, 5, 10, 0.65),
+    inset 0 1px 0 rgba(255, 253, 245, 0.36),
+    inset 1px 0 0 rgba(255, 253, 245, 0.16);
 }
 
-.primary-action-btn:hover {
-  filter: brightness(1.08);
-  transform: translateY(-1px);
+.quarry-btn.is-lit .quarry-glass-pane {
+  box-shadow:
+    inset 0 0 6px rgba(6, 5, 10, 0.48),
+    inset 0 0 0 1px rgba(255, 248, 224, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62);
 }
 
-/* Collapse Summary Card (Selenium Ruby Came Accent) */
-.collapse-card {
-  padding: 19px 25px;
-  max-width: 486px;
+.quarry-btn:hover:not(:disabled) {
+  --hover-bloom: 0.22;
+}
+
+.quarry-btn:hover:not(:disabled) .quarry-glass-pane {
+  filter: brightness(1.10) saturate(1.08);
+}
+
+.quarry-btn[data-pressing='true'] .quarry-glass-pane {
+  transition:
+    transform 36ms cubic-bezier(0.32, 0, 0.67, 0),
+    filter 45ms ease,
+    box-shadow 45ms ease;
+  transform: translateY(1.6px) scale(0.955);
+  filter: brightness(1.18) saturate(1.14);
+  box-shadow:
+    inset 0 3px 8px rgba(3, 2, 6, 0.90),
+    inset 0 0 2px rgba(0, 0, 0, 0.96),
+    inset 0 -1px 0 rgba(255, 250, 232, 0.32);
+}
+
+.quarry-btn[data-rebounding='true'] .quarry-glass-pane {
+  animation: quarrySpringReturn 280ms cubic-bezier(0.22, 1.35, 0.42, 1) forwards;
+}
+
+.quarry-caustic-glint {
+  position: absolute;
+  inset: -15% 0;
+  width: 46%;
+  pointer-events: none;
+  z-index: 2;
+  opacity: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 253, 242, 0.44) 50%,
+    transparent 100%
+  );
+}
+
+.quarry-btn[data-rebounding='true'] .quarry-caustic-glint {
+  animation: quarryCausticSweep 290ms ease-out forwards;
+}
+
+.quarry-etch-content {
+  position: relative;
+  z-index: 3;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+/* Quarry Glass Material Tones */
+.quarry-tone-crystal {
+  --q-top: rgba(188, 198, 212, 0.28);
+  --q-bot: rgba(58, 64, 74, 0.56);
+}
+
+.quarry-tone-opal {
+  --q-top: rgba(242, 236, 224, 0.88);
+  --q-bot: rgba(206, 196, 178, 0.84);
+  color: var(--kiln-ink);
+}
+
+.quarry-tone-cobalt {
+  --q-top: rgba(59, 130, 246, 0.86);
+  --q-bot: rgba(29, 64, 148, 0.90);
+}
+
+.quarry-tone-emerald {
+  --q-top: rgba(24, 168, 124, 0.86);
+  --q-bot: rgba(11, 88, 64, 0.90);
+}
+
+.quarry-tone-amethyst {
+  --q-top: rgba(152, 84, 216, 0.86);
+  --q-bot: rgba(84, 34, 132, 0.90);
+}
+
+.quarry-tone-amber {
+  --q-top: rgba(238, 156, 36, 0.88);
+  --q-bot: rgba(154, 78, 14, 0.92);
+}
+
+.quarry-tone-ruby {
+  --q-top: rgba(226, 58, 74, 0.88);
+  --q-bot: rgba(136, 20, 34, 0.92);
+}
+
+.quarry-tone-teal {
+  --q-top: rgba(45, 178, 188, 0.84);
+  --q-bot: rgba(17, 92, 104, 0.90);
+}
+
+/* Luminous Silver-Stained Grisaille Tones (unselected window courses still glow softly as glass) */
+.quarry-tone-grisaille-cobalt {
+  --q-top: rgba(128, 152, 188, 0.44);
+  --q-bot: rgba(52, 66, 92, 0.72);
+}
+
+.quarry-tone-grisaille-emerald {
+  --q-top: rgba(124, 162, 148, 0.44);
+  --q-bot: rgba(48, 72, 64, 0.72);
+}
+
+.quarry-tone-grisaille-amethyst {
+  --q-top: rgba(152, 132, 176, 0.44);
+  --q-bot: rgba(66, 52, 86, 0.72);
+}
+
+/* ============================================================================
+ * ZONE 1 (LEFT JAMB): THE ARCHITECTURAL STAINED-GLASS LANCET WINDOW
+ * ============================================================================ */
+.vitrail-lancet-window {
+  pointer-events: auto;
+  width: 244px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  text-align: center;
-  background: rgba(19, 13, 18, 0.91);
-  border-color: rgba(225, 72, 78, 0.62);
+  filter:
+    drop-shadow(0 16px 32px rgba(4, 3, 8, 0.65))
+    drop-shadow(0 0 26px var(--lancet-halo));
 }
 
-.collapse-card::before {
-  border-top-color: rgba(255, 196, 196, 0.18);
-  border-left-color: rgba(248, 148, 148, 0.12);
+.lancet-arch-crown {
+  width: 244px;
+  height: 62px;
+  margin-bottom: -1px;
+  position: relative;
+  z-index: 2;
 }
 
-.collapse-card::after {
-  border-top-color: rgba(252, 165, 165, 0.24);
-  border-left-color: rgba(248, 113, 113, 0.16);
+.lancet-apex-svg {
+  display: block;
+  width: 244px;
+  height: 62px;
 }
 
-.collapse-title {
-  font-family: 'Cinzel', Georgia, serif;
-  font-size: 1.2rem;
-  color: #fca5a5;
-  letter-spacing: 0.08em;
+.lancet-sash-body {
+  background: var(--lead-came);
+  padding: 2px 2.5px 2.5px;
+  border-left: 1px solid var(--pewter-fillet);
+  border-right: 1px solid var(--pewter-fillet);
+  display: flex;
+  flex-direction: column;
+  gap: 2.5px;
 }
 
-.collapse-desc {
-  font-size: 0.83rem;
-  color: var(--text-muted);
-  line-height: 1.42;
+.lancet-course {
+  display: flex;
+  align-items: stretch;
+  gap: 2.5px;
+  background: var(--lead-came);
 }
 
-/* Quick Help Modal Popover */
-.help-modal-backdrop {
+.full-pane-mosaic-svg {
   position: absolute;
   inset: 0;
-  background: rgba(6, 5, 8, 0.66);
-  backdrop-filter: blur(5px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  pointer-events: auto;
-  z-index: 40;
-  padding: 20px;
-}
-
-.help-card {
-  max-width: 526px;
   width: 100%;
-  padding: 25px 27px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  background: rgba(18, 16, 22, 0.95);
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
 }
 
-.help-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+/* Clerestory Sky Panes (Morning / Vespers / Noon) */
+.sky-course {
+  height: 58px;
 }
 
-.help-title {
-  font-family: 'Cinzel', Georgia, serif;
-  font-size: 1.15rem;
-  color: #fde6b0;
+.sky-lancet-pane {
+  flex: 1;
 }
 
-.help-steps {
-  display: flex;
-  flex-direction: column;
-  gap: 11px;
+.sky-lancet-pane .quarry-etch-content {
+  align-items: flex-end;
+  padding-bottom: 3.5px;
 }
 
-.help-step {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  background: rgba(6, 5, 9, 0.42);
-  padding: 10px 12px;
-  border-radius: 0;
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(255, 245, 220, 0.16);
-  border-left-color: rgba(238, 202, 140, 0.12);
-  border-right-color: rgba(0, 0, 0, 0.5);
-  border-bottom-color: rgba(0, 0, 0, 0.6);
+.sky-pane-label {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--silica-bright);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
 }
 
-.help-num {
-  width: 24px;
-  height: 24px;
-  border-radius: 0;
-  background: rgba(234, 179, 8, 0.22);
-  border-style: solid;
-  border-width: 1px;
-  border-top-color: rgba(254, 240, 138, 0.65);
-  border-left-color: rgba(250, 204, 21, 0.48);
-  border-right-color: rgba(161, 98, 7, 0.6);
-  border-bottom-color: rgba(133, 77, 14, 0.7);
-  color: #fde68a;
-  font-size: 0.78rem;
-  font-weight: 700;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+/* Frosted Milk-Opal Nameplate Cartouche + Wright Margin Lights */
+.cartouche-course {
+  height: 46px;
+}
+
+.margin-inlay-cell {
+  width: 22px;
   flex-shrink: 0;
 }
 
-.help-step-body h4 {
-  font-size: 0.86rem;
-  margin-bottom: 3px;
-  color: var(--text-ivory);
+.margin-inlay-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.help-step-body p {
-  font-size: 0.78rem;
-  color: var(--text-muted);
-  line-height: 1.42;
+.opal-title-plaque {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-image:
+    linear-gradient(125deg, rgba(255, 255, 255, 0.45) 0%, transparent 48%, rgba(168, 152, 126, 0.25) 100%),
+    var(--waterglass-grain);
+  background-color: #ebe3d3;
+  box-shadow:
+    inset 0 0 6px rgba(42, 34, 24, 0.36),
+    inset 0 1px 0 #ffffff;
 }
 
-.webgpu-error-banner {
+.vitrail-wordmark {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.26em;
+  padding-left: 0.26em;
+  color: var(--kiln-ink);
+  line-height: 1.1;
+}
+
+.vitrail-spec {
+  margin-top: 2px;
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  color: #463c33;
+  white-space: nowrap;
+}
+
+/* 3 Horizontal Inlaid Stained-Glass Mode Courses */
+.lancet-mode-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2.5px;
+  background: var(--lead-came);
+}
+
+.mode-course-btn {
+  height: 38px;
+  width: 100%;
+}
+
+.mode-course-btn .quarry-etch-content {
+  justify-content: flex-start;
+  gap: 0;
+}
+
+.mode-medallion-svg {
+  width: 46px;
+  height: 38px;
+  flex-shrink: 0;
+  border-right: 2px solid var(--lead-came);
+}
+
+.mode-right-jewel-svg {
+  width: 11px;
+  height: 38px;
+  flex-shrink: 0;
+  border-left: 2px solid var(--lead-came);
+}
+
+.mode-course-copy {
+  flex: 1;
+  min-width: 0;
+  padding: 0 11px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.mode-course-name {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(8, 6, 12, 0.72);
+}
+
+.mode-course-meta {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(252, 246, 234, 0.82);
+  text-shadow: 0 1px 2px rgba(8, 6, 12, 0.65);
+}
+
+/* Pass & Play Inlaid Sub-Course */
+.party-subcourse {
+  height: 34px;
+}
+
+.party-turn-pane {
+  flex: 1;
+  min-width: 0;
+  padding: 0 9px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: linear-gradient(135deg, rgba(84, 96, 92, 0.56), rgba(38, 44, 42, 0.80));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.player-cabochon {
+  width: 8px;
+  height: 8px;
+  transform: rotate(45deg);
+  border: 1px solid #100e14;
+  outline: 0.8px solid rgba(255, 255, 255, 0.65);
+  flex-shrink: 0;
+}
+
+.party-turn-copy {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--silica-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.party-count-strip {
+  display: flex;
+  gap: 2px;
+  background: var(--lead-came);
+}
+
+.player-num-pane {
+  width: 28px;
+}
+
+.player-num-pane .quarry-etch-content {
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+/* Sandbox Smash Sub-Course */
+.sandbox-subcourse {
+  height: 36px;
+}
+
+.smash-course-btn {
+  width: 100%;
+}
+
+.smash-course-btn .quarry-etch-content {
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Lower Sill Trio (Glass-in-Glass Panes: Chime, Rebuild, Guide) */
+.sill-course {
+  height: 52px;
+}
+
+.sill-pane-btn {
+  flex: 1;
+}
+
+.sill-pane-btn .quarry-etch-content {
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 2px;
+}
+
+.sill-etch-svg {
+  width: 19px;
+  height: 19px;
+  flex-shrink: 0;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.72));
+}
+
+.sill-pane-label {
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--silica-bright);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+}
+
+.lancet-apron-svg {
+  display: block;
+  width: 244px;
+  height: 24px;
+  margin-top: -1px;
+}
+
+/* ============================================================================
+ * ZONE 2 (RIGHT SPACE): FRAMELESS WHEEL-ETCHED OPTICAL CRYSTAL INSTRUMENT
+ * Pure transparent beveled crystal with 0.75px frosted silica engraving
+ * ============================================================================ */
+.crystal-optical-plate {
+  pointer-events: auto;
+  position: relative;
+  width: 204px;
+  padding: 13px 15px 12px;
+  background: linear-gradient(
+    142deg,
+    rgba(255, 253, 248, 0.065) 0%,
+    rgba(255, 255, 255, 0.015) 54%,
+    rgba(255, 252, 244, 0.038) 100%
+  );
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  border-top: 1px solid rgba(255, 252, 244, 0.36);
+  border-left: 1px solid rgba(255, 252, 244, 0.24);
+  border-right: 1px solid rgba(255, 252, 244, 0.11);
+  border-bottom: 1px solid rgba(255, 252, 244, 0.14);
+  box-shadow:
+    inset 0 0 0 3px rgba(255, 255, 255, 0.015),
+    0 10px 26px rgba(0, 0, 0, 0.24);
+}
+
+/* Wheel-engraved optical registration ticks at the 4 crystal corners */
+.crystal-reg {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  pointer-events: none;
+}
+
+.reg-tl {
+  top: 4px;
+  left: 4px;
+  border-top: 1px solid var(--silica-faint);
+  border-left: 1px solid var(--silica-faint);
+}
+.reg-tr {
+  top: 4px;
+  right: 4px;
+  border-top: 1px solid var(--silica-faint);
+  border-right: 1px solid var(--silica-faint);
+}
+.reg-bl {
+  bottom: 4px;
+  left: 4px;
+  border-bottom: 1px solid var(--silica-faint);
+  border-left: 1px solid var(--silica-faint);
+}
+.reg-br {
+  bottom: 4px;
+  right: 4px;
+  border-bottom: 1px solid var(--silica-faint);
+  border-right: 1px solid var(--silica-faint);
+}
+
+.etched-plumb-section {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 11px;
+  border-bottom: 1px solid rgba(255, 250, 240, 0.14);
+}
+
+.etched-compass-wrap {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  flex-shrink: 0;
+}
+
+.etched-compass-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.inlaid-plumb-jewel {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  transform: translate(-50%, -50%) rotate(45deg);
+  border: 1px solid #ffffff;
+  box-shadow:
+    0 0 10px currentColor,
+    0 0 2px #ffffff;
+  transition: left 75ms linear, top 75ms linear, background-color 180ms ease;
+  pointer-events: none;
+}
+
+.etched-plumb-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.etched-plumb-title {
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--silica-faint);
+}
+
+.etched-plumb-deg {
+  margin-top: 1px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 16px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+
+.etched-plumb-status {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--silica-soft);
+  line-height: 1.1;
+}
+
+.etched-metrics-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.etched-metric-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 250, 240, 0.10);
+}
+
+.etched-metric-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.inlaid-gem {
+  width: 7px;
+  height: 7px;
+  transform: rotate(45deg);
+  flex-shrink: 0;
+  border: 0.8px solid rgba(255, 255, 255, 0.55);
+}
+
+.gem-cobalt {
+  background: #3b82f6;
+  box-shadow: 0 0 6px rgba(59, 130, 246, 0.5);
+}
+.gem-emerald {
+  background: #10b981;
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
+}
+.gem-opal {
+  background: #f3ece0;
+  box-shadow: 0 0 5px rgba(255, 248, 228, 0.35);
+}
+.gem-amber {
+  background: #f59e0b;
+  box-shadow: 0 0 7px rgba(245, 158, 11, 0.6);
+}
+.gem-ruby {
+  background: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.65);
+}
+
+.etched-metric-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.etched-m-label {
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--silica-bright);
+  line-height: 1.15;
+}
+
+.etched-m-sub {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--silica-soft);
+  line-height: 1.1;
+}
+
+.etched-m-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--silica-bright);
+  white-space: nowrap;
+}
+
+/* ============================================================================
+ * ZONE 3 (BOTTOM HORIZON): 3D BEVEL-MITERED CUT-GLASS PRISM BAR
+ * Replicates a beveled clear glass prism with inlaid stained-glass end-caps
+ * ============================================================================ */
+.cut-glass-prism-bar {
+  pointer-events: auto;
+  display: flex;
+  align-items: stretch;
+  min-height: 46px;
+  max-width: min(94vw, 860px);
+  border-top: 1px solid rgba(255, 253, 246, 0.44);
+  border-bottom: 1px solid rgba(255, 253, 246, 0.18);
+  border-left: 1px solid rgba(255, 253, 246, 0.32);
+  border-right: 1px solid rgba(255, 253, 246, 0.32);
+  box-shadow:
+    0 12px 28px rgba(4, 3, 7, 0.55),
+    0 -1px 12px rgba(147, 197, 253, 0.08),
+    0 1px 12px rgba(251, 191, 36, 0.07);
+}
+
+.prism-end-inlay-svg {
+  width: 18px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.prism-bevel-chamber {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 14px;
+  background-image:
+    var(--prism-corner-tl),
+    var(--prism-corner-tr),
+    var(--prism-corner-bl),
+    var(--prism-corner-br),
+    linear-gradient(
+      176deg,
+      rgba(255, 254, 248, 0.16) 0%,
+      rgba(255, 255, 255, 0.04) 24%,
+      rgba(18, 17, 22, 0.58) 100%
+    );
+  background-color: rgba(24, 22, 26, 0.62);
+  background-repeat: no-repeat;
+  background-position: top left, top right, bottom left, bottom right, center;
+  background-size: 10px 10px, 10px 10px, 10px 10px, 10px 10px, 100% 100%;
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+}
+
+.prism-phase-tag {
+  padding: 4px 9px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  border: 1px solid rgba(255, 252, 242, 0.28);
+  white-space: nowrap;
+}
+
+.tag-cobalt {
+  background: rgba(37, 99, 235, 0.36);
+  color: #dbeafe;
+}
+.tag-amber {
+  background: rgba(217, 119, 6, 0.38);
+  color: #fef3c7;
+}
+.tag-emerald {
+  background: rgba(16, 185, 129, 0.36);
+  color: #d1fae5;
+}
+.tag-amethyst {
+  background: rgba(147, 51, 234, 0.36);
+  color: #f3e8ff;
+}
+
+.prism-copy-group {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+}
+
+.prism-primary-line {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--silica-bright);
+  white-space: nowrap;
+}
+
+.prism-secondary-line {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--silica-soft);
+  white-space: nowrap;
+}
+
+.inlaid-swatch-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.inlaid-prism-chip {
+  display: inline-block;
+  width: 12px;
+  height: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.65);
+}
+
+.status-legal {
+  color: #86efac;
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.status-locked {
+  color: #fca5a5;
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* 12-Pane Leaded Stained-Glass Tension Strip */
+.leaded-tension-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 3px;
+  background: var(--lead-came);
+  border: 1px solid rgba(255, 250, 240, 0.20);
+}
+
+.tension-quarry {
+  width: 9px;
+  height: 22px;
+  background: rgba(255, 255, 255, 0.08);
+  transition: background 80ms ease, box-shadow 80ms ease;
+}
+
+.tension-quarry.seg-sky.is-lit {
+  background: linear-gradient(180deg, #93c5fd, #2563eb);
+  box-shadow: 0 0 7px rgba(59, 130, 246, 0.5);
+}
+.tension-quarry.seg-amber.is-lit {
+  background: linear-gradient(180deg, #fde047, #d97706);
+  box-shadow: 0 0 7px rgba(245, 158, 11, 0.5);
+}
+.tension-quarry.seg-ruby.is-lit {
+  background: linear-gradient(180deg, #fca5a5, #dc2626);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+}
+.tension-quarry.seg-emerald.is-lit {
+  background: linear-gradient(180deg, #6ee7b7, #059669);
+  box-shadow: 0 0 7px rgba(16, 185, 129, 0.45);
+}
+
+/* Placement Inlaid Glass Keys inside the Bottom Prism */
+.prism-inlaid-keys {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 2px;
+  background: var(--lead-came);
+  border: 1px solid rgba(255, 252, 242, 0.24);
+  height: 34px;
+}
+
+.prism-key-btn .quarry-etch-content {
+  padding: 0 9px;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.prism-release-btn .quarry-etch-content {
+  padding: 0 13px;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.place-glyph-svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+/* ============================================================================
+ * COLLAPSE PLAQUE & VITRAIL STUDIO GUIDE MODAL
+ * ============================================================================ */
+.collapse-crystal-plaque,
+.codex-window {
+  pointer-events: auto;
+  background: var(--lead-came);
+  padding: 2.5px;
+  border: 1px solid var(--pewter-fillet);
+  box-shadow: 0 18px 42px rgba(4, 3, 8, 0.72);
+  display: flex;
+  flex-direction: column;
+  gap: 2.5px;
+}
+
+.collapse-crystal-plaque {
+  max-width: 470px;
+  width: calc(100vw - 40px);
+}
+
+.monument-spandrel-bar {
+  display: flex;
+  height: 8px;
+  gap: 2.5px;
+  background: var(--lead-came);
+}
+
+.m-shard {
+  flex: 1;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.s-ruby {
+  background: linear-gradient(135deg, #ef4444, #991b1b);
+}
+.s-amber {
+  background: linear-gradient(135deg, #f59e0b, #92400e);
+}
+.s-rose {
+  background: linear-gradient(135deg, #f43f5e, #9f1239);
+}
+.s-amethyst {
+  background: linear-gradient(135deg, #a855f7, #581c87);
+}
+.s-cobalt {
+  background: linear-gradient(135deg, #3b82f6, #1e3a8a);
+}
+.s-emerald {
+  background: linear-gradient(135deg, #10b981, #065f46);
+}
+.s-teal {
+  background: linear-gradient(135deg, #14b8a6, #115e59);
+}
+
+.monument-body {
+  padding: 18px 22px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 9px;
+  background: linear-gradient(160deg, rgba(48, 38, 42, 0.88), rgba(22, 20, 24, 0.94));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.monument-title {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--silica-bright);
+}
+
+.monument-prose {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--silica-soft);
+  max-width: 410px;
+}
+
+.monument-prose strong {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.keystone-cta {
+  margin-top: 4px;
+  height: 38px;
+  min-width: 240px;
+}
+
+.keystone-cta .quarry-etch-content {
+  padding: 0 18px;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.codex-backdrop {
   position: absolute;
   inset: 0;
+  z-index: 40;
+  background: rgba(10, 9, 13, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
-  background: #0d0c0f;
-  z-index: 50;
+  padding: 20px;
 }
 
-@media (max-width: 760px) {
+.codex-window {
+  width: min(550px, 100%);
+}
+
+.codex-pane-inner {
+  padding: 22px 24px;
+  background: rgba(28, 26, 30, 0.92);
+}
+
+.codex-header-course {
+  display: flex;
+  align-items: stretch;
+  gap: 2.5px;
+  min-height: 56px;
+}
+
+.codex-title-quarry {
+  flex: 1;
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #ebe3d3;
+  color: var(--kiln-ink);
+}
+
+.hallmark-svg {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.etched-heading {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: inherit;
+}
+
+.etched-subtitle {
+  display: block;
+  margin-top: 2px;
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-size: 13px;
+  font-weight: 600;
+  color: #4a4037;
+}
+
+.etched-prose {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--silica-soft);
+}
+
+.codex-close-quarry {
+  width: 50px;
+}
+
+.codex-courses {
+  display: flex;
+  flex-direction: column;
+  gap: 2.5px;
+}
+
+.codex-step-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2.5px;
+}
+
+.codex-diagram-quarry {
+  width: 72px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  background: rgba(34, 32, 38, 0.92);
+}
+
+.codex-medallion-svg {
+  width: 48px;
+  height: 48px;
+}
+
+.codex-text-quarry {
+  flex: 1;
+  padding: 11px 15px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  background: rgba(28, 26, 32, 0.92);
+}
+
+.codex-text-quarry h4 {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--silica-bright);
+}
+
+.codex-text-quarry p {
+  font-size: 12.5px;
+  line-height: 1.48;
+  color: var(--silica-soft);
+}
+
+.codex-text-quarry strong {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.codex-footer-course {
+  display: flex;
+  align-items: stretch;
+  gap: 2.5px;
+  min-height: 40px;
+}
+
+.codex-hint-quarry {
+  flex: 1;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-size: 13.5px;
+  color: var(--silica-soft);
+  background: rgba(26, 24, 30, 0.92);
+}
+
+.codex-enter-quarry .quarry-etch-content {
+  padding: 0 18px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+@media (max-width: 900px) {
   .hud-layer {
     padding: 12px;
   }
-  .brand-panel {
-    min-width: 240px;
-    padding: 11px 13px;
+
+  .vitrail-lancet-window {
+    width: 214px;
   }
-  .plumb-panel {
-    display: none;
+
+  .lancet-arch-crown,
+  .lancet-apex-svg,
+  .lancet-apron-svg {
+    width: 214px;
   }
-  .coach-pill {
-    padding: 11px 15px;
+
+  .crystal-optical-plate {
+    width: 176px;
+    padding: 10px 12px;
+  }
+
+  .prism-primary-line,
+  .prism-secondary-line {
+    white-space: normal;
   }
 }

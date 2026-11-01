@@ -681,6 +681,18 @@ export class GameEngine {
     this.emitTelemetry(true);
   }
 
+  public handleResetCarriedRotation(): void {
+    if (this.physics.turnPhase !== 'EXTRACTED') return;
+    this.physics.resetCarriedBlockRotation();
+    this.emitTelemetry(true);
+  }
+
+  public handleReleaseOntoTop(): void {
+    if (this.physics.turnPhase !== 'EXTRACTED') return;
+    this.physics.releaseExtractedBlockOntoTop();
+    this.emitTelemetry(true);
+  }
+
   private onPointerDown = (e: PointerEvent): void => {
     if ((e as unknown as { _vitrailHandled?: boolean })._vitrailHandled) return;
     (e as unknown as { _vitrailHandled?: boolean })._vitrailHandled = true;

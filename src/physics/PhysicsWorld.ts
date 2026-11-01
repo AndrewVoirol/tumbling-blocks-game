@@ -134,17 +134,22 @@ export interface TowerTelemetry {
   playerCount: number;
   blocksStacked: number;
   currentLayers: number;
+  peakLayers: number;
+  liveHeightCm: number;
   peakHeightCm: number;
   leanAngleDeg: number;
   wobbleSpeedDegPerSec: number;
   centerOfMassXZ: [number, number]; // in cm relative to base center
   shatteredCount: number;
+  crazedCount: number;
   intactCount: number;
   activeShardCount: number;
   grabResistance01: number; // 0 = loose, 0.5 = snug, 0.9+ = pinned load-bearing
   hoveredBlockId: number | null;
   activeBlockId: number | null;
   hoveredSlotIndex: number | null;
+  carriedYawDeg: number;
+  lockedMinRow: number | null;
   settleProgress01: number;
   collapseReason: string | null;
 }
@@ -268,7 +273,10 @@ export class PhysicsWorld {
   public wobbleSpeedDegPerSec: number = 0;
   public centerOfMassXZCm: [number, number] = [0, 0];
   public currentLayers: number = INITIAL_LAYERS;
+  public peakLayers: number = INITIAL_LAYERS;
+  public liveHeightCm: number = INITIAL_LAYERS * BLOCK_HEIGHT * 10;
   public peakHeightCm: number = INITIAL_LAYERS * BLOCK_HEIGHT * 10;
+  public lockedMinRow: number | null = INITIAL_LAYERS;
 
   private accumulator: number = 0;
   private simTime: number = 0;
@@ -385,7 +393,10 @@ export class PhysicsWorld {
     this.leanAngleDeg = 0;
     this.wobbleSpeedDegPerSec = 0;
     this.currentLayers = towerLayers;
+    this.peakLayers = towerLayers;
+    this.liveHeightCm = towerLayers * BLOCK_HEIGHT * 10;
     this.peakHeightCm = towerLayers * BLOCK_HEIGHT * 10;
+    this.lockedMinRow = this.gameMode === 'sandbox' ? null : towerLayers;
 
     const rBevel = BLOCK_BEVEL_RADIUS;
 
@@ -3381,7 +3392,10 @@ export class PhysicsWorld {
           if (t.y + BLOCK_HALF_Y > maxTowerY) {
             maxTowerY = t.y + BLOCK_HALF_Y;
           }
-          if (b.assignedLayer > maxActiveLayer) {
+          if (
+            t.y >= Math.max(0.03, (b.assignedLayer - 0.85) * BLOCK_HEIGHT) &&
+            b.assignedLayer > maxActiveLayer
+          ) {
             maxActiveLayer = b.assignedLayer;
           }
           const upVec = quatRotateVec3(b.rotation, [0, 1, 0]);
@@ -3431,14 +3445,21 @@ export class PhysicsWorld {
       this.wobbleSpeedDegPerSec = this.wobbleSpeedDegPerSec * 0.7 + avgOmegaDeg * 0.3;
     }
 
-    this.currentLayers = maxActiveLayer + 1;
+    this.currentLayers = countInTower > 0 ? maxActiveLayer + 1 : 0;
     const heightCm = maxTowerY * 10.0;
-    if (this.turnPhase !== 'COLLAPSED' && heightCm > this.peakHeightCm) {
-      this.peakHeightCm = heightCm;
+    this.liveHeightCm = heightCm;
+    if (this.turnPhase !== 'COLLAPSED') {
+      if (heightCm > this.peakHeightCm) {
+        this.peakHeightCm = heightCm;
+      }
+      if (this.currentLayers > this.peakLayers) {
+        this.peakLayers = this.currentLayers;
+      }
     }
 
     this.computeOpenTopSlots();
     const forbiddenMinLayer = Math.max(0, this.topSupportFrame.targetLayer - 1);
+    this.lockedMinRow = this.gameMode === 'sandbox' ? null : forbiddenMinLayer + 1;
 
     for (const b of this.blocks) {
       b.isLegalTarget =
@@ -3678,7 +3699,14 @@ export class PhysicsWorld {
   }
 
   private updateTurnStateMachine(dt: number): void {
-    if (this.gameMode === 'sandbox' || this.turnPhase === 'COLLAPSED') return;
+    if (this.gameMode === 'sandbox') return;
+    if (this.turnPhase === 'COLLAPSED') {
+      if (this.shatteredCount > 0) {
+        this.collapseReason =
+          'The stained-glass tower gave way and shattered across the walnut table!';
+      }
+      return;
+    }
     if (this.simTime < 0.25) return;
 
     let fallenBlocks = this.shatteredCount;
@@ -3716,7 +3744,7 @@ export class PhysicsWorld {
       }
       this.collapseReason =
         this.shatteredCount > 0
-          ? 'The stained-glass tower gave way and shattered across the oak table!'
+          ? 'The stained-glass tower gave way and shattered across the walnut table!'
           : 'The tower lost equilibrium and tumbled!';
       return;
     }
@@ -3737,6 +3765,17 @@ export class PhysicsWorld {
   }
 
   public getTelemetry(): TowerTelemetry {
+    let intactCount = 0;
+    let crazedCount = 0;
+    for (let i = 0; i < this.blocks.length; i++) {
+      const b = this.blocks[i];
+      if (!b.shattered) {
+        intactCount++;
+        if (b.damage > 0.05) {
+          crazedCount++;
+        }
+      }
+    }
     return {
       turnPhase: this.turnPhase,
       gameMode: this.gameMode,
@@ -3744,6 +3783,8 @@ export class PhysicsWorld {
       playerCount: this.playerCount,
       blocksStacked: this.blocksStacked,
       currentLayers: this.currentLayers,
+      peakLayers: this.peakLayers,
+      liveHeightCm: +this.liveHeightCm.toFixed(1),
       peakHeightCm: +this.peakHeightCm.toFixed(1),
       leanAngleDeg: +this.leanAngleDeg.toFixed(2),
       wobbleSpeedDegPerSec: +this.wobbleSpeedDegPerSec.toFixed(1),
@@ -3752,12 +3793,15 @@ export class PhysicsWorld {
         +this.centerOfMassXZCm[1].toFixed(2),
       ],
       shatteredCount: this.shatteredCount,
-      intactCount: this.blocks.filter((b) => !b.shattered).length,
+      crazedCount,
+      intactCount,
       activeShardCount: this.shards.length,
       grabResistance01: +this.grabResistance01.toFixed(2),
       hoveredBlockId: this.hoveredBlockId,
       activeBlockId: this.activeBlockId,
       hoveredSlotIndex: this.hoveredSlotIndex,
+      carriedYawDeg: Math.round((this.carriedYawOffsetRad * 180) / Math.PI),
+      lockedMinRow: this.lockedMinRow,
       settleProgress01:
         this.turnPhase === 'SETTLING'
           ? Math.min(1.0, this.settleTimer / this.SETTLE_DURATION)
