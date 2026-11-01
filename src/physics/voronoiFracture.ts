@@ -1,5 +1,11 @@
 import { Vec3 } from '../math/vecMat';
-import { BLOCK_HALF_X, BLOCK_HALF_Y, BLOCK_HALF_Z } from './constants';
+import {
+  BLOCK_HALF_X,
+  BLOCK_HALF_Y,
+  BLOCK_HALF_Z,
+  GLASS_DENSITY,
+  SHARD_SLOT_STRIDE_VERTS,
+} from './constants';
 
 export const MAX_SHARD_PLANES = 12;
 
@@ -285,11 +291,156 @@ function applyAnisotropicMetric(
   ];
 }
 
+function buildShardGeometryFromFaces(
+  faces: PolyFace[],
+  clampedImpact: Vec3
+): GlassShardGeometry | null {
+  if (faces.length < 4) return null;
+
+  const uniqueVerts: Vec3[] = [];
+  for (const f of faces) {
+    for (const v of f.verts) {
+      let exists = false;
+      for (const u of uniqueVerts) {
+        if (Math.hypot(v[0] - u[0], v[1] - u[1], v[2] - u[2]) < 2e-4) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) uniqueVerts.push(v);
+    }
+  }
+  if (uniqueVerts.length < 4) return null;
+
+  let refX = 0, refY = 0, refZ = 0;
+  for (const u of uniqueVerts) {
+    refX += u[0];
+    refY += u[1];
+    refZ += u[2];
+  }
+  refX /= uniqueVerts.length;
+  refY /= uniqueVerts.length;
+  refZ /= uniqueVerts.length;
+
+  let totalVolume = 0;
+  let cx = 0, cy = 0, cz = 0;
+
+  for (const f of faces) {
+    const fv = f.verts;
+    const v0 = fv[0];
+    for (let t = 1; t < fv.length - 1; t++) {
+      const v1 = fv[t];
+      const v2 = fv[t + 1];
+
+      const ax = v0[0] - refX, ay = v0[1] - refY, az = v0[2] - refZ;
+      const bx = v1[0] - refX, by = v1[1] - refY, bz = v1[2] - refZ;
+      const dx = v2[0] - refX, dy = v2[1] - refY, dz = v2[2] - refZ;
+
+      const det =
+        ax * (by * dz - bz * dy) -
+        ay * (bx * dz - bz * dx) +
+        az * (bx * dy - by * dx);
+      const tetVol = Math.abs(det) / 6.0;
+      totalVolume += tetVol;
+      cx += tetVol * (refX + v0[0] + v1[0] + v2[0]) * 0.25;
+      cy += tetVol * (refY + v0[1] + v1[1] + v2[1]) * 0.25;
+      cz += tetVol * (refZ + v0[2] + v1[2] + v2[2]) * 0.25;
+    }
+  }
+
+  if (totalVolume < 1e-6) return null;
+  const localCentroid: Vec3 = [cx / totalVolume, cy / totalVolume, cz / totalVolume];
+  const impactDist = Math.hypot(
+    localCentroid[0] - clampedImpact[0],
+    localCentroid[1] - clampedImpact[1],
+    localCentroid[2] - clampedImpact[2]
+  );
+
+  let triCount = 0;
+  for (const f of faces) {
+    triCount += Math.max(0, f.verts.length - 2);
+  }
+  if (triCount < 4) {
+    return null;
+  }
+  const vertexCount = Math.min(SHARD_SLOT_STRIDE_VERTS, triCount * 3);
+
+  const hullPoints = new Float32Array(uniqueVerts.length * 3);
+  for (let k = 0; k < uniqueVerts.length; k++) {
+    hullPoints[k * 3 + 0] = uniqueVerts[k][0] - localCentroid[0];
+    hullPoints[k * 3 + 1] = uniqueVerts[k][1] - localCentroid[1];
+    hullPoints[k * 3 + 2] = uniqueVerts[k][2] - localCentroid[2];
+  }
+
+  // Pack up to MAX_SHARD_PLANES (12) bounding half-space planes sorted by face area descending
+  const sortedFacesForPlanes = faces
+    .map((f) => ({ f, area: computePolygonArea(f.verts) }))
+    .sort((a, b) => b.area - a.area);
+  const planeCount = Math.min(MAX_SHARD_PLANES, sortedFacesForPlanes.length);
+  const planes = new Float32Array(MAX_SHARD_PLANES * 4);
+  for (let pIdx = 0; pIdx < planeCount; pIdx++) {
+    const f = sortedFacesForPlanes[pIdx].f;
+    const v0 = f.verts[0];
+    const distFromCentroid = Math.max(
+      2e-4,
+      f.normal[0] * (v0[0] - localCentroid[0]) +
+        f.normal[1] * (v0[1] - localCentroid[1]) +
+        f.normal[2] * (v0[2] - localCentroid[2])
+    );
+    planes[pIdx * 4 + 0] = f.normal[0];
+    planes[pIdx * 4 + 1] = f.normal[1];
+    planes[pIdx * 4 + 2] = f.normal[2];
+    planes[pIdx * 4 + 3] = f.isOuter ? -distFromCentroid : distFromCentroid;
+  }
+
+  const renderVertices = new Float32Array(vertexCount * 10);
+  let ptr = 0;
+  const maxFloatLen = vertexCount * 10;
+  for (const item of sortedFacesForPlanes) {
+    if (ptr + 30 > maxFloatLen) break;
+    const f = item.f;
+    const fv = f.verts;
+    const nx = f.normal[0];
+    const ny = f.normal[1];
+    const nz = f.normal[2];
+    const outerFlag = f.isOuter ? 1.0 : 0.0;
+    const v0 = fv[0];
+
+    for (let t = 1; t < fv.length - 1; t++) {
+      if (ptr + 30 > maxFloatLen) break;
+      const tri = [v0, fv[t], fv[t + 1]];
+      for (const v of tri) {
+        renderVertices[ptr++] = v[0] - localCentroid[0];
+        renderVertices[ptr++] = v[1] - localCentroid[1];
+        renderVertices[ptr++] = v[2] - localCentroid[2];
+        renderVertices[ptr++] = nx;
+        renderVertices[ptr++] = ny;
+        renderVertices[ptr++] = nz;
+        renderVertices[ptr++] = v[0];
+        renderVertices[ptr++] = v[1];
+        renderVertices[ptr++] = v[2];
+        renderVertices[ptr++] = outerFlag;
+      }
+    }
+  }
+
+  return {
+    localCentroid,
+    volume: totalVolume,
+    impactDist,
+    hullPoints,
+    planes,
+    planeCount,
+    renderVertices,
+    vertexCount,
+  };
+}
+
 /**
  * Fractures a stained-glass Jenga block into watertight 3D Voronoi convex polyhedron shards:
  * - Zone 1 (Hertzian crush core): small angular glass chips tightly clustered at `localImpactPoint`
- * - Zone 2 (Radial cleavage fan): elongated, acute diagonal glass wedges & splinters guided by stained-glass cames
- * - Zone 3 (Far-end remnants): larger recognizable leaded stained-glass end pieces on moderate impacts
+ * - Zone 2 (Radial cleavage fan): elongated, acute diagonal glass wedges & splinters
+ * - Zone 3 (Far-end remnants): larger cast-glass end pieces (with optional 1-generation 2-plane cleavage > 10g on high-energy impacts)
  */
 export function fractureBlockVoronoi(
   localImpactPoint: Vec3,
@@ -298,8 +449,9 @@ export function fractureBlockVoronoi(
   hx: number = BLOCK_HALF_X,
   hy: number = BLOCK_HALF_Y,
   hz: number = BLOCK_HALF_Z,
-  motif: number = 0,
-  impactEnergy01: number = 0.65
+  _motif: number = 0,
+  impactEnergy01: number = 0.65,
+  allowSecondaryCleavage: boolean = false
 ): GlassShardGeometry[] {
   const rand = mulberry32(seed);
   const energy = Math.max(0.0, Math.min(1.0, impactEnergy01));
@@ -343,75 +495,63 @@ export function fractureBlockVoronoi(
   const l3 = 2.25;
 
   const seeds: Vec3[] = [];
+  const seedZones: number[] = [];
   const targetCount = Math.max(4, Math.min(22, shardCount));
 
-  // Keep only 1-2 seeds in the far un-impacted end so blocks snap into realistic jagged half-bars/large end remnants
-  // paired with long acute splinters and small crushed cullet chips at the impact zone!
   const farCount = energy > 0.8 ? 2 : 1;
   const crushCount = Math.max(2, Math.round((targetCount - farCount) * (0.44 + energy * 0.12)));
   const fanCount = Math.max(1, targetCount - farCount - crushCount);
 
   for (let i = 0; i < targetCount; i++) {
-    let sx = 0;
-    let sy = 0;
-    let sz = 0;
+    const zone = i < crushCount ? 1 : i < crushCount + fanCount ? 2 : 3;
+    const minSep = zone === 1 ? 0.013 : 0.022;
 
-    if (i < crushCount) {
-      // Zone 1: Hertzian impact crush zone — small sharp chips right around the contact point
-      const rFrac = Math.pow(rand(), 1.75) * (0.19 + energy * 0.09);
-      const rx = (rand() * 2 - 1) * hx * 0.94;
-      const ry = (rand() * 2 - 1) * hy * 0.90;
-      const rz = (rand() * 2 - 1) * hz * 0.92;
-      sx = clampedImpact[0] + (rx - clampedImpact[0]) * rFrac;
-      sy = clampedImpact[1] + (ry - clampedImpact[1]) * rFrac;
-      sz = clampedImpact[2] + (rz - clampedImpact[2]) * rFrac;
-    } else if (i < crushCount + fanCount) {
-      // Zone 2: Mid-range radial cleavage fan, subtly attracted to stained-glass lead came stress risers
-      const t = 0.20 + rand() * (0.38 + energy * 0.22);
-      let rx = (rand() * 2 - 1) * hx * 0.92;
-      const ry = (rand() * 2 - 1) * hy * 0.88;
-      let rz = (rand() * 2 - 1) * hz * 0.92;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      let sx = 0;
+      let sy = 0;
+      let sz = 0;
 
-      if (motif === 2 && rand() < 0.45) {
-        // Gothic Triptych mullions at x = +/- 0.125 dm
-        rx = (rand() > 0.5 ? 0.125 : -0.125) + (rand() - 0.5) * 0.04;
-      } else if (motif === 1 && rand() < 0.4) {
-        // Diamond lozenge diagonal panes
-        rz = (rand() > 0.5 ? 1 : -1) * Math.max(0.02, (1.0 - Math.abs(rx) / hx) * hz * 0.78);
-      } else if (motif === 3 && rand() < 0.4) {
-        // Rose medallion rondel perimeter
-        const ang = rand() * Math.PI * 2;
-        rx = Math.cos(ang) * 0.11;
-        rz = Math.sin(ang) * 0.08;
+      if (zone === 1) {
+        const spreadBoost = attempt * 0.065;
+        const rFrac = Math.pow(rand(), 1.45) * (0.21 + energy * 0.09 + spreadBoost);
+        const rx = (rand() * 2 - 1) * hx * 0.94;
+        const ry = (rand() * 2 - 1) * hy * 0.90;
+        const rz = (rand() * 2 - 1) * hz * 0.92;
+        sx = clampedImpact[0] + (rx - clampedImpact[0]) * rFrac;
+        sy = clampedImpact[1] + (ry - clampedImpact[1]) * rFrac;
+        sz = clampedImpact[2] + (rz - clampedImpact[2]) * rFrac;
+      } else if (zone === 2) {
+        const t = 0.22 + rand() * (0.42 + energy * 0.22);
+        const rx = (rand() * 2 - 1) * hx * 0.92;
+        const ry = (rand() * 2 - 1) * hy * 0.88;
+        const rz = (rand() * 2 - 1) * hz * 0.92;
+        sx = clampedImpact[0] + (rx - clampedImpact[0]) * t;
+        sy = clampedImpact[1] + (ry - clampedImpact[1]) * t;
+        sz = clampedImpact[2] + (rz - clampedImpact[2]) * t;
+      } else {
+        const farSignX = clampedImpact[0] >= 0 ? -1 : 1;
+        const spread = 0.58 + rand() * 0.30;
+        sx = farSignX * hx * spread + (rand() - 0.5) * hx * 0.22;
+        sy = (rand() * 2 - 1) * hy * 0.68;
+        sz = (rand() * 2 - 1) * hz * 0.74;
       }
 
-      sx = clampedImpact[0] + (rx - clampedImpact[0]) * t;
-      sy = clampedImpact[1] + (ry - clampedImpact[1]) * t;
-      sz = clampedImpact[2] + (rz - clampedImpact[2]) * t;
-    } else {
-      // Zone 3: Far-end leaded stained-glass remnant (1-2 large jagged broken half-block / end pieces!)
-      const farSignX = clampedImpact[0] >= 0 ? -1 : 1;
-      const spread = 0.62 + rand() * 0.26;
-      sx = farSignX * hx * spread + (rand() - 0.5) * hx * 0.18;
-      sy = (rand() * 2 - 1) * hy * 0.65;
-      sz = (rand() * 2 - 1) * hz * 0.72;
-    }
+      sx = Math.max(-hx * 0.95, Math.min(hx * 0.95, sx));
+      sy = Math.max(-hy * 0.92, Math.min(hy * 0.92, sy));
+      sz = Math.max(-hz * 0.95, Math.min(hz * 0.95, sz));
 
-    sx = Math.max(-hx * 0.95, Math.min(hx * 0.95, sx));
-    sy = Math.max(-hy * 0.92, Math.min(hy * 0.92, sy));
-    sz = Math.max(-hz * 0.95, Math.min(hz * 0.95, sz));
-
-    // Minimum seed separation (tighter 1.4 mm in crush core so small chips form cleanly)
-    const minSep = i < crushCount ? 0.014 : 0.024;
-    let tooClose = false;
-    for (const prev of seeds) {
-      if (Math.hypot(sx - prev[0], sy - prev[1], sz - prev[2]) < minSep) {
-        tooClose = true;
+      let tooClose = false;
+      for (const prev of seeds) {
+        if (Math.hypot(sx - prev[0], sy - prev[1], sz - prev[2]) < minSep) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (!tooClose) {
+        seeds.push([sx, sy, sz]);
+        seedZones.push(zone);
         break;
       }
-    }
-    if (!tooClose) {
-      seeds.push([sx, sy, sz]);
     }
   }
 
@@ -422,9 +562,9 @@ export function fractureBlockVoronoi(
       [0, hy * 0.35, -hz * 0.35],
       [0, -hy * 0.35, hz * 0.35]
     );
+    seedZones.push(2, 2, 2, 3);
   }
 
-  // Precompute A * s_i and s_i^T * A * s_i for exact anisotropic Voronoi bisectors
   const aSeeds: Vec3[] = seeds.map((s) => applyAnisotropicMetric(s, u1, u2, u3, l1, l2, l3));
   const quadSeeds: number[] = seeds.map((s, idx) => dot3(s, aSeeds[idx]));
 
@@ -436,7 +576,6 @@ export function fractureBlockVoronoi(
     const asi = aSeeds[i];
     const qi = quadSeeds[i];
 
-    // Sort neighbors by anisotropic metric distance (s_j - s_i)^T A (s_j - s_i) for fast early clipping
     const neighbors = seeds
       .map((sj, j) => {
         const dx = sj[0] - si[0];
@@ -466,138 +605,68 @@ export function fractureBlockVoronoi(
       faces = clipConvexPolyhedron(faces, normal, planeD);
     }
 
-    if (faces.length < 4) continue;
+    const baseGeom = buildShardGeometryFromFaces(faces, clampedImpact);
+    if (!baseGeom) continue;
 
-    // Gather unique hull vertices & compute exact volume + centroid via tetrahedral decomposition
-    const uniqueVerts: Vec3[] = [];
-    for (const f of faces) {
-      for (const v of f.verts) {
-        let exists = false;
-        for (const u of uniqueVerts) {
-          if (Math.hypot(v[0] - u[0], v[1] - u[1], v[2] - u[2]) < 2e-4) {
-            exists = true;
-            break;
-          }
+    // Secondary 2-plane cleavage on Zone-3 remnants > 10g (0.010 kg) on high-speed impacts
+    if (
+      allowSecondaryCleavage &&
+      seedZones[i] === 3 &&
+      baseGeom.volume * GLASS_DENSITY > 0.01
+    ) {
+      const c0 = baseGeom.localCentroid;
+      const n1 = normalize3([
+        u3[0] * 0.82 + u1[0] * (0.35 + (rand() - 0.5) * 0.25),
+        u2[1] * 0.35 + (rand() - 0.5) * 0.3,
+        u3[2] * 0.82 + u1[2] * (0.35 + (rand() - 0.5) * 0.25),
+      ]);
+      const d1 = dot3(n1, c0);
+      const negN1: Vec3 = [-n1[0], -n1[1], -n1[2]];
+      const facesA = clipConvexPolyhedron(faces, n1, d1);
+      const facesB = clipConvexPolyhedron(faces, negN1, -d1);
+      const geomA = buildShardGeometryFromFaces(facesA, clampedImpact);
+      const geomB = buildShardGeometryFromFaces(facesB, clampedImpact);
+
+      if (
+        geomA &&
+        geomB &&
+        Math.abs(geomA.volume + geomB.volume - baseGeom.volume) < 5e-6
+      ) {
+        // Second oblique cleavage plane across the heavier sub-remnant
+        const targetFaces = geomA.volume >= geomB.volume ? facesA : facesB;
+        const targetGeom = geomA.volume >= geomB.volume ? geomA : geomB;
+        const keepGeom = geomA.volume >= geomB.volume ? geomB : geomA;
+
+        const n2 = normalize3([
+          u1[0] * 0.72 - u3[0] * 0.52 + (rand() - 0.5) * 0.24,
+          u2[1] * 0.48 + (rand() - 0.5) * 0.28,
+          u1[2] * 0.72 - u3[2] * 0.52 + (rand() - 0.5) * 0.24,
+        ]);
+        const d2 = dot3(n2, targetGeom.localCentroid);
+        const negN2: Vec3 = [-n2[0], -n2[1], -n2[2]];
+        const sub1 = buildShardGeometryFromFaces(
+          clipConvexPolyhedron(targetFaces, n2, d2),
+          clampedImpact
+        );
+        const sub2 = buildShardGeometryFromFaces(
+          clipConvexPolyhedron(targetFaces, negN2, -d2),
+          clampedImpact
+        );
+
+        if (
+          sub1 &&
+          sub2 &&
+          Math.abs(keepGeom.volume + sub1.volume + sub2.volume - baseGeom.volume) < 8e-6
+        ) {
+          shards.push(keepGeom, sub1, sub2);
+          continue;
         }
-        if (!exists) uniqueVerts.push(v);
-      }
-    }
-    if (uniqueVerts.length < 4) continue;
-
-    let refX = 0, refY = 0, refZ = 0;
-    for (const u of uniqueVerts) {
-      refX += u[0];
-      refY += u[1];
-      refZ += u[2];
-    }
-    refX /= uniqueVerts.length;
-    refY /= uniqueVerts.length;
-    refZ /= uniqueVerts.length;
-
-    let totalVolume = 0;
-    let cx = 0, cy = 0, cz = 0;
-
-    for (const f of faces) {
-      const fv = f.verts;
-      const v0 = fv[0];
-      for (let t = 1; t < fv.length - 1; t++) {
-        const v1 = fv[t];
-        const v2 = fv[t + 1];
-
-        const ax = v0[0] - refX, ay = v0[1] - refY, az = v0[2] - refZ;
-        const bx = v1[0] - refX, by = v1[1] - refY, bz = v1[2] - refZ;
-        const dx = v2[0] - refX, dy = v2[1] - refY, dz = v2[2] - refZ;
-
-        const det =
-          ax * (by * dz - bz * dy) -
-          ay * (bx * dz - bz * dx) +
-          az * (bx * dy - by * dx);
-        const tetVol = Math.abs(det) / 6.0;
-        totalVolume += tetVol;
-        cx += tetVol * (refX + v0[0] + v1[0] + v2[0]) * 0.25;
-        cy += tetVol * (refY + v0[1] + v1[1] + v2[1]) * 0.25;
-        cz += tetVol * (refZ + v0[2] + v1[2] + v2[2]) * 0.25;
+        shards.push(geomA, geomB);
+        continue;
       }
     }
 
-    if (totalVolume < 1e-6) continue;
-    const localCentroid: Vec3 = [cx / totalVolume, cy / totalVolume, cz / totalVolume];
-    const impactDist = Math.hypot(
-      localCentroid[0] - clampedImpact[0],
-      localCentroid[1] - clampedImpact[1],
-      localCentroid[2] - clampedImpact[2]
-    );
-
-    const hullPoints = new Float32Array(uniqueVerts.length * 3);
-    for (let k = 0; k < uniqueVerts.length; k++) {
-      hullPoints[k * 3 + 0] = uniqueVerts[k][0] - localCentroid[0];
-      hullPoints[k * 3 + 1] = uniqueVerts[k][1] - localCentroid[1];
-      hullPoints[k * 3 + 2] = uniqueVerts[k][2] - localCentroid[2];
-    }
-
-    // Pack up to MAX_SHARD_PLANES (12) bounding half-space planes sorted by face area descending
-    const sortedFacesForPlanes = faces
-      .map((f) => ({ f, area: computePolygonArea(f.verts) }))
-      .sort((a, b) => b.area - a.area);
-    const planeCount = Math.min(MAX_SHARD_PLANES, sortedFacesForPlanes.length);
-    const planes = new Float32Array(MAX_SHARD_PLANES * 4);
-    for (let pIdx = 0; pIdx < planeCount; pIdx++) {
-      const f = sortedFacesForPlanes[pIdx].f;
-      const v0 = f.verts[0];
-      const distFromCentroid = Math.max(
-        2e-4,
-        f.normal[0] * (v0[0] - localCentroid[0]) +
-          f.normal[1] * (v0[1] - localCentroid[1]) +
-          f.normal[2] * (v0[2] - localCentroid[2])
-      );
-      planes[pIdx * 4 + 0] = f.normal[0];
-      planes[pIdx * 4 + 1] = f.normal[1];
-      planes[pIdx * 4 + 2] = f.normal[2];
-      planes[pIdx * 4 + 3] = f.isOuter ? -distFromCentroid : distFromCentroid;
-    }
-
-    // Build flat-faceted render triangle list (10 floats/vertex)
-    let triCount = 0;
-    for (const f of faces) {
-      triCount += Math.max(0, f.verts.length - 2);
-    }
-    const renderVertices = new Float32Array(triCount * 3 * 10);
-    let ptr = 0;
-    for (const f of faces) {
-      const fv = f.verts;
-      const nx = f.normal[0];
-      const ny = f.normal[1];
-      const nz = f.normal[2];
-      const outerFlag = f.isOuter ? 1.0 : 0.0;
-      const v0 = fv[0];
-
-      for (let t = 1; t < fv.length - 1; t++) {
-        const tri = [v0, fv[t], fv[t + 1]];
-        for (const v of tri) {
-          renderVertices[ptr++] = v[0] - localCentroid[0];
-          renderVertices[ptr++] = v[1] - localCentroid[1];
-          renderVertices[ptr++] = v[2] - localCentroid[2];
-          renderVertices[ptr++] = nx;
-          renderVertices[ptr++] = ny;
-          renderVertices[ptr++] = nz;
-          renderVertices[ptr++] = v[0];
-          renderVertices[ptr++] = v[1];
-          renderVertices[ptr++] = v[2];
-          renderVertices[ptr++] = outerFlag;
-        }
-      }
-    }
-
-    shards.push({
-      localCentroid,
-      volume: totalVolume,
-      impactDist,
-      hullPoints,
-      planes,
-      planeCount,
-      renderVertices,
-      vertexCount: triCount * 3,
-    });
+    shards.push(baseGeom);
   }
 
   return shards;

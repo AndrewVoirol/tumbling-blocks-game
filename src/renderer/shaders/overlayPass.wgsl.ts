@@ -27,6 +27,7 @@ struct SlotVSOut {
   @location(0) localPos: vec3<f32>,
   @location(1) color: vec3<f32>,
   @location(2) isHovered: f32,
+  @location(3) scaleXYZ: vec3<f32>,
 };
 
 @vertex
@@ -38,31 +39,35 @@ fn vs_slot_guide(
   let slot = uSlots[iid];
   let wp = slot.localToWorld * vec4<f32>(pos, 1.0);
   let _n = normal.x * 0.0;
+  let sx = max(0.05, length(slot.localToWorld[0].xyz));
+  let sy = max(0.02, length(slot.localToWorld[1].xyz));
+  let sz = max(0.05, length(slot.localToWorld[2].xyz));
 
   var out: SlotVSOut;
   out.clipPos = uScene.viewProj * wp + vec4<f32>(_n, 0.0, 0.0, 0.0);
   out.localPos = pos;
   out.color = slot.colorAndHover.xyz;
   out.isHovered = slot.colorAndHover.w;
+  out.scaleXYZ = vec3<f32>(sx, sy, sz);
   return out;
 }
 
 @fragment
 fn fs_slot_guide(input: SlotVSOut) -> @location(0) vec4<f32> {
-  let ax = BLOCK_HX - abs(input.localPos.x);
-  let ay = BLOCK_HY - abs(input.localPos.y);
-  let az = BLOCK_HZ - abs(input.localPos.z);
+  let ax = (BLOCK_HX - abs(input.localPos.x)) * input.scaleXYZ.x;
+  let ay = (BLOCK_HY - abs(input.localPos.y)) * input.scaleXYZ.y;
+  let az = (BLOCK_HZ - abs(input.localPos.z)) * input.scaleXYZ.z;
   let dMin = min(ax, min(ay, az));
   let dMax = max(ax, max(ay, az));
   let edgeDist = ax + ay + az - dMin - dMax;
 
   let pulse = 0.85 + 0.15 * sin(uScene.cameraPosAndTime.w * 5.0);
-  let edgeMask = 1.0 - smoothstep(0.004, 0.014, edgeDist);
-  let fillAlpha = select(0.05, 0.16, input.isHovered > 0.5);
-  let edgeAlpha = select(0.38, 0.92, input.isHovered > 0.5) * pulse;
+  let edgeMask = 1.0 - smoothstep(0.0035, 0.013, edgeDist);
+  let fillAlpha = select(0.035, 0.15, input.isHovered > 0.5);
+  let edgeAlpha = select(0.34, 0.92, input.isHovered > 0.5) * pulse;
 
   let alpha = clamp(fillAlpha + edgeMask * edgeAlpha, 0.0, 0.95);
-  let glow = select(1.0, 2.1, input.isHovered > 0.5);
+  let glow = select(0.95, 2.1, input.isHovered > 0.5);
   let rgb = input.color * glow * alpha;
   return vec4<f32>(rgb, alpha);
 }

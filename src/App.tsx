@@ -148,6 +148,9 @@ export const App: React.FC = () => {
       ? '#f59e0b'
       : '#ef4444';
 
+  const isBench =
+    typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('bench');
+
   return (
     <div className="app-shell">
       <canvas ref={canvasRef} className="webgpu-canvas" />
@@ -164,7 +167,7 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      <div className="hud-layer">
+      <div className="hud-layer" style={{ display: isBench ? 'none' : undefined }}>
         {/* Top Row */}
         <div className="hud-top-row">
           {/* Top-Left Brand, Mode & Score Panel */}
@@ -366,7 +369,7 @@ export const App: React.FC = () => {
               <div className="coach-main-line">
                 <span className="step-chip place">Step 2 / 2 · Stack on Top</span>
                 <span className="coach-instruction">
-                  Aim at one of the glowing slots on top and click to gently release
+                  Position freely anywhere on the top row and click to gently release
                 </span>
                 <button
                   className="primary-action-btn"
@@ -375,11 +378,14 @@ export const App: React.FC = () => {
                   }}
                 >
                   <Sparkles size={14} />
-                  <span>Drop on Slot</span>
+                  <span>Place Block</span>
                 </button>
               </div>
               <div className="coach-subline">
-                <span>Drag outside the tower to orbit & check which side needs counter-balance</span>
+                <span>
+                  Wheel or Q / E to angle · R to turn 90° · Drag outside tower to orbit &
+                  counter-balance lean
+                </span>
               </div>
             </div>
           ) : telemetry.turnPhase === 'PULLING' ? (
@@ -501,9 +507,10 @@ export const App: React.FC = () => {
                 <div className="help-step-body">
                   <h4>Stack on Top & Counter-Balance the Lean</h4>
                   <p>
-                    Once pulled clear, move over the glowing slots on top of the tower and{' '}
-                    <strong>click</strong> (or press <em>Drop on Slot</em>) to stack it at 90°. Use
-                    the <strong>Tower Plumb</strong> gauge to counter-balance leans!
+                    Once pulled clear, position the block freely anywhere across the top row, fine-tune
+                    its angle with the <strong>mouse wheel</strong> or <strong>Q / E / R</strong>, and{' '}
+                    <strong>click</strong> to release. Use the <strong>Tower Plumb</strong> gauge to
+                    counter-balance leans!
                   </p>
                 </div>
               </div>

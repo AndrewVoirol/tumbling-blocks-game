@@ -84,7 +84,49 @@ export class OrbitCamera {
     mat4Invert(this.invViewProjMatrix, this.viewProjMatrix);
   }
 
-  public screenToRay(clientX: number, clientY: number, rect: DOMRect): { origin: Vec3; dir: Vec3 } {
+  public setPoseImmediate(
+    azimuth: number,
+    elevation: number,
+    distance: number,
+    target?: Vec3,
+    aspect: number = this.aspect
+  ): void {
+    this.azimuth = azimuth;
+    this.targetAzimuth = azimuth;
+    this.elevation = elevation;
+    this.targetElevation = elevation;
+    this.distance = distance;
+    this.targetDistance = distance;
+    if (target) {
+      this.target = [...target];
+      this.desiredTargetY = target[1];
+    }
+    this.aspect = Math.max(0.2, aspect);
+
+    const cosEl = Math.cos(this.elevation);
+    const sinEl = Math.sin(this.elevation);
+    const sinAz = Math.sin(this.azimuth);
+    const cosAz = Math.cos(this.azimuth);
+
+    this.position[0] = this.target[0] + this.distance * cosEl * sinAz;
+    this.position[1] = Math.max(0.12, this.target[1] + this.distance * sinEl);
+    this.position[2] = this.target[2] + this.distance * cosEl * cosAz;
+
+    mat4LookAt(this.viewMatrix, this.position, this.target, [0, 1, 0]);
+    mat4PerspectiveZO(this.projMatrix, this.fovYRad, this.aspect, this.near, this.far);
+    mat4Multiply(this.viewProjMatrix, this.projMatrix, this.viewMatrix);
+    mat4Invert(this.invViewProjMatrix, this.viewProjMatrix);
+  }
+
+  public getRightVector(): Vec3 {
+    return [Math.cos(this.azimuth), 0, -Math.sin(this.azimuth)];
+  }
+
+  public screenToRay(
+    clientX: number,
+    clientY: number,
+    rect: { left: number; top: number; width: number; height: number }
+  ): { origin: Vec3; dir: Vec3 } {
     const ndcX = ((clientX - rect.left) / Math.max(1, rect.width)) * 2.0 - 1.0;
     const ndcY = 1.0 - ((clientY - rect.top) / Math.max(1, rect.height)) * 2.0;
     return unprojectScreenRay(ndcX, ndcY, this.invViewProjMatrix);

@@ -18,23 +18,29 @@ export function createBeveledBlockMesh(
   hx: number = BLOCK_HALF_X,
   hy: number = BLOCK_HALF_Y,
   hz: number = BLOCK_HALF_Z,
-  bevel: number = 0.0085, // ~0.85 mm glass bevel chamfer
-  segments: number = 3
+  bevel: number = 0.0125, // ~1.25 mm diamond-polished glass prism chamfer
+  segments: number = 1
 ): MeshData {
   const verts: number[] = [];
   const indices: number[] = [];
 
-  // Parameterize each face on [-1, 1]^2 with clustered edge coordinates and project point onto inner box + bevel sphere!
-  const paramStops: number[] = [-1.0];
-  for (let i = 1; i <= segments; i++) {
-    paramStops.push(-1.0 + (i / segments) * 0.16);
-  }
-  for (let i = segments; i >= 1; i--) {
-    paramStops.push(1.0 - (i / segments) * 0.16);
-  }
-  paramStops.push(1.0);
+  const makeAxisStops = (halfExt: number): number[] => {
+    const flatStop = Math.max(0.05, 1.0 - bevel / halfExt);
+    const stops: number[] = [-1.0];
+    for (let i = 1; i <= segments; i++) {
+      stops.push(-1.0 + (i / segments) * (1.0 - flatStop));
+    }
+    for (let i = segments; i >= 1; i--) {
+      stops.push(1.0 - (i / segments) * (1.0 - flatStop));
+    }
+    stops.push(1.0);
+    return stops;
+  };
 
-  const mSteps = paramStops.length;
+  const stopsX = makeAxisStops(hx);
+  const stopsY = makeAxisStops(hy);
+  const stopsZ = makeAxisStops(hz);
+
   const mapCubePointToRoundedBox = (cx: number, cy: number, cz: number) => {
     // Map unit cube [-1, 1]^3 onto exact box [-hx, hx] x [-hy, hy] x [-hz, hz],
     // then clamp to inner core [-hx+b, hx-b] to get exact signed distance surface point + outward normal!
@@ -76,24 +82,28 @@ export function createBeveledBlockMesh(
   };
 
   const emitCubeFace = (
+    uStops: number[],
+    vStops: number[],
     evalCube: (u: number, v: number) => [number, number, number],
     flip: boolean
   ) => {
+    const uCount = uStops.length;
+    const vCount = vStops.length;
     const base = verts.length / 6;
-    for (let iv = 0; iv < mSteps; iv++) {
-      const v = paramStops[iv];
-      for (let iu = 0; iu < mSteps; iu++) {
-        const u = paramStops[iu];
+    for (let iv = 0; iv < vCount; iv++) {
+      const v = vStops[iv];
+      for (let iu = 0; iu < uCount; iu++) {
+        const u = uStops[iu];
         const [cx, cy, cz] = evalCube(u, v);
         const p = mapCubePointToRoundedBox(cx, cy, cz);
         verts.push(p.x, p.y, p.z, p.nx, p.ny, p.nz);
       }
     }
-    for (let iv = 0; iv < mSteps - 1; iv++) {
-      for (let iu = 0; iu < mSteps - 1; iu++) {
-        const i00 = base + iv * mSteps + iu;
+    for (let iv = 0; iv < vCount - 1; iv++) {
+      for (let iu = 0; iu < uCount - 1; iu++) {
+        const i00 = base + iv * uCount + iu;
         const i10 = i00 + 1;
-        const i01 = i00 + mSteps;
+        const i01 = i00 + uCount;
         const i11 = i01 + 1;
         if (!flip) {
           indices.push(i00, i10, i11, i00, i11, i01);
@@ -105,12 +115,12 @@ export function createBeveledBlockMesh(
   };
 
   // +Z (front), -Z (back), +X (right), -X (left), +Y (top), -Y (bottom) with outward CCW winding
-  emitCubeFace((u, v) => [u, v, 1], false);
-  emitCubeFace((u, v) => [u, v, -1], true);
-  emitCubeFace((u, v) => [1, v, -u], false);
-  emitCubeFace((u, v) => [-1, v, u], false);
-  emitCubeFace((u, v) => [u, 1, -v], false);
-  emitCubeFace((u, v) => [u, -1, v], false);
+  emitCubeFace(stopsX, stopsY, (u, v) => [u, v, 1], false);
+  emitCubeFace(stopsX, stopsY, (u, v) => [u, v, -1], true);
+  emitCubeFace(stopsZ, stopsY, (u, v) => [1, v, -u], false);
+  emitCubeFace(stopsZ, stopsY, (u, v) => [-1, v, u], false);
+  emitCubeFace(stopsX, stopsZ, (u, v) => [u, 1, -v], false);
+  emitCubeFace(stopsX, stopsZ, (u, v) => [u, -1, v], false);
 
   return {
     vertices: new Float32Array(verts),
@@ -181,3 +191,84 @@ export function createSimpleBoxMesh(
     indexCount: 36,
   };
 }
+
+/**
+ * Tessellated rounded-bevel glass block proxy (13x13 per face = 1,014 vertices)
+ * spanning both the interior hand-rolled waterglass undulations and the 1.25 mm
+ * diamond-polished bevels so vertex-refracted Snell caustics project continuous
+ * focal ribbons and chromatic bevel arcs onto the tabletop.
+ */
+export function createCausticRefractionMesh(
+  hx: number = BLOCK_HALF_X,
+  hy: number = BLOCK_HALF_Y,
+  hz: number = BLOCK_HALF_Z,
+  _bevel: number = 0.0125
+): MeshData {
+  const verts: number[] = [];
+  const indices: number[] = [];
+  const paramStops = [
+    -1.0, -0.92, -0.82, -0.62, -0.41, -0.20, 0.0, 0.20, 0.41, 0.62, 0.82, 0.92, 1.0,
+  ];
+  const mSteps = paramStops.length;
+
+  const mapFlushCuboidPoint = (
+    cx: number,
+    cy: number,
+    cz: number,
+    nx: number,
+    ny: number,
+    nz: number
+  ) => ({
+    x: cx * hx,
+    y: cy * hy,
+    z: cz * hz,
+    nx,
+    ny,
+    nz,
+  });
+
+  const emitFace = (
+    evalCube: (u: number, v: number) => [number, number, number],
+    normal: [number, number, number],
+    flip: boolean
+  ) => {
+    const base = verts.length / 6;
+    for (let iv = 0; iv < mSteps; iv++) {
+      const v = paramStops[iv];
+      for (let iu = 0; iu < mSteps; iu++) {
+        const u = paramStops[iu];
+        const [cx, cy, cz] = evalCube(u, v);
+        const p = mapFlushCuboidPoint(cx, cy, cz, normal[0], normal[1], normal[2]);
+        verts.push(p.x, p.y, p.z, p.nx, p.ny, p.nz);
+      }
+    }
+    for (let iv = 0; iv < mSteps - 1; iv++) {
+      for (let iu = 0; iu < mSteps - 1; iu++) {
+        const i00 = base + iv * mSteps + iu;
+        const i10 = i00 + 1;
+        const i01 = i00 + mSteps;
+        const i11 = i01 + 1;
+        if (!flip) {
+          indices.push(i00, i10, i11, i00, i11, i01);
+        } else {
+          indices.push(i00, i11, i10, i00, i01, i11);
+        }
+      }
+    }
+  };
+
+  emitFace((u, v) => [u, v, 1], [0, 0, 1], false);
+  emitFace((u, v) => [u, v, -1], [0, 0, -1], true);
+  emitFace((u, v) => [1, v, -u], [1, 0, 0], false);
+  emitFace((u, v) => [-1, v, u], [-1, 0, 0], false);
+  emitFace((u, v) => [u, 1, -v], [0, 1, 0], false);
+  emitFace((u, v) => [u, -1, v], [0, -1, 0], false);
+
+  return {
+    vertices: new Float32Array(verts),
+    indices: new Uint16Array(indices),
+    vertexCount: verts.length / 6,
+    indexCount: indices.length,
+  };
+}
+

@@ -20,16 +20,19 @@ export const INITIAL_LAYERS = 18;
 export const BLOCKS_PER_LAYER = 3;
 export const INITIAL_BLOCK_COUNT = INITIAL_LAYERS * BLOCKS_PER_LAYER; // 54 blocks
 
+// 1.25 mm diamond-polished bevel radius matching visual mesh (`beveledBlockMesh.ts`)
+export const BLOCK_BEVEL_RADIUS = 0.0125;
+
 // Soda-lime / Cathedral Stained Glass density: 2.52 g/cm^3 = 2.52 kg/dm^3
-// Block volume = 0.75 * 0.15 * 0.25 = 0.028125 dm^3 (28.125 cm^3)
-// Exact block mass = 0.028125 * 2.52 = 0.070875 kg (~70.9 grams)
+// Calibrated beveled glass prism mass (~71.10 grams)
 export const GLASS_DENSITY = 2.52;
+export const TARGET_BLOCK_MASS_KG = 0.0711;
 
 // Exact Froude-number similarity scaling (Fr = 1):
 // World length is in decimeters (1 unit = 0.1 m) while Rapier solves with g_sim = -9.81
 // at SIM_TIME_SCALE = sqrt(10) = 3.16227766 sim-sec per real wall-clock second:
 // -> Effective real-time gravity = 9.81 * (sqrt(10))^2 = 98.1 dm/s^2 = 9.81 m/s^2 (exact 1.000g!)
-// -> Keeps Rapier PGS contact compliance 10x stiffer (< 0.3 mm across 30+ stacked glass stories).
+// -> Keeps Rapier PGS contact compliance 10x stiffer (< 0.15 mm across 18+ stacked glass stories).
 export const SIM_GRAVITY_Y = -9.81;
 export const SIM_TIME_SCALE = Math.sqrt(10.0); // 3.16227766
 export const GRAVITY_Y = -98.1; // Real wall-clock dm/s^2 for micro-splinter particles
@@ -38,16 +41,21 @@ export const GRAVITY_Y = -98.1; // Real wall-clock dm/s^2 for micro-splinter par
 export const TABLE_RADIUS = 4.3; // 43 cm radius
 export const TABLE_THICKNESS = 0.32;
 
-// Physics stepping (60 Hz per sim-second * sqrt(10) = ~190 Hz in real wall-clock time = ~3 substeps per 60fps frame!)
-export const SIM_PHYSICS_HZ = 60;
+// Physics stepping: 120 Hz per sim-second * sqrt(10) = ~379.5 Hz in real wall-clock time
+export const SIM_PHYSICS_HZ = 120;
 export const PHYSICS_DT = 1.0 / SIM_PHYSICS_HZ;
+
+// Fixed-stride O(1) GPU/Physics shard slot allocator constants
+export const MAX_ACTIVE_SHARDS = 512;
+export const SHARD_SLOT_STRIDE_VERTS = 132;
+export const MAX_SHARD_VERTICES = MAX_ACTIVE_SHARDS * SHARD_SLOT_STRIDE_VERTS; // 67,584 verts
 
 // Fracture thresholds in real wall-clock decimeters/sec (v_real = v_sim * SIM_TIME_SCALE):
 // Gentle 1.0 cm top drop = ~4.4 dm/s (0.44 m/s) -> completely safe clink
-// Medium impact (~9.5 dm/s = 0.95 m/s, ~4.6 cm drop onto hard oak) -> micro-crazing cracks
-// Hard impact (~13.5 dm/s = 1.35 m/s, ~9.3 cm free-fall onto hard oak) -> shatters into 3D Voronoi shards
-export const CRAZE_IMPACT_SPEED = 9.5;
-export const SHATTER_IMPACT_SPEED = 13.5;
+// Medium impact (~7.4 dm/s = 0.74 m/s, ~2.8 cm drop) -> internal 3D crazing fracture planes
+// Hard impact (~12.6 dm/s = 1.26 m/s, ~8.1 cm direct drop) -> shatters into 3D Voronoi shards
+export const CRAZE_IMPACT_SPEED = 7.4;
+export const SHATTER_IMPACT_SPEED = 12.6;
 
 export interface StainedGlassSwatch {
   id: number;
@@ -70,59 +78,59 @@ export const STAINED_GLASS_PALETTE: StainedGlassSwatch[] = [
   {
     id: 0,
     name: 'Selenium Ruby',
-    absorption: [0.32, 7.8, 9.2],
-    accentAbsorption: [0.45, 3.4, 8.8], // Warm amber-ruby accent
-    uiHex: '#e12b38',
+    absorption: [0.16, 8.6, 9.4],
+    accentAbsorption: [0.24, 4.1, 8.9], // Deep garnet-amber accent
+    uiHex: '#c82333',
   },
   {
     id: 1,
     name: 'Chartres Cobalt',
-    absorption: [8.6, 4.4, 0.28],
-    accentAbsorption: [6.2, 1.8, 0.35], // Sky sapphire accent
-    uiHex: '#2563eb',
+    absorption: [8.8, 4.6, 0.18],
+    accentAbsorption: [6.4, 2.2, 0.22], // Deep ultramarine-sapphire accent
+    uiHex: '#1d4ed8',
   },
   {
     id: 2,
     name: 'Silver-Stain Amber',
-    absorption: [0.22, 1.65, 8.9],
-    accentAbsorption: [0.35, 3.6, 9.4], // Deep honey topaz
-    uiHex: '#f59e0b',
+    absorption: [0.14, 1.85, 9.2],
+    accentAbsorption: [0.22, 3.6, 9.6], // Burnished cognac topaz
+    uiHex: '#d97706',
   },
   {
     id: 3,
     name: 'Cathedral Emerald',
-    absorption: [7.6, 0.48, 5.4],
-    accentAbsorption: [5.8, 0.72, 2.2], // Seafoam tourmaline
-    uiHex: '#10b981',
+    absorption: [7.4, 0.34, 5.4],
+    accentAbsorption: [5.6, 0.52, 3.1], // Bottle-green tourmaline
+    uiHex: '#15803d',
   },
   {
     id: 4,
     name: 'Manganese Amethyst',
-    absorption: [3.2, 8.4, 1.15],
-    accentAbsorption: [1.4, 7.6, 2.8], // Rose plum accent
-    uiHex: '#9333ea',
+    absorption: [2.6, 8.6, 0.85],
+    accentAbsorption: [1.4, 7.4, 2.2], // Smoked plum-violet
+    uiHex: '#7e22ce',
   },
   {
     id: 5,
     name: 'Peacock Teal',
-    absorption: [8.2, 1.05, 1.1],
-    accentAbsorption: [6.8, 2.5, 0.42], // Cerulean accent
-    uiHex: '#06b6d4',
+    absorption: [8.1, 0.82, 0.95],
+    accentAbsorption: [6.5, 2.1, 0.48], // Deep Venetian sea-glass
+    uiHex: '#0f766e',
   },
   {
     id: 6,
     name: 'Gold-Ruby Rose',
-    absorption: [0.42, 6.6, 4.1],
-    accentAbsorption: [0.28, 2.4, 7.2], // Peach-gold accent
-    uiHex: '#ec4899',
+    absorption: [0.26, 6.8, 4.2],
+    accentAbsorption: [0.20, 2.8, 7.2], // Antique cranberry-rose
+    uiHex: '#be185d',
   },
   {
     id: 7,
     name: 'Antique Seeded Crystal',
-    // Real antique soda-lime clear glass has a faint iron-oxide aqua-celadon tint over 7.5 cm path!
-    absorption: [0.68, 0.34, 0.48],
-    accentAbsorption: [0.42, 1.15, 3.8], // Subtle pale champagne accent
-    uiHex: '#e2f1ee',
+    // High-iron soda-lime architectural glass: water-clear on 1.5 cm faces, subtle sea-green along 7.5 cm edges!
+    absorption: [0.58, 0.20, 0.38],
+    accentAbsorption: [0.42, 0.88, 2.6], // Pale smoked champagne accent
+    uiHex: '#cfe5de',
   },
 ];
 
