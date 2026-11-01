@@ -3,6 +3,7 @@
  * Chroma-Preserving Filmic Tone Mapping + 8-bit Anti-Banding Dither (`postProcess.wgsl.ts`).
  */
 export const POST_PROCESS_WGSL = /* wgsl */ `
+override HDR_EXTENDED: u32 = 0u;
 const PI: f32 = 3.14159265359;
 
 struct PostUniforms {
@@ -107,6 +108,13 @@ fn acesFilmicChromaSafe(xIn: vec3<f32>) -> vec3<f32> {
 
 fn interleavedGradientNoise(px: vec2<f32>) -> f32 {
   return fract(52.9829189 * fract(dot(px, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn srgbToLinear(c: vec3<f32>) -> vec3<f32> {
+  let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  let lo = v / 12.92;
+  let hi = pow((v + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(hi, lo, v <= vec3<f32>(0.04045));
 }
 
 // 4. Final Composite: Depth-Aware Macro Lens Bokeh + Dual-Scale Optical Bloom -> Filmic Tone Map -> Dithered sRGB
@@ -233,6 +241,18 @@ fn fs_composite(input: FullscreenOut) -> @location(0) vec4<f32> {
 
   let mapped = acesFilmicChromaSafe(combined);
   let srgb = pow(mapped, vec3<f32>(1.0 / 2.2));
+
+  if (HDR_EXTENDED != 0u) {
+    // Match exact SDR display luminance across [0, 1] dark walnut/velvet while opening
+    // linear extended-sRGB XDR headroom (> 1.0..4.0x) on caustics, TIR glints, and stained glass
+    let baseLinear = srgbToLinear(srgb);
+    let excess = max(combined - vec3<f32>(0.70), vec3<f32>(0.0));
+    let excessPeak = max(excess.r, max(excess.g, excess.b));
+    let maxHeadroom = 3.0;
+    let boostPeak = (excessPeak * maxHeadroom) / (excessPeak + maxHeadroom * 1.35 + 1e-4);
+    let edrBoost = select(vec3<f32>(0.0), excess * (boostPeak / max(excessPeak, 1e-4)), excessPeak > 1e-4);
+    return vec4<f32>(baseLinear + edrBoost, 1.0);
+  }
 
   // Sub-LSB interleaved gradient dither eliminates 8-bit Mach banding across dark limestone/walnut gradients
   let dither = (interleavedGradientNoise(input.clipPos.xy + vec2<f32>(7.0, 3.0)) - 0.5) / 255.0;

@@ -27,7 +27,7 @@
   - [`glassTower.wgsl.ts`](src/renderer/shaders/glassTower.wgsl.ts): Raytraced beveled regulation Jenga blocks (`n = 1.522`) with multi-block interior refraction (`<= 2` interior blocks), Total Internal Reflection, 3D seed air bubbles, and internal crazing spiderweb cracks.
   - [`glassShard.wgsl.ts`](src/renderer/shaders/glassShard.wgsl.ts): Convex 3D Voronoi glass shards (`MAX_ACTIVE_SHARDS = 512`, `SHARD_SLOT_STRIDE_VERTS = 132`) differentiating outer leaded faces from inner conchoidal cleavage planes.
   - [`overlayPass.wgsl.ts`](src/renderer/shaders/overlayPass.wgsl.ts) & [`postProcess.wgsl.ts`](src/renderer/shaders/postProcess.wgsl.ts): Top-row placement guides (`depthCompare: 'less-equal'`, `depthWriteEnabled: false`) and ACES HDR tone mapping.
-- **Swapchain Color Contract**: [`postProcess.wgsl.ts`](src/renderer/shaders/postProcess.wgsl.ts) currently outputs ACES-tonemapped, gamma-encoded sRGB `[0, 1]` to a `bgra8unorm` swapchain. Upgrading to Apple Silicon XDR (`rgba16float` + `toneMapping: { mode: 'extended' }`) requires branching `postProcess.wgsl.ts` to emit **linear** extended-sRGB (`> 1.0` specular/caustic headroom without double-gamma washout).
+- **Swapchain Color Contract**: [`postProcess.wgsl.ts`](src/renderer/shaders/postProcess.wgsl.ts) compiles dual pipelines (`pipeCompositeHdr` with `HDR_EXTENDED = 1` on `rgba16float` + `toneMapping: { mode: 'extended' }` for Apple Silicon XDR displays, and `pipeCompositeSdr` with `HDR_EXTENDED = 0` on `bgra8unorm` / `rgba8unorm` for SDR monitors), switching automatically on `window.matchMedia('(dynamic-range: high)')` or via `renderer.setExtendedHdr(boolean)`.
 
 ---
 

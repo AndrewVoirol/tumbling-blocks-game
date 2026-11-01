@@ -39,9 +39,13 @@ const SPLINTER_FLOATS = 8; // 32 bytes per GPUSplinter
 
 export class WebGPURenderer {
   public device!: GPUDevice;
-  private context!: GPUCanvasContext;
-  private canvasFormat!: GPUTextureFormat;
+  public context!: GPUCanvasContext;
+  public canvasFormat!: GPUTextureFormat;
+  public preferredSdrFormat!: GPUTextureFormat;
+  public isExtendedHdr: boolean = false;
   private canvas: HTMLCanvasElement;
+  private hdrMediaQuery: MediaQueryList | null = null;
+  private onHdrMediaChange: ((e: MediaQueryListEvent) => void) | null = null;
 
   // Static & Pre-allocated GPU Buffers
   private sceneUniformBuffer!: GPUBuffer;
@@ -119,6 +123,9 @@ export class WebGPURenderer {
   private pipeBloomExtract!: GPURenderPipeline;
   private pipeBloomDownsample!: GPURenderPipeline;
   private pipeBloomBlur!: GPURenderPipeline;
+  private bglComposite!: GPUBindGroupLayout;
+  private pipeCompositeSdr!: GPURenderPipeline;
+  private pipeCompositeHdr!: GPURenderPipeline;
   private pipeComposite!: GPURenderPipeline;
 
   // Pre-allocated Bind Groups (zero allocation inside rAF!)
@@ -211,13 +218,21 @@ export class WebGPURenderer {
       throw new Error('Unable to configure WebGPU canvas context.');
     }
     this.context = ctx;
-    this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
-
-    this.context.configure({
-      device: this.device,
-      format: this.canvasFormat,
-      alphaMode: 'opaque',
-    });
+    this.preferredSdrFormat = navigator.gpu.getPreferredCanvasFormat();
+    const hdrQuery =
+      typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        ? window.matchMedia('(dynamic-range: high)')
+        : null;
+    this.configureSwapchain(Boolean(hdrQuery?.matches));
+    if (hdrQuery) {
+      this.hdrMediaQuery = hdrQuery;
+      this.onHdrMediaChange = (e: MediaQueryListEvent) => {
+        if (!this.destroyed) {
+          this.setExtendedHdr(e.matches);
+        }
+      };
+      hdrQuery.addEventListener('change', this.onHdrMediaChange);
+    }
 
     if (this.supportsTimestamps) {
       this.timestampQuerySet = this.device.createQuerySet({
@@ -255,6 +270,52 @@ export class WebGPURenderer {
     await this.compilePipelinesAsync();
 
     this.resize(this.canvas.clientWidth || 1280, this.canvas.clientHeight || 720);
+  }
+
+  private configureSwapchain(preferExtendedHdr: boolean): void {
+    if (preferExtendedHdr) {
+      try {
+        this.context.configure({
+          device: this.device,
+          format: 'rgba16float',
+          alphaMode: 'opaque',
+          toneMapping: { mode: 'extended' },
+        });
+        this.canvasFormat = 'rgba16float';
+        this.isExtendedHdr = true;
+        if (this.pipeCompositeHdr) {
+          this.pipeComposite = this.pipeCompositeHdr;
+        }
+        return;
+      } catch {
+        // Fall through to standard SDR swapchain when extended rgba16float is unsupported
+      }
+    }
+
+    try {
+      this.context.configure({
+        device: this.device,
+        format: this.preferredSdrFormat,
+        alphaMode: 'opaque',
+        toneMapping: { mode: 'standard' },
+      });
+    } catch {
+      this.context.configure({
+        device: this.device,
+        format: this.preferredSdrFormat,
+        alphaMode: 'opaque',
+      });
+    }
+    this.canvasFormat = this.preferredSdrFormat;
+    this.isExtendedHdr = false;
+    if (this.pipeCompositeSdr) {
+      this.pipeComposite = this.pipeCompositeSdr;
+    }
+  }
+
+  public setExtendedHdr(enabled: boolean): void {
+    if (this.destroyed || !this.context || !this.device) return;
+    this.configureSwapchain(enabled);
   }
 
   private createStaticBuffersAndMeshes(): void {
@@ -419,6 +480,21 @@ export class WebGPURenderer {
       alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
     };
 
+    this.bglComposite = d.createBindGroupLayout({
+      label: 'bglComposite',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      ],
+    });
+    const plComposite = d.createPipelineLayout({
+      label: 'plComposite',
+      bindGroupLayouts: [this.bglComposite],
+    });
+
     const [
       pipeSunDepthBlock,
       pipeSunDepthShard,
@@ -437,7 +513,8 @@ export class WebGPURenderer {
       pipeBloomExtract,
       pipeBloomDownsample,
       pipeBloomBlur,
-      pipeComposite,
+      pipeCompositeSdr,
+      pipeCompositeHdr,
     ] = await Promise.all([
       d.createRenderPipelineAsync({
         label: 'pipeSunDepthBlock',
@@ -615,13 +692,25 @@ export class WebGPURenderer {
         },
       }),
       d.createRenderPipelineAsync({
-        label: 'pipeComposite',
-        layout: 'auto',
+        label: 'pipeCompositeSdr',
+        layout: plComposite,
         vertex: { module: modPost, entryPoint: 'vs_fullscreen' },
         fragment: {
           module: modPost,
           entryPoint: 'fs_composite',
-          targets: [{ format: this.canvasFormat }],
+          constants: { HDR_EXTENDED: 0 },
+          targets: [{ format: this.preferredSdrFormat }],
+        },
+      }),
+      d.createRenderPipelineAsync({
+        label: 'pipeCompositeHdr',
+        layout: plComposite,
+        vertex: { module: modPost, entryPoint: 'vs_fullscreen' },
+        fragment: {
+          module: modPost,
+          entryPoint: 'fs_composite',
+          constants: { HDR_EXTENDED: 1 },
+          targets: [{ format: 'rgba16float' }],
         },
       }),
     ]);
@@ -643,7 +732,9 @@ export class WebGPURenderer {
     this.pipeBloomExtract = pipeBloomExtract;
     this.pipeBloomDownsample = pipeBloomDownsample;
     this.pipeBloomBlur = pipeBloomBlur;
-    this.pipeComposite = pipeComposite;
+    this.pipeCompositeSdr = pipeCompositeSdr;
+    this.pipeCompositeHdr = pipeCompositeHdr;
+    this.pipeComposite = this.isExtendedHdr ? pipeCompositeHdr : pipeCompositeSdr;
 
     this.buildStaticBindGroups();
   }
@@ -918,7 +1009,7 @@ export class WebGPURenderer {
     });
 
     this.bgComposite = d.createBindGroup({
-      layout: this.pipeComposite.getBindGroupLayout(0),
+      layout: this.bglComposite,
       entries: [
         { binding: 0, resource: { buffer: this.postUniformComposite } },
         { binding: 1, resource: this.hdrResolveView },
@@ -1791,6 +1882,11 @@ export class WebGPURenderer {
     if (this.destroyed) return;
     this.destroyed = true;
     try {
+      if (this.hdrMediaQuery && this.onHdrMediaChange) {
+        this.hdrMediaQuery.removeEventListener('change', this.onHdrMediaChange);
+        this.hdrMediaQuery = null;
+        this.onHdrMediaChange = null;
+      }
       this.context?.unconfigure();
       this.timestampQuerySet?.destroy();
       this.timestampResolveBuffer?.destroy();
