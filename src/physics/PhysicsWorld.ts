@@ -308,6 +308,7 @@ export class PhysicsWorld {
     if (mode) this.gameMode = mode;
     if (players !== undefined) this.playerCount = Math.max(2, Math.min(4, players));
     const towerLayers = Math.max(1, Math.min(32, Math.round(layers)));
+    this.audio.updateSlideFriction(0, 0);
 
     if (this.eventQueue) {
       this.eventQueue.free();
@@ -2002,6 +2003,15 @@ export class PhysicsWorld {
       const vz = lv.z + (av.x * worldOffset[1] - av.y * worldOffset[0]);
 
       const subDt = this.currentSubstepDt;
+      const sandboxOutsideTower =
+        this.gameMode === 'sandbox' &&
+        (radialDist > BLOCK_LENGTH * 0.98 ||
+          Math.abs(grabWorld[1] - this.grabPlaneY) > BLOCK_HEIGHT * 0.65);
+      if (sandboxOutsideTower) {
+        const trackAlpha = Math.min(1.0, subDt * 28.0);
+        this.grabPlaneY += (grabWorld[1] - this.grabPlaneY) * trackAlpha;
+        this.grabWorldAnchor[1] = this.grabPlaneY;
+      }
       this.grabRampSec = Math.min(0.065, this.grabRampSec + subDt / SIM_TIME_SCALE);
       const rampU = this.grabRampSec / 0.065;
       const grabRamp = 0.35 + 0.65 * (rampU * rampU * (3.0 - 2.0 * rampU));
@@ -2023,7 +2033,8 @@ export class PhysicsWorld {
 
       let fx = kp * effErrX - kd * vx;
       let fz = kp * effErrZ - kd * vz;
-      const fy = -1.6 * implicitDampScale * lv.y;
+      const vertDamp = sandboxOutsideTower ? 0.32 : 1.6;
+      const fy = -vertDamp * implicitDampScale * lv.y;
 
       const maxForce = (this.gameMode === 'sandbox' ? 11.5 : 5.2) * grabRamp;
       const fMag = Math.hypot(fx, fz);
@@ -2918,7 +2929,12 @@ export class PhysicsWorld {
         if (!inSameSlapWindow) {
           const post = rb.linvel();
           this.spawnGlassCulletChips(hitWorld, post, worldNormal, blk.swatchId, 5, 0.55);
-          this.audio.playGlassCrack(Math.min(1.0, blk.damage));
+          this.audio.playGlassCrack(
+            Math.min(1.0, blk.damage),
+            hitWorld,
+            this.listenerCamPos,
+            this.listenerCamRight
+          );
         }
       }
     }

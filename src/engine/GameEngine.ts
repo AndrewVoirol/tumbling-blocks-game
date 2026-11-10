@@ -34,6 +34,8 @@ export class GameEngine {
 
   // Pointer interaction tracking
   private activePointerId: number | null = null;
+  private activeTouches = new Map<number, [number, number]>();
+  private lastPinchDist: number = 0;
   private pointerDownPos: [number, number] = [0, 0];
   private lastPointerPos: [number, number] = [0, 0];
   private pointerMovedDist: number = 0;
@@ -41,6 +43,7 @@ export class GameEngine {
   private pendingTapHit: { blockId: number; hit: RayOBBHit } | null = null;
   private grabAnchorOrigin: Vec3 = [0, 0, 0];
 
+  public modalOpen: boolean = false;
   public benchPaused: boolean = false;
   public benchCameraLocked: boolean = false;
   private resizeObserver: ResizeObserver | null = null;
@@ -104,9 +107,12 @@ export class GameEngine {
     const dt = Math.min(0.05, Math.max(0.001, rawDt));
     this.elapsedSec += dt;
 
-    const aspect =
-      (this.canvas.clientWidth || window.innerWidth) /
-      Math.max(1, this.canvas.clientHeight || window.innerHeight);
+    const cw = this.canvas.clientWidth || window.innerWidth;
+    const ch = Math.max(1, this.canvas.clientHeight || window.innerHeight);
+    if (cw > 0 && ch > 0) {
+      this.renderer.resize(cw, ch);
+    }
+    const aspect = cw / ch;
     if (!this.benchCameraLocked) {
       this.camera.update(dt, aspect);
     } else {
@@ -165,11 +171,21 @@ export class GameEngine {
     }
     this.interactionMode = 'none';
     this.activePointerId = null;
+    this.activeTouches.clear();
+    this.lastPinchDist = 0;
     this.pendingTapHit = null;
+    this.audio.updateSlideFriction(0, 0);
     this.physics.rebuildTower(mode, players);
     this.camera.resetView(27.0);
     this.updateCursorStyle();
     this.emitTelemetry(true);
+  }
+
+  public setModalOpen(open: boolean): void {
+    this.modalOpen = open;
+    if (open) {
+      this.handlePointerCancel();
+    }
   }
 
   public setLightingPreset(presetId: string): void {
@@ -596,9 +612,19 @@ export class GameEngine {
 
     if (this.interactionMode === 'block') {
       if (this.physics.turnPhase === 'EXTRACTED') {
-        this.physics.updateCarriedHover(origin, dir);
+        const lc = this.physics.topSupportFrame.layerCenter;
+        const ptTop = this.intersectTopSupportPlane(origin, dir);
+        const nearTopPlane =
+          ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 1.35;
+        if (this.physics.isExtractionLiftReady && nearTopPlane) {
+          this.physics.updateCarriedHover(origin, dir);
+        }
       } else {
-        const planePt = this.projectBlockDragPlane(origin, dir, this.grabAnchorOrigin);
+        const anchorPlaneOrigin: Vec3 =
+          this.physics.gameMode === 'sandbox'
+            ? [this.grabAnchorOrigin[0], this.physics.grabPlaneY, this.grabAnchorOrigin[2]]
+            : this.grabAnchorOrigin;
+        const planePt = this.projectBlockDragPlane(origin, dir, anchorPlaneOrigin);
         if (planePt) {
           this.physics.updateGrabTarget(planePt);
         }
@@ -701,29 +727,68 @@ export class GameEngine {
     } catch {
       // Synthetic pointer events may not have an active pointerId
     }
+    if (e.pointerType === 'touch') {
+      this.activeTouches.set(e.pointerId, [e.clientX, e.clientY]);
+      if (this.activeTouches.size === 2) {
+        const pts = Array.from(this.activeTouches.values());
+        this.lastPinchDist = Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
+        if (this.interactionMode === 'orbit' || this.interactionMode === 'block_pending') {
+          this.handlePointerCancel();
+        }
+        return;
+      }
+    }
     this.handlePointerDown(e.clientX, e.clientY, e.pointerId, e.button, e.altKey);
   };
 
   private onPointerMove = (e: PointerEvent): void => {
+    if (e.pointerType === 'touch' && this.activeTouches.has(e.pointerId)) {
+      this.activeTouches.set(e.pointerId, [e.clientX, e.clientY]);
+      if (this.activeTouches.size >= 2) {
+        const pts = Array.from(this.activeTouches.values());
+        const dist = Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
+        if (this.lastPinchDist > 4) {
+          const pinchDelta = (this.lastPinchDist - dist) * 0.014;
+          this.camera.zoomBy(Math.max(-0.22, Math.min(0.22, pinchDelta)));
+        }
+        this.lastPinchDist = dist;
+        return;
+      }
+    }
     this.handlePointerMove(e.clientX, e.clientY, e.pointerId);
   };
 
   private onPointerUp = (e: PointerEvent): void => {
+    if (e.pointerType === 'touch') {
+      this.activeTouches.delete(e.pointerId);
+      if (this.activeTouches.size < 2) {
+        this.lastPinchDist = 0;
+      }
+    }
     this.handlePointerUp(e.clientX, e.clientY, e.pointerId);
   };
 
   private onPointerCancel = (e: PointerEvent): void => {
+    if (e.pointerType === 'touch') {
+      this.activeTouches.delete(e.pointerId);
+      if (this.activeTouches.size < 2) {
+        this.lastPinchDist = 0;
+      }
+    }
     this.handlePointerCancel(e.pointerId);
   };
 
   private onWindowBlur = (): void => {
+    this.activeTouches.clear();
+    this.lastPinchDist = 0;
     this.handlePointerCancel();
   };
 
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
     if (this.physics.turnPhase === 'EXTRACTED' && !e.altKey && !e.ctrlKey && !e.metaKey) {
-      const yawStep = Math.max(-0.16, Math.min(0.16, e.deltaY * 0.0009));
+      const wheelAxis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      const yawStep = Math.max(-0.16, Math.min(0.16, wheelAxis * 0.0009));
       this.handleRotateCarried(yawStep);
       return;
     }
@@ -732,10 +797,21 @@ export class GameEngine {
   };
 
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (this.physics?.turnPhase !== 'EXTRACTED') return;
+    if (this.modalOpen || !this.physics) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
-    const tag = (e.target as HTMLElement | null)?.tagName;
+    const targetEl = e.target as HTMLElement | null;
+    const tag = targetEl?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+    if (e.code === 'Escape') {
+      if (this.activePointerId !== null) {
+        e.preventDefault();
+        this.handlePointerCancel();
+      }
+      return;
+    }
+
+    if (this.physics.turnPhase !== 'EXTRACTED') return;
 
     if (e.code === 'KeyQ' || e.code === 'BracketLeft') {
       e.preventDefault();
@@ -750,6 +826,14 @@ export class GameEngine {
       e.preventDefault();
       this.physics.resetCarriedBlockRotation();
       this.emitTelemetry(true);
+    } else if (
+      (e.code === 'Space' || e.code === 'Enter') &&
+      tag !== 'BUTTON' &&
+      tag !== 'A' &&
+      this.physics.isExtractionLiftReady
+    ) {
+      e.preventDefault();
+      this.handleReleaseOntoTop();
     }
   };
 

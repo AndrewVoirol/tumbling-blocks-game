@@ -99,6 +99,8 @@ body,
 .hud-upper-space {
   position: relative;
   z-index: 2;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
@@ -108,6 +110,7 @@ body,
 .hud-bottom-row {
   position: relative;
   z-index: 2;
+  flex-shrink: 0;
   display: flex;
   justify-content: center;
   align-items: flex-end;
@@ -1297,5 +1300,65 @@ body,
   .prism-primary-line,
   .prism-secondary-line {
     white-space: normal;
+  }
+}
+
+@media (max-width: 560px) {
+  .hud-layer {
+    padding: 10px;
+  }
+
+  .hud-upper-space {
+    gap: 8px;
+  }
+
+  .vitrail-lancet-window,
+  .lancet-arch-crown,
+  .lancet-apex-svg,
+  .lancet-apron-svg {
+    width: 176px;
+  }
+
+  .margin-inlay-cell,
+  .mode-course-meta,
+  .vitrail-spec {
+    display: none;
+  }
+
+  .crystal-optical-plate {
+    width: 146px;
+    padding: 8px 10px;
+  }
+
+  .codex-window {
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
+    overflow-y: auto;
+  }
+}
+
+@media (max-height: 580px) {
+  .hud-layer {
+    padding: 8px 12px;
+  }
+
+  .lancet-arch-crown,
+  .lancet-sill-apron {
+    display: none;
+  }
+
+  .vitrail-lancet-window {
+    transform-origin: top left;
+    transform: scale(0.84);
+  }
+
+  .crystal-optical-plate {
+    transform-origin: top right;
+    transform: scale(0.84);
+  }
+
+  .codex-window {
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
   }
 }

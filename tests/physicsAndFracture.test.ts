@@ -1232,5 +1232,95 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
 
     engine.dispose();
   }, 15000);
+
+  it('T7: guards mid-drag PULLING->EXTRACTED against side-corner snap, tracks Sandbox table grabPlaneY without parallax, and cancels active grab on modal open', async () => {
+    const { GameEngine } = await import('../src/engine/GameEngine');
+    const stubCanvas = { style: { cursor: 'default' } } as unknown as HTMLCanvasElement;
+    const engine = new GameEngine(stubCanvas);
+    await engine.initHeadless();
+    const rect = { left: 0, top: 0, width: 1280, height: 800 };
+
+    const projectScreen = (wp: [number, number, number]): [number, number] => {
+      const m = engine.camera.viewProjMatrix;
+      const cx = m[0] * wp[0] + m[4] * wp[1] + m[8] * wp[2] + m[12];
+      const cy = m[1] * wp[0] + m[5] * wp[1] + m[9] * wp[2] + m[13];
+      const cw = m[3] * wp[0] + m[7] * wp[1] + m[11] * wp[2] + m[15];
+      return [((cx / cw) * 0.5 + 0.5) * rect.width, (0.5 - (cy / cw) * 0.5) * rect.height];
+    };
+
+    // 1. Side-pointer drag across PULLING -> EXTRACTED must not snap carriedTargetPos to clamped corner mid-arc
+    engine.physics.rebuildTower('solo', 2, 18);
+    for (let i = 0; i < 90; i++) engine.physics.step(1 / 60);
+    engine.camera.setPoseImmediate(0.68, 0.34, 5.2, [0, 1.44, 0], rect.width / rect.height);
+
+    const looseBlk = engine.physics.blocks.find((b) => b.assignedLayer === 8 && b.isLooseSlot)!;
+    const [sx0, sy0] = projectScreen([
+      looseBlk.position[0] + 0.30,
+      looseBlk.position[1],
+      looseBlk.position[2],
+    ]);
+    engine.handlePointerDown(sx0, sy0, 1, 0, false, rect);
+
+    for (let f = 1; f <= 80; f++) {
+      const pullX = looseBlk.position[0] + 0.30 + Math.min(1.35, f * 0.04);
+      const [sx, sy] = projectScreen([pullX, 1.275, 0]);
+      engine.handlePointerMove(sx, sy, 1, rect);
+      engine.physics.step(1 / 60);
+      if (engine.physics.turnPhase === 'EXTRACTED') {
+        // Immediate next pointermove while cursor is still far out at side of row 8
+        engine.handlePointerMove(sx + 2, sy, 1, rect);
+        expect(Math.hypot(engine.physics.carriedTargetPos[0], engine.physics.carriedTargetPos[2])).toBeLessThan(0.05);
+        break;
+      }
+    }
+    expect(engine.physics.turnPhase).toBe('EXTRACTED');
+    engine.handlePointerUp(sx0 + 120, sy0, 1, rect);
+
+    // 2. setModalOpen(true) cleanly cancels an active pointer grab
+    engine.resetGame('solo', 2);
+    for (let i = 0; i < 60; i++) engine.physics.step(1 / 60);
+    const blk2 = engine.physics.blocks.find((b) => b.assignedLayer === 6 && b.isLooseSlot)!;
+    const [mx0, my0] = projectScreen([blk2.position[0] + 0.30, blk2.position[1], blk2.position[2]]);
+    engine.handlePointerDown(mx0, my0, 3, 0, false, rect);
+    engine.handlePointerMove(mx0 + 18, my0, 3, rect);
+    expect(engine.physics.turnPhase).toBe('PULLING');
+    engine.setModalOpen(true);
+    expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+    engine.setModalOpen(false);
+
+    // 3. Sandbox pull onto table tracks grabPlaneY downward so prism lands directly under cursor aim
+    engine.resetGame('sandbox', 2);
+    for (let i = 0; i < 60; i++) engine.physics.step(1 / 60);
+    engine.camera.setPoseImmediate(0.68, 0.34, 5.2, [0, 1.44, 0], rect.width / rect.height);
+    const sbBlk = engine.physics.blocks.find((b) => b.assignedLayer === 10 && b.isLooseSlot)!;
+    const startPlaneY = sbBlk.position[1];
+    const [sbx0, sby0] = projectScreen([sbBlk.position[0] + 0.34, startPlaneY, sbBlk.position[2]]);
+    engine.handlePointerDown(sbx0, sby0, 7, 0, false, rect);
+
+    let finalAx = sbx0;
+    let finalAy = sby0;
+    const tableGoal: [number, number, number] = [1.85, 0.075, 0.0];
+    for (let i = 1; i <= 140; i++) {
+      const u = Math.min(1, i / 35);
+      const aim: [number, number, number] = [
+        (sbBlk.position[0] + 0.34) * (1 - u) + tableGoal[0] * u,
+        startPlaneY * (1 - u) + tableGoal[1] * u,
+        tableGoal[2],
+      ];
+      const [ax, ay] = projectScreen(aim);
+      finalAx = ax;
+      finalAy = ay;
+      engine.handlePointerMove(ax, ay, 7, rect);
+      engine.physics.step(1 / 60);
+    }
+    expect(engine.physics.grabPlaneY).toBeLessThan(startPlaneY - 0.65);
+    expect(
+      Math.abs(engine.physics.grabPlaneY - engine.physics.grabCurrentWorldOnBlock[1])
+    ).toBeLessThan(0.02);
+    const [grabSx, grabSy] = projectScreen(engine.physics.grabCurrentWorldOnBlock);
+    expect(Math.hypot(grabSx - finalAx, grabSy - finalAy)).toBeLessThan(28.0);
+
+    engine.dispose();
+  }, 15000);
 });
 

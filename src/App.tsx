@@ -247,6 +247,20 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    engineRef.current?.setModalOpen(showHelp);
+    if (!showHelp) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        engineRef.current?.audio.playUiKeyUp('default');
+        setShowHelp(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showHelp]);
+
   const playUiDown = useCallback((tone: UiSoundTone) => {
     engineRef.current?.audio.playUiKeyDown(tone);
   }, []);
@@ -869,6 +883,7 @@ export const App: React.FC = () => {
                     onAudioUp={playUiUp}
                     className="prism-release-btn"
                     onClick={() => engineRef.current?.handleReleaseOntoTop()}
+                    title="Release prism onto top course (Space / Enter)"
                   >
                     <PlacementGlyphSvg kind="place" />
                     <span>Place Prism</span>
@@ -989,7 +1004,13 @@ export const App: React.FC = () => {
        * ==================================================================== */}
       {showHelp && (
         <div className="codex-backdrop" onClick={() => setShowHelp(false)}>
-          <div className="codex-window" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="codex-window"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="vitrail-guide-heading"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="monument-spandrel-bar" aria-hidden="true">
               <span className="m-shard s-cobalt" />
               <span className="m-shard s-amber" />
@@ -1004,7 +1025,9 @@ export const App: React.FC = () => {
               <div className="codex-title-quarry">
                 <RoseHallmarkSvg />
                 <div>
-                  <h2 className="etched-heading">Vitrail Studio Guide</h2>
+                  <h2 id="vitrail-guide-heading" className="etched-heading">
+                    Vitrail Studio Guide
+                  </h2>
                   <span className="etched-subtitle">
                     Acoustic Tap-Testing · Spring Extraction · Voronoi Glass Fracture
                   </span>

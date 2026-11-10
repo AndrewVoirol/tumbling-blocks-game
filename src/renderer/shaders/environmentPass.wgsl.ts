@@ -54,7 +54,7 @@ fn fs_sky(input: SkyOut) -> @location(0) vec4<f32> {
   return vec4<f32>(col, 14.0);
 }
 
-// 2. Procedural 3D Round Dark Walnut Pedestal Table with Smooth Rounded Bullnose Rim (192 slices * 15 verts)
+// 2. Procedural 3D Round Dark Walnut Pedestal Table with Bullnose Rim, Recessed Soffit & Turned Pedestal (192 slices * 33 verts)
 struct TableOut {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
@@ -62,18 +62,28 @@ struct TableOut {
 };
 
 const TABLE_SEGMENTS: u32 = 192u;
+const TABLE_VERTS_PER_SLICE: u32 = 33u;
 const TABLE_R_FLAT: f32 = 4.24;
 const TABLE_R_OUTER: f32 = 4.30;
 const TABLE_BULLNOSE_Y: f32 = -0.048;
 const TABLE_H: f32 = 0.34;
+const TABLE_R_SOFFIT: f32 = 3.78;
+const TABLE_SOFFIT_Y: f32 = -0.54;
+const TABLE_R_COLLAR: f32 = 1.44;
+const TABLE_COLLAR_Y: f32 = -0.72;
+const TABLE_R_PED_BASE: f32 = 1.18;
+const TABLE_PED_BASE_Y: f32 = -4.20;
 
 fn evalTableVertex(vid: u32) -> TableOut {
-  // Each radial slice emits 5 triangles (15 vertices):
+  // Each radial slice emits 11 triangles (33 vertices):
   // Tri 0 (0..2): Flat top disc (0 -> rFlat)
   // Tri 1 & 2 (3..8): Smoothly curved bullnose upper chamfer (rFlat, 0 -> rOuter, -0.048)
-  // Tri 3 & 4 (9..14): Turned hardwood apron side band (rOuter, -0.048 -> rOuter*0.985, -TABLE_H)
-  let slice = vid / 15u;
-  let sub = vid % 15u;
+  // Tri 3 & 4 (9..14): Turned hardwood apron side band (rOuter, -0.048 -> rOuter*0.982, -TABLE_H)
+  // Tri 5 & 6 (15..20): Recessed cove under-bevel (rOuter*0.982, -TABLE_H -> rSoffit, -0.54)
+  // Tri 7 & 8 (21..26): Dark walnut sub-frame soffit (rSoffit, -0.54 -> rCollar, -0.72)
+  // Tri 9 & 10 (27..32): Turned central pedestal column (rCollar, -0.72 -> rPedBase, -4.20)
+  let slice = vid / TABLE_VERTS_PER_SLICE;
+  let sub = vid % TABLE_VERTS_PER_SLICE;
 
   let a0 = (f32(slice) / f32(TABLE_SEGMENTS)) * 2.0 * PI;
   let a1 = (f32(slice + 1u) / f32(TABLE_SEGMENTS)) * 2.0 * PI;
@@ -88,6 +98,12 @@ fn evalTableVertex(vid: u32) -> TableOut {
   let nRim1 = normalize(vec3<f32>(dir1.x, 0.38, dir1.y));
   let nApron0 = normalize(vec3<f32>(dir0.x, -0.08, dir0.y));
   let nApron1 = normalize(vec3<f32>(dir1.x, -0.08, dir1.y));
+  let nCove0 = normalize(vec3<f32>(dir0.x * 0.42, -0.91, dir0.y * 0.42));
+  let nCove1 = normalize(vec3<f32>(dir1.x * 0.42, -0.91, dir1.y * 0.42));
+  let nSoffit0 = normalize(vec3<f32>(dir0.x * 0.08, -0.99, dir0.y * 0.08));
+  let nSoffit1 = normalize(vec3<f32>(dir1.x * 0.08, -0.99, dir1.y * 0.08));
+  let nPed0 = normalize(vec3<f32>(dir0.x, -0.07, dir0.y));
+  let nPed1 = normalize(vec3<f32>(dir1.x, -0.07, dir1.y));
 
   let pCenter = vec3<f32>(0.0, 0.0, 0.0);
   let pFlat0 = vec3<f32>(dir0.x * TABLE_R_FLAT, 0.0, dir0.y * TABLE_R_FLAT);
@@ -96,30 +112,60 @@ fn evalTableVertex(vid: u32) -> TableOut {
   let pMid1 = vec3<f32>(dir1.x * TABLE_R_OUTER, TABLE_BULLNOSE_Y, dir1.y * TABLE_R_OUTER);
   let pBot0 = vec3<f32>(dir0.x * (TABLE_R_OUTER * 0.982), -TABLE_H, dir0.y * (TABLE_R_OUTER * 0.982));
   let pBot1 = vec3<f32>(dir1.x * (TABLE_R_OUTER * 0.982), -TABLE_H, dir1.y * (TABLE_R_OUTER * 0.982));
+  let pSoffit0 = vec3<f32>(dir0.x * TABLE_R_SOFFIT, TABLE_SOFFIT_Y, dir0.y * TABLE_R_SOFFIT);
+  let pSoffit1 = vec3<f32>(dir1.x * TABLE_R_SOFFIT, TABLE_SOFFIT_Y, dir1.y * TABLE_R_SOFFIT);
+  let pCollar0 = vec3<f32>(dir0.x * TABLE_R_COLLAR, TABLE_COLLAR_Y, dir0.y * TABLE_R_COLLAR);
+  let pCollar1 = vec3<f32>(dir1.x * TABLE_R_COLLAR, TABLE_COLLAR_Y, dir1.y * TABLE_R_COLLAR);
+  let pPed0 = vec3<f32>(dir0.x * TABLE_R_PED_BASE, TABLE_PED_BASE_Y, dir0.y * TABLE_R_PED_BASE);
+  let pPed1 = vec3<f32>(dir1.x * TABLE_R_PED_BASE, TABLE_PED_BASE_Y, dir1.y * TABLE_R_PED_BASE);
 
   var wp = pCenter;
   var wn = nTop;
 
   switch (sub) {
-    case 0u: { wp = pCenter; wn = nTop; }
-    case 1u: { wp = pFlat1;  wn = nTop; }
-    case 2u: { wp = pFlat0;  wn = nTop; }
+    case 0u: { wp = pCenter;  wn = nTop; }
+    case 1u: { wp = pFlat1;   wn = nTop; }
+    case 2u: { wp = pFlat0;   wn = nTop; }
 
-    case 3u: { wp = pFlat0;  wn = nBevelTop0; }
-    case 4u: { wp = pFlat1;  wn = nBevelTop1; }
-    case 5u: { wp = pMid0;   wn = nRim0; }
+    case 3u: { wp = pFlat0;   wn = nBevelTop0; }
+    case 4u: { wp = pFlat1;   wn = nBevelTop1; }
+    case 5u: { wp = pMid0;    wn = nRim0; }
 
-    case 6u: { wp = pFlat1;  wn = nBevelTop1; }
-    case 7u: { wp = pMid1;   wn = nRim1; }
-    case 8u: { wp = pMid0;   wn = nRim0; }
+    case 6u: { wp = pFlat1;   wn = nBevelTop1; }
+    case 7u: { wp = pMid1;    wn = nRim1; }
+    case 8u: { wp = pMid0;    wn = nRim0; }
 
-    case 9u:  { wp = pMid0;  wn = nRim0; }
-    case 10u: { wp = pMid1;  wn = nRim1; }
-    case 11u: { wp = pBot0;  wn = nApron0; }
+    case 9u:  { wp = pMid0;   wn = nRim0; }
+    case 10u: { wp = pMid1;   wn = nRim1; }
+    case 11u: { wp = pBot0;   wn = nApron0; }
 
-    case 12u: { wp = pMid1;  wn = nRim1; }
-    case 13u: { wp = pBot1;  wn = nApron1; }
-    default:  { wp = pBot0;  wn = nApron0; }
+    case 12u: { wp = pMid1;   wn = nRim1; }
+    case 13u: { wp = pBot1;   wn = nApron1; }
+    case 14u: { wp = pBot0;   wn = nApron0; }
+
+    case 15u: { wp = pBot0;    wn = nCove0; }
+    case 16u: { wp = pBot1;    wn = nCove1; }
+    case 17u: { wp = pSoffit0; wn = nCove0; }
+
+    case 18u: { wp = pBot1;    wn = nCove1; }
+    case 19u: { wp = pSoffit1; wn = nCove1; }
+    case 20u: { wp = pSoffit0; wn = nCove0; }
+
+    case 21u: { wp = pSoffit0; wn = nSoffit0; }
+    case 22u: { wp = pSoffit1; wn = nSoffit1; }
+    case 23u: { wp = pCollar0; wn = nSoffit0; }
+
+    case 24u: { wp = pSoffit1; wn = nSoffit1; }
+    case 25u: { wp = pCollar1; wn = nSoffit1; }
+    case 26u: { wp = pCollar0; wn = nSoffit0; }
+
+    case 27u: { wp = pCollar0; wn = nPed0; }
+    case 28u: { wp = pCollar1; wn = nPed1; }
+    case 29u: { wp = pPed0;    wn = nPed0; }
+
+    case 30u: { wp = pCollar1; wn = nPed1; }
+    case 31u: { wp = pPed1;    wn = nPed1; }
+    default:  { wp = pPed0;    wn = nPed0; }
   }
 
   var out: TableOut;
@@ -320,12 +366,24 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   let skyTint = uScene.skyTintAndMode.xyz;
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
 
-  let mat = evaluateWalnutTableMaterial(input.worldPos.xz, aaWidth);
+  let isUnderStructure = input.worldPos.y < -0.342;
+  var mat = evaluateWalnutTableMaterial(input.worldPos.xz, aaWidth);
+  if (isUnderStructure) {
+    let pedGrain = noise3D(vec3<f32>(input.worldPos.x * 9.0, input.worldPos.y * 22.0, input.worldPos.z * 9.0));
+    mat.albedo = mix(vec3<f32>(0.028, 0.017, 0.011), vec3<f32>(0.056, 0.034, 0.021), pedGrain);
+    mat.normalPerturb = vec3<f32>(0.0, (pedGrain - 0.5) * 0.02, 0.0);
+    mat.roughness = 0.44;
+    mat.metallic = 0.0;
+  }
   let topMask = smoothstep(0.55, 0.95, input.worldNormal.y);
   let N = safeNormalize(input.worldNormal + mat.normalPerturb * mix(0.22, 1.0, topMask), vec3<f32>(0.0, 1.0, 0.0));
 
-  let causticRGB = sampleContactHardeningCaustics(input.worldPos, L);
-  let windowGobo = evaluateStudioWindowGobo(input.worldPos, L);
+  var causticRGB = vec3<f32>(0.0);
+  var windowGobo: f32 = 0.0;
+  if (!isUnderStructure) {
+    causticRGB = sampleContactHardeningCaustics(input.worldPos, L);
+    windowGobo = evaluateStudioWindowGobo(input.worldPos, L);
+  }
 
   // Dual-scale Contact Ambient Occlusion gated by tableAoBounds + Y-sorted storage pointers
   let blockCount = u32(uScene.sunDirAndBlockCount.w);
@@ -333,6 +391,12 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   let shardStride = max(1u, u32(uScene.tableAoCounts.y));
   var aoCrevice: f32 = 1.0;
   var aoBounce: f32 = 1.0;
+  if (isUnderStructure) {
+    let rad = length(input.worldPos.xz);
+    let overhangOcc = mix(0.26, 0.68, smoothstep(1.35, 4.18, rad));
+    let pedDepthFade = smoothstep(-4.0, -0.35, input.worldPos.y);
+    aoBounce = overhangOcc * (0.45 + 0.55 * pedDepthFade);
+  }
 
   let aoB = uScene.tableAoBounds;
   if (

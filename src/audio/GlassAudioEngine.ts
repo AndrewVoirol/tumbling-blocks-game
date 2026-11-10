@@ -9,6 +9,7 @@ export class GlassAudioEngine {
   private noiseBuffer: AudioBuffer | null = null;
 
   // Persistent sliding friction loop nodes (zero allocation during rAF)
+  private slideSource: AudioBufferSourceNode | null = null;
   private slideGain: GainNode | null = null;
   private slideFilterA: BiquadFilterNode | null = null;
   private slideFilterB: BiquadFilterNode | null = null;
@@ -118,7 +119,13 @@ export class GlassAudioEngine {
   public setMuted(muted: boolean): void {
     this.muted = muted;
     if (this.masterGain && this.ctx) {
-      this.masterGain.gain.setTargetAtTime(muted ? 0 : 0.65, this.ctx.currentTime, 0.02);
+      const now = this.ctx.currentTime;
+      this.masterGain.gain.setTargetAtTime(muted ? 0 : 0.65, now, 0.02);
+      if (muted && this.slideGain) {
+        this.slideGain.gain.cancelScheduledValues(now);
+        this.slideGain.gain.setValueAtTime(this.slideGain.gain.value, now);
+        this.slideGain.gain.linearRampToValueAtTime(0, now + 0.018);
+      }
     }
   }
 
@@ -157,6 +164,7 @@ export class GlassAudioEngine {
     this.slideGain = this.ctx.createGain();
     this.slideGain.gain.value = 0;
 
+    this.slideSource = src;
     src.connect(this.slideFilterA);
     src.connect(this.slideFilterB);
     this.slideFilterA.connect(this.slideGain);
@@ -169,9 +177,15 @@ export class GlassAudioEngine {
    * Modulates real-time glass-on-glass sliding resonance while pulling/nudging a block.
    */
   public updateSlideFriction(slideSpeedDmPerSec: number, resistance01: number): void {
-    if (!this.ctx || !this.slideGain || !this.slideFilterA || !this.slideFilterB || this.muted) return;
+    if (!this.ctx || !this.slideGain || !this.slideFilterA || !this.slideFilterB) return;
     const now = this.ctx.currentTime;
     const speedNorm = Math.min(1.0, Math.max(0.0, (slideSpeedDmPerSec - 0.04) / 4.2));
+    if (this.muted || speedNorm <= 0) {
+      this.slideGain.gain.cancelScheduledValues(now);
+      this.slideGain.gain.setValueAtTime(this.slideGain.gain.value, now);
+      this.slideGain.gain.linearRampToValueAtTime(0, now + 0.018);
+      return;
+    }
     const targetGain = speedNorm * (0.025 + 0.062 * resistance01);
     this.slideGain.gain.setTargetAtTime(targetGain, now, 0.02);
     this.slideFilterA.frequency.setTargetAtTime(2100 + speedNorm * 650 + resistance01 * 420, now, 0.025);
@@ -376,7 +390,12 @@ export class GlassAudioEngine {
   /**
    * Internal stress craze / hairline crack sound without full shatter.
    */
-  public playGlassCrack(severity01: number = 0.7): void {
+  public playGlassCrack(
+    severity01: number = 0.7,
+    worldPos?: [number, number, number],
+    camPos?: [number, number, number],
+    camRight?: [number, number, number]
+  ): void {
     if (!this.ctx || !this.masterGain || !this.noiseBuffer || this.muted) return;
     const now = this.ctx.currentTime;
 
@@ -396,7 +415,7 @@ export class GlassAudioEngine {
       this.activeVoices++;
       snap.connect(bp);
       bp.connect(g);
-      const cleanupSnap = this.connectPanned(g);
+      const cleanupSnap = this.connectPanned(g, worldPos, camPos, camRight);
       snap.start(now, Math.random() * 1.2, 0.03);
       snap.onended = () => {
         this.activeVoices = Math.max(0, this.activeVoices - 1);
@@ -410,7 +429,7 @@ export class GlassAudioEngine {
       };
     }
 
-    this.playGlassImpact(0.45 * severity01, 1.32);
+    this.playGlassImpact(0.45 * severity01, 1.32, worldPos, camPos, camRight);
   }
 
   /**
@@ -773,6 +792,22 @@ export class GlassAudioEngine {
   }
 
   public dispose(): void {
+    if (this.slideSource) {
+      try {
+        this.slideSource.stop();
+        this.slideSource.disconnect();
+      } catch {
+        // Ignore already-stopped source
+      }
+      this.slideSource = null;
+    }
+    this.slideGain = null;
+    this.slideFilterA = null;
+    this.slideFilterB = null;
+    this.masterGain = null;
+    this.noiseBuffer = null;
+    this.activeVoices = 0;
+    this.liveConnectedNodes = 0;
     if (this.ctx) {
       void this.ctx.close();
       this.ctx = null;

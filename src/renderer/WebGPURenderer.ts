@@ -1343,7 +1343,9 @@ export class WebGPURenderer {
       Math.cos(el) * Math.cos(az),
     ];
 
-    const sunTargetY = 1.25;
+    const towerTopDm = intactCount > 0 ? Math.max(0.0, blkMaxY) : 0.0;
+    const sunTargetY =
+      towerTopDm > 2.82 ? 1.25 + (towerTopDm - 2.82) * 0.45 : 1.25;
     const sunEye: Vec3 = [sunDir[0] * 10.0, sunTargetY + sunDir[1] * 10.0, sunDir[2] * 10.0];
     mat4LookAt(this.sunViewMatrix, sunEye, [0, sunTargetY, 0], [0, 1, 0]);
     mat4OrthoZO(this.sunProjMatrix, -4.85, 4.85, -4.85, 4.85, 3.0, 17.0);
@@ -1437,7 +1439,7 @@ export class WebGPURenderer {
     this.compositeUniformData[2] = 0.085; // Tight physical optical glare
     this.compositeUniformData[3] = 1.18;  // Calibrated exposure for low-key dark walnut stage
     this.compositeUniformData[4] = focusDistDm;
-    this.compositeUniformData[5] = 1.65;  // +/- 16.5 cm tack-sharp zone around tower
+    this.compositeUniformData[5] = Math.max(1.65, towerTopDm * 0.58); // +/- 16.5 cm tack-sharp zone (expands automatically on tall >18-row stacks)
     this.compositeUniformData[6] = 4.2;   // Subtle natural f/2.8 bokeh blur on far table rim & backdrop
     this.compositeUniformData[7] = aspect;
     this.device.queue.writeBuffer(this.postUniformComposite, 0, this.compositeUniformData.buffer);
@@ -1572,7 +1574,7 @@ export class WebGPURenderer {
 
       pass.setPipeline(this.pipeTable);
       pass.setBindGroup(0, this.bgTable);
-      pass.draw(192 * 15, 1, 0, 0);
+      pass.draw(192 * 33, 1, 0, 0);
 
       pass.setPipeline(this.pipeSky);
       pass.setBindGroup(0, this.bgSky);
