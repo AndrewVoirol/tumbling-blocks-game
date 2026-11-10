@@ -4,6 +4,8 @@
 
 Stained-glass Jenga built from scratch on WebGPU and Rapier3D. Every prism is modeled to 1:1 regulation scale (`7.5 × 2.5 × 1.5 cm`, `71.1 g` beveled cathedral soda-lime glass across 18 courses = `27.0 cm`) atop a quarter-sawn dark walnut stave pedestal table, raytraced through multi-block dielectric refraction with projected Snell caustics and 3D Voronoi glass shattering.
 
+**[Play Live at vitrail.andrewvoirol.com →](https://vitrail.andrewvoirol.com)**
+
 ## Quick Start
 
 Requires Node.js 20+ and a WebGPU browser (Chrome 113+, Edge 113+, or Safari 18+).
