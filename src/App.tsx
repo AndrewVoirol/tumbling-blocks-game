@@ -31,8 +31,9 @@ const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#f59e0b', '#10b981'];
 
 const LIGHT_LABELS: Record<string, string> = {
   'lancet-morning': 'Morning',
-  'golden-vespers': 'Vespers',
+  'daylight-atelier': 'Atelier',
   'high-clerestory': 'Noon',
+  'golden-vespers': 'Vespers',
 };
 
 export type QuarryGlassTone =

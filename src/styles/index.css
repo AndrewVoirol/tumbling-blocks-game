@@ -36,6 +36,12 @@
   --sunbeam-ray-b: rgba(186, 230, 253, 0.08);
 }
 
+.app-shell[data-lighting='daylight-atelier'] {
+  --lancet-halo: rgba(251, 191, 36, 0.20);
+  --sunbeam-ray-a: rgba(255, 251, 235, 0.14);
+  --sunbeam-ray-b: rgba(253, 224, 71, 0.08);
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -379,13 +385,16 @@ body,
   z-index: 1;
 }
 
-/* Clerestory Sky Panes (Morning / Vespers / Noon) */
+/* Clerestory Sky Panes (2x2 Gothic Bifora Mullion Grid: Morning / Atelier / Noon / Vespers) */
 .sky-course {
-  height: 58px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: 46px;
+  gap: 2.5px;
 }
 
 .sky-lancet-pane {
-  flex: 1;
+  width: 100%;
 }
 
 .sky-lancet-pane .quarry-etch-content {
@@ -629,19 +638,38 @@ body,
   padding: 13px 15px 12px;
   background: linear-gradient(
     142deg,
-    rgba(255, 253, 248, 0.065) 0%,
-    rgba(255, 255, 255, 0.015) 54%,
-    rgba(255, 252, 244, 0.038) 100%
+    rgba(24, 22, 26, 0.34) 0%,
+    rgba(18, 16, 20, 0.24) 54%,
+    rgba(28, 25, 28, 0.30) 100%
   );
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  border-top: 1px solid rgba(255, 252, 244, 0.36);
-  border-left: 1px solid rgba(255, 252, 244, 0.24);
-  border-right: 1px solid rgba(255, 252, 244, 0.11);
-  border-bottom: 1px solid rgba(255, 252, 244, 0.14);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border-top: 1px solid rgba(255, 252, 244, 0.38);
+  border-left: 1px solid rgba(255, 252, 244, 0.26);
+  border-right: 1px solid rgba(255, 252, 244, 0.14);
+  border-bottom: 1px solid rgba(255, 252, 244, 0.16);
   box-shadow:
-    inset 0 0 0 3px rgba(255, 255, 255, 0.015),
-    0 10px 26px rgba(0, 0, 0, 0.24);
+    inset 0 0 0 3px rgba(255, 255, 255, 0.02),
+    0 10px 26px rgba(0, 0, 0, 0.26);
+  transition: background 240ms ease, border-color 240ms ease, box-shadow 240ms ease;
+}
+
+.app-shell[data-lighting='daylight-atelier'] .crystal-optical-plate {
+  background: linear-gradient(
+    142deg,
+    rgba(28, 25, 22, 0.72) 0%,
+    rgba(20, 18, 16, 0.62) 54%,
+    rgba(30, 26, 22, 0.68) 100%
+  );
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  border-top-color: rgba(255, 252, 244, 0.58);
+  border-left-color: rgba(255, 252, 244, 0.42);
+  border-right-color: rgba(255, 252, 244, 0.24);
+  border-bottom-color: rgba(255, 252, 244, 0.26);
+  box-shadow:
+    inset 0 0 0 3px rgba(255, 253, 246, 0.04),
+    0 12px 28px rgba(28, 20, 12, 0.24);
 }
 
 /* Wheel-engraved optical registration ticks at the 4 crystal corners */

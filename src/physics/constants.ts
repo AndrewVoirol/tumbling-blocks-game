@@ -147,6 +147,7 @@ export interface LightingPreset {
   sunElevationDeg: number;
   sunColor: [number, number, number];
   skyTint: [number, number, number];
+  atelierMix?: number;
 }
 
 export const LIGHTING_PRESETS: LightingPreset[] = [
@@ -157,14 +158,16 @@ export const LIGHTING_PRESETS: LightingPreset[] = [
     sunElevationDeg: 38,
     sunColor: [3.4, 3.05, 2.55],
     skyTint: [0.44, 0.54, 0.72],
+    atelierMix: 0,
   },
   {
-    id: 'golden-vespers',
-    name: 'Golden Vespers',
-    sunAzimuthDeg: 48,
-    sunElevationDeg: 27,
-    sunColor: [3.85, 2.65, 1.75],
-    skyTint: [0.52, 0.44, 0.62],
+    id: 'daylight-atelier',
+    name: 'Daylight Atelier',
+    sunAzimuthDeg: -34,
+    sunElevationDeg: 42,
+    sunColor: [3.25, 3.1, 2.84],
+    skyTint: [0.6, 0.67, 0.79],
+    atelierMix: 1,
   },
   {
     id: 'high-clerestory',
@@ -173,5 +176,15 @@ export const LIGHTING_PRESETS: LightingPreset[] = [
     sunElevationDeg: 54,
     sunColor: [3.3, 3.25, 3.1],
     skyTint: [0.48, 0.58, 0.74],
+    atelierMix: 0,
+  },
+  {
+    id: 'golden-vespers',
+    name: 'Golden Vespers',
+    sunAzimuthDeg: 48,
+    sunElevationDeg: 27,
+    sunColor: [3.85, 2.65, 1.75],
+    skyTint: [0.52, 0.44, 0.62],
+    atelierMix: 0,
   },
 ];

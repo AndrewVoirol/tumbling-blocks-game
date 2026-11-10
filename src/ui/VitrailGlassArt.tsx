@@ -86,6 +86,16 @@ export const LancetArchApexSvg: React.FC<{ presetId: string }> = ({ presetId }) 
           opal: '#fde68a',
           jewel: '#fffbeb',
         }
+      : presetId === 'daylight-atelier'
+      ? {
+          c1: '#0284c7',
+          c2: '#38bdf8',
+          c3: '#f59e0b',
+          c4: '#d97706',
+          c5: '#fde047',
+          opal: '#fffbeb',
+          jewel: '#ffffff',
+        }
       : presetId === 'high-clerestory'
       ? {
           c1: '#0369a1',
@@ -216,7 +226,16 @@ export const ClerestoryPaneMosaicSvg: React.FC<{ presetId: string; active: boole
           midL: '#be185d',
           midR: '#6d28d9',
           sun: '#fde68a',
-          band: active ? 'rgba(42, 18, 12, 0.76)' : 'rgba(28, 22, 24, 0.72)',
+          band: active ? 'rgba(42, 18, 12, 0.78)' : 'rgba(28, 22, 24, 0.74)',
+        }
+      : presetId === 'daylight-atelier'
+      ? {
+          topL: '#38bdf8',
+          topR: '#fde68a',
+          midL: '#bae6fd',
+          midR: '#f59e0b',
+          sun: '#ffffff',
+          band: active ? 'rgba(44, 34, 18, 0.80)' : 'rgba(28, 25, 20, 0.75)',
         }
       : presetId === 'high-clerestory'
       ? {
@@ -225,7 +244,7 @@ export const ClerestoryPaneMosaicSvg: React.FC<{ presetId: string; active: boole
           midL: '#0d9488',
           midR: '#38bdf8',
           sun: '#ffffff',
-          band: active ? 'rgba(10, 38, 44, 0.76)' : 'rgba(20, 28, 32, 0.72)',
+          band: active ? 'rgba(10, 38, 44, 0.78)' : 'rgba(20, 28, 32, 0.74)',
         }
       : {
           topL: '#1d4ed8',
@@ -233,11 +252,18 @@ export const ClerestoryPaneMosaicSvg: React.FC<{ presetId: string; active: boole
           midL: '#2563eb',
           midR: '#f59e0b',
           sun: '#fef08a',
-          band: active ? 'rgba(14, 28, 62, 0.76)' : 'rgba(20, 24, 34, 0.72)',
+          band: active ? 'rgba(14, 28, 62, 0.78)' : 'rgba(20, 24, 34, 0.74)',
         };
 
-  const sunCx = presetId === 'lancet-morning' ? 24 : presetId === 'golden-vespers' ? 54 : 39;
-  const sunCy = presetId === 'high-clerestory' ? 14 : 18;
+  const sunCx =
+    presetId === 'lancet-morning'
+      ? 24
+      : presetId === 'daylight-atelier'
+      ? 30
+      : presetId === 'golden-vespers'
+      ? 54
+      : 39;
+  const sunCy = presetId === 'high-clerestory' ? 13 : presetId === 'daylight-atelier' ? 15 : 18;
 
   return (
     <svg

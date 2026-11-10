@@ -193,9 +193,9 @@ fn projectTableSunUV(hitPos: vec3<f32>) -> vec2<f32> {
   return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 }
 
-fn evalTableCausticAndLightAt(hitPos: vec3<f32>, diffuseAlbedo: vec3<f32>, L: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>, skyScale: f32) -> vec3<f32> {
+fn evalTableCausticAndLightAt(hitPos: vec3<f32>, diffuseAlbedo: vec3<f32>, L: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>, skyScale: f32, atelierMix: f32) -> vec3<f32> {
   let rXZ = length(hitPos.xz);
-  let gobo = evaluateStudioWindowGobo(hitPos, L);
+  let gobo = evaluateStudioWindowGobo(hitPos, L, atelierMix);
   let uv = projectTableSunUV(hitPos);
   var caustic = vec3<f32>(1.0);
   if (uv.x >= 0.002 && uv.x <= 0.998 && uv.y >= 0.002 && uv.y <= 0.998) {
@@ -207,16 +207,16 @@ fn evalTableCausticAndLightAt(hitPos: vec3<f32>, diffuseAlbedo: vec3<f32>, L: ve
     caustic = mix(vec3<f32>(1.0), sBase, cMask) + flux;
   }
   let nDotL = max(0.0, L.y);
-  let edgeVignette = 1.0 - smoothstep(3.45, 4.30, rXZ) * 0.32;
+  let edgeVignette = 1.0 - smoothstep(3.45, 4.30, rXZ) * mix(0.32, 0.14, atelierMix);
   let baseOcc = mix(0.45, 1.0, smoothstep(0.28, 0.65, max(abs(hitPos.x), abs(hitPos.z))));
-  let ambient = (skyTint * 0.11 + vec3<f32>(0.024, 0.019, 0.016) * skyScale) * baseOcc;
+  let ambient = evaluateTableAmbientIrradiance(skyTint, skyScale, atelierMix) * baseOcc;
   let direct = sunColor * nDotL * caustic * gobo;
   return diffuseAlbedo * (direct + ambient) * edgeVignette;
 }
 
 /**
  * Evaluates refracted background scene for dispersed R, G, B rays simultaneously,
- * sharing procedural walnut grain + optical-depth base when rays land within 3.5 cm
+ * sharing procedural stave grain + optical-depth base when rays land within 3.5 cm
  * while sampling exact dispersed caustics (uvR, uvG, uvB) & sky!
  */
 fn sampleRefractedDispersedBackground(
@@ -232,6 +232,7 @@ fn sampleRefractedDispersedBackground(
   let sunColor = uScene.sunColorAndAspect.xyz;
   let skyTint = uScene.skyTintAndMode.xyz;
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
+  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
   let nDotL = max(0.0, L.y);
 
   let hitTableG = dirG.y < -1e-4 && posG.y > 0.0;
@@ -247,12 +248,12 @@ fn sampleRefractedDispersedBackground(
     hitPosG = posG + dirG * (-posG.y / dirG.y);
     let r2G = dot(hitPosG.xz, hitPosG.xz);
     if (r2G <= 4.30 * 4.30) {
-      let matG = evaluateWalnutTableMaterial(hitPosG.xz, 0.0025);
+      let matG = evaluateWalnutTableMaterial(hitPosG.xz, 0.0025, atelierMix);
       sharedWoodAlbedo = matG.albedo * (1.0 - matG.metallic * 0.85);
-      sharedGobo = evaluateStudioWindowGobo(hitPosG, L);
-      sharedVignette = 1.0 - smoothstep(3.45, 4.30, sqrt(r2G)) * 0.32;
+      sharedGobo = evaluateStudioWindowGobo(hitPosG, L, atelierMix);
+      sharedVignette = 1.0 - smoothstep(3.45, 4.30, sqrt(r2G)) * mix(0.32, 0.14, atelierMix);
       let baseOccG = mix(0.45, 1.0, smoothstep(0.28, 0.65, max(abs(hitPosG.x), abs(hitPosG.z))));
-      sharedAmbient = (skyTint * 0.11 + vec3<f32>(0.024, 0.019, 0.016) * skyScale) * baseOccG;
+      sharedAmbient = evaluateTableAmbientIrradiance(skyTint, skyScale, atelierMix) * baseOccG;
       let uvG = projectTableSunUV(hitPosG);
       if (uvG.x >= 0.002 && uvG.x <= 0.998 && uvG.y >= 0.002 && uvG.y <= 0.998) {
         let tau = textureSampleLevel(uSunOpticalDepthTex, uLinearSampler, uvG, 0.0).rgb;
@@ -274,7 +275,7 @@ fn sampleRefractedDispersedBackground(
     }
     outG = sharedWoodAlbedo.g * (sunColor.g * nDotL * (sharedShadowBase.g + fluxG) * sharedGobo + sharedAmbient.g) * sharedVignette;
   } else {
-    outG = (sampleStudioBackdrop(dirG, L, sunColor, skyTint) + pow(max(0.0, dot(dirG, L)), 5.0) * sunColor * 0.38).g;
+    outG = (sampleStudioBackdrop(dirG, L, sunColor, skyTint, atelierMix) + pow(max(0.0, dot(dirG, L)), 5.0) * sunColor * 0.38).g;
   }
 
   var outR: f32 = 0.0;
@@ -289,15 +290,15 @@ fn sampleRefractedDispersedBackground(
         }
         outR = sharedWoodAlbedo.r * (sunColor.r * nDotL * (sharedShadowBase.r + fluxR) * sharedGobo + sharedAmbient.r) * sharedVignette;
       } else {
-        let matR = evaluateWalnutTableMaterial(hitPosR.xz, 0.0025);
+        let matR = evaluateWalnutTableMaterial(hitPosR.xz, 0.0025, atelierMix);
         let albR = matR.albedo * (1.0 - matR.metallic * 0.85);
-        outR = evalTableCausticAndLightAt(hitPosR, albR, L, sunColor, skyTint, skyScale).r;
+        outR = evalTableCausticAndLightAt(hitPosR, albR, L, sunColor, skyTint, skyScale, atelierMix).r;
       }
     } else {
-      outR = (sampleStudioBackdrop(dirR, L, sunColor, skyTint) + pow(max(0.0, dot(dirR, L)), 5.0) * sunColor * 0.38).r;
+      outR = (sampleStudioBackdrop(dirR, L, sunColor, skyTint, atelierMix) + pow(max(0.0, dot(dirR, L)), 5.0) * sunColor * 0.38).r;
     }
   } else {
-    outR = (sampleStudioBackdrop(dirR, L, sunColor, skyTint) + pow(max(0.0, dot(dirR, L)), 5.0) * sunColor * 0.38).r;
+    outR = (sampleStudioBackdrop(dirR, L, sunColor, skyTint, atelierMix) + pow(max(0.0, dot(dirR, L)), 5.0) * sunColor * 0.38).r;
   }
 
   var outB: f32 = 0.0;
@@ -312,15 +313,15 @@ fn sampleRefractedDispersedBackground(
         }
         outB = sharedWoodAlbedo.b * (sunColor.b * nDotL * (sharedShadowBase.b + fluxB) * sharedGobo + sharedAmbient.b) * sharedVignette;
       } else {
-        let matB = evaluateWalnutTableMaterial(hitPosB.xz, 0.0025);
+        let matB = evaluateWalnutTableMaterial(hitPosB.xz, 0.0025, atelierMix);
         let albB = matB.albedo * (1.0 - matB.metallic * 0.85);
-        outB = evalTableCausticAndLightAt(hitPosB, albB, L, sunColor, skyTint, skyScale).b;
+        outB = evalTableCausticAndLightAt(hitPosB, albB, L, sunColor, skyTint, skyScale, atelierMix).b;
       }
     } else {
-      outB = (sampleStudioBackdrop(dirB, L, sunColor, skyTint) + pow(max(0.0, dot(dirB, L)), 5.0) * sunColor * 0.38).b;
+      outB = (sampleStudioBackdrop(dirB, L, sunColor, skyTint, atelierMix) + pow(max(0.0, dot(dirB, L)), 5.0) * sunColor * 0.38).b;
     }
   } else {
-    outB = (sampleStudioBackdrop(dirB, L, sunColor, skyTint) + pow(max(0.0, dot(dirB, L)), 5.0) * sunColor * 0.38).b;
+    outB = (sampleStudioBackdrop(dirB, L, sunColor, skyTint, atelierMix) + pow(max(0.0, dot(dirB, L)), 5.0) * sunColor * 0.38).b;
   }
 
   return vec3<f32>(outR, outG, outB);
@@ -405,12 +406,13 @@ fn traceTowerGlassRayDispersed(
   let iorG: f32 = 1.522;
   let iorB: f32 = 1.533;
   let f0: f32 = 0.0428;
+  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
 
   // 1. Refract Green carrier ray + R/B Abbe dispersion into primary block
   var internalDirWorld = refract(incidentDir, frontWorldNormal, 1.0 / iorG);
   if (length(internalDirWorld) < 1e-4) {
     internalDirWorld = reflect(incidentDir, frontWorldNormal);
-    return sampleCathedralEnvironment(internalDirWorld, L, sunColor, skyTint);
+    return sampleCathedralEnvironment(internalDirWorld, L, sunColor, skyTint, atelierMix);
   }
   internalDirWorld = safeNormalize(internalDirWorld, incidentDir);
 
@@ -446,10 +448,10 @@ fn traceTowerGlassRayDispersed(
     if (length(worldRayDir) < 1e-4) {
       worldRayDir = reflect(bouncedWorldDir, -finalExitNWorld);
     }
-    internalMirrorContrib = sampleCathedralEnvironment(bouncedWorldDir, L, sunColor, skyTint) * 0.14;
+    internalMirrorContrib = sampleCathedralEnvironment(bouncedWorldDir, L, sunColor, skyTint, atelierMix) * 0.14;
   } else {
     let partialBounce = reflect(internalDirWorld, -exitPerturbedN);
-    internalMirrorContrib = sampleCathedralEnvironment(partialBounce, L, sunColor, skyTint) * internalReflF * 0.22;
+    internalMirrorContrib = sampleCathedralEnvironment(partialBounce, L, sunColor, skyTint, atelierMix) * internalReflF * 0.22;
   }
   worldRayDir = safeNormalize(worldRayDir, incidentDir);
 
@@ -612,7 +614,7 @@ fn traceTowerGlassRayDispersed(
     let seamReflDir = reflect(worldRayDir, entryNWorld);
     var seamEnv = skyTint * 0.22 + sunColor * pow(max(0.0, dot(seamReflDir, L)), 6.0) * 0.55;
     if (bounce == 0u) {
-      seamEnv = sampleCathedralEnvironment(seamReflDir, L, sunColor, skyTint);
+      seamEnv = sampleCathedralEnvironment(seamReflDir, L, sunColor, skyTint, atelierMix);
     }
     internalScatter += seamEnv * throughput * seamFresnel * (0.24 + 0.24 * isTightContact) * scatterGate;
 
@@ -645,7 +647,7 @@ fn traceTowerGlassRayDispersed(
       if (length(exitedDir) < 1e-4) {
         exitedDir = reflect(tirWorldDir, -exitN2World);
       }
-      internalScatter += sampleCathedralEnvironment(tirWorldDir, L, sunColor, skyTint) * throughput * 0.12 * scatterGate;
+      internalScatter += sampleCathedralEnvironment(tirWorldDir, L, sunColor, skyTint, atelierMix) * throughput * 0.12 * scatterGate;
     }
 
     let cosExit2 = clamp(abs(dot(insideSecondary, exitN2World)), 0.0, 1.0);
@@ -767,8 +769,9 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let macroWorldN = safeNormalize(((*pBlk).localToWorld * vec4<f32>(smoothLocalN, 0.0)).xyz, input.worldNormal);
 
   // Upstream-only colored solar transmittance (replaces opaque binary self-shadow blackout!)
+  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
   let rawSunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, input.worldPos, macroWorldN, L, 0.022);
-  let windowGobo = evaluateStudioWindowGobo(input.worldPos, L);
+  let windowGobo = evaluateStudioWindowGobo(input.worldPos, L, atelierMix);
   let sunDirLocal = ((*pBlk).worldToLocal * vec4<f32>(-L, 0.0)).xyz;
   let selfChord = clamp(intersectLocalSlabRaw(input.localPos + sunDirLocal * 0.001, sunDirLocal).y, 0.015, 0.38);
   let sigmaSelf = mix((*pBlk).absorptionAndMotif.xyz, (*pBlk).accentAndSeed.xyz, vitrail.accentMix) + SODA_LIME_IRON_SIGMA;
@@ -801,7 +804,7 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
 
   let reflDir = reflect(incidentDir, glassNormal);
   let reflSunColor = sunColor * mix(0.20 + 0.80 * sunTransRGB, vec3<f32>(1.0), directSunVis);
-  let envReflection = sampleCathedralEnvironment(reflDir, L, reflSunColor, skyTint);
+  let envReflection = sampleCathedralEnvironment(reflDir, L, reflSunColor, skyTint, atelierMix);
   let glassRoughness = mix(0.032, 0.055, flatFaceMask);
   let sunMicroSpec = min(
     evalGGXSpecular(glassNormal, V, L, glassRoughness) * fresnel,

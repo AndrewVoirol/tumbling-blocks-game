@@ -19,7 +19,7 @@ struct SceneUniforms {
   sunColorAndAspect: vec4<f32>,
   skyTintAndMode: vec4<f32>, // xyz = skyTint, w = activeShardCount
   tableAoBounds: vec4<f32>,  // (minX, minZ, maxX, maxZ) of low-height blocks & shards
-  tableAoCounts: vec4<f32>,  // x = intactCount, y = shardStride
+  tableAoCounts: vec4<f32>,  // x = intactCount, y = shardStride, z = maxBlockHalfY, w = atelierMix (0 = stone workshop/walnut, 1 = daylight plaster/oak)
 };
 
 struct GPUBlockData {
@@ -231,10 +231,10 @@ fn evalGGXSpecular(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, roughness: f32) -> 
 
 /**
  * Evaluates a focused cathedral clerestory window light-shaft (gobo) across the stage:
- * Full sunlight illuminates the central tower & caustic pool, softly rolling off into cool
- * architectural shadow toward the outer perimeter of the 86 cm walnut table.
+ * Full sunlight illuminates the central tower & caustic pool, softly rolling off into
+ * architectural shadow toward the outer perimeter (lifted in bounce-lit Daylight Atelier).
  */
-fn evaluateStudioWindowGobo(worldPos: vec3<f32>, sunDir: vec3<f32>) -> f32 {
+fn evaluateStudioWindowGobo(worldPos: vec3<f32>, sunDir: vec3<f32>, atelierMix: f32) -> f32 {
   // Trace point back along sunDir to reference plane y = 0.9 dm so tall tower & floor pool align coherently
   let shiftT = (0.90 - worldPos.y) / max(0.22, sunDir.y);
   let stageXZ = worldPos.xz + sunDir.xz * shiftT * 0.25;
@@ -250,8 +250,9 @@ fn evaluateStudioWindowGobo(worldPos: vec3<f32>, sunDir: vec3<f32>) -> f32 {
   let longMask = 1.0 - smoothstep(2.45, 4.25, abs(vWin - 0.35));
 
   // Subtle soft-blurred upper window transom bar near the far edge of the light pool
-  let transomDip = 1.0 - 0.18 * (1.0 - smoothstep(0.18, 0.52, abs(vWin - 2.35)));
-  return clamp(0.14 + 0.86 * lateralMask * longMask * transomDip, 0.14, 1.0);
+  let transomDip = 1.0 - mix(0.16, 0.08, atelierMix) * (1.0 - smoothstep(0.18, 0.52, abs(vWin - 2.35)));
+  let goboFloor = mix(0.27, 0.56, clamp(atelierMix, 0.0, 1.0));
+  return clamp(goboFloor + (1.0 - goboFloor) * lateralMask * longMask * transomDip, goboFloor, 1.0);
 }
 
 /**
@@ -343,15 +344,19 @@ fn sampleSunOpticalDepth(
  * Features crisp, bright architectural window panes divided by dark mullions so polished glass
  * faces and 1.25 mm bevels reflect continuous elongated window strips instead of Phong dots!
  */
-fn sampleCathedralEnvironment(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>) -> vec3<f32> {
+fn sampleCathedralEnvironment(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>, atelierMix: f32) -> vec3<f32> {
   let d = safeNormalize(rayDir, vec3<f32>(0.0, 1.0, 0.0));
   let up = clamp(d.y, -1.0, 1.0);
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
+  let aMix = clamp(atelierMix, 0.0, 1.0);
 
-  // Warm architectural limestone studio bounce scaled linearly by skyScale so dark-room L(0) == 0
-  let darkFloor = vec3<f32>(0.042, 0.028, 0.019) * skyScale;
-  let shadowedStone = vec3<f32>(0.072, 0.068, 0.068) * skyScale + skyTint * 0.085;
-  let vaultZenith = skyTint * 0.28 + vec3<f32>(0.045, 0.052, 0.068) * skyScale;
+  // Warm architectural limestone studio bounce (lifted ~38% on workshop presets, bright plaster in Daylight Atelier)
+  // Scaled linearly by skyScale & skyTint so dark-room L(0) == 0
+  let darkFloor = mix(vec3<f32>(0.058, 0.040, 0.028), vec3<f32>(0.155, 0.112, 0.072), aMix) * skyScale;
+  let shadowedStone = mix(vec3<f32>(0.098, 0.092, 0.089), vec3<f32>(0.235, 0.220, 0.202), aMix) * skyScale
+                    + skyTint * mix(0.115, 0.215, aMix);
+  let vaultZenith = skyTint * mix(0.36, 0.56, aMix)
+                  + mix(vec3<f32>(0.062, 0.070, 0.088), vec3<f32>(0.155, 0.165, 0.185), aMix) * skyScale;
 
   var env = mix(shadowedStone, vaultZenith, smoothstep(0.0, 0.80, max(0.0, up)));
   env = mix(darkFloor, env, smoothstep(-0.28, 0.04, up));
@@ -395,36 +400,49 @@ fn sampleCathedralEnvironment(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: ve
 }
 
 /**
- * Dimensional, out-of-focus shadowed limestone studio alcove behind the walnut table.
- * Provides warm architectural depth & oblique window-shaft atmosphere without washing out or clipping to pitch black.
+ * Dimensional, out-of-focus sunlit stone workshop / limewashed daylight atelier alcove behind the table.
+ * Workshop presets (atelierMix = 0) read as a warm sunlit stone studio (~42% lifted over deep nave),
+ * while Daylight Atelier (atelierMix = 1) shifts to a bright limewashed plaster & travertine gallery.
  */
-fn sampleStudioBackdrop(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>) -> vec3<f32> {
+fn sampleStudioBackdrop(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>, atelierMix: f32) -> vec3<f32> {
   let d = safeNormalize(rayDir, vec3<f32>(0.0, 0.0, -1.0));
   let up = clamp(d.y, -1.0, 1.0);
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
+  let aMix = clamp(atelierMix, 0.0, 1.0);
 
-  // Warm shadowed studio dado/wainscot below horizon -> soft limestone plaster wall above
-  let lowerAlcove = vec3<f32>(0.026, 0.021, 0.019) * skyScale;
-  let midWall = vec3<f32>(0.054, 0.048, 0.046) * skyScale + skyTint * 0.042;
-  let upperVault = vec3<f32>(0.038, 0.040, 0.048) * skyScale + skyTint * 0.065;
+  // Sunlit stone workshop (aMix = 0) vs warm limewashed daylight plaster atelier (aMix = 1)
+  // Calibrated to default camera wall frustum (rayDir.y in [-0.32, +0.05] above rear table rim)
+  let lowerAlcove = mix(vec3<f32>(0.074, 0.064, 0.056), vec3<f32>(0.172, 0.155, 0.138), aMix) * skyScale
+                  + skyTint * mix(0.032, 0.068, aMix);
+  let midWall     = mix(vec3<f32>(0.132, 0.120, 0.108), vec3<f32>(0.292, 0.270, 0.244), aMix) * skyScale
+                  + skyTint * mix(0.078, 0.140, aMix);
+  let upperVault  = mix(vec3<f32>(0.112, 0.112, 0.120), vec3<f32>(0.252, 0.246, 0.242), aMix) * skyScale
+                  + skyTint * mix(0.108, 0.198, aMix);
 
-  var bg = mix(lowerAlcove, midWall, smoothstep(-0.18, 0.12, up));
-  bg = mix(bg, upperVault, smoothstep(0.16, 0.72, up));
+  var bg = mix(lowerAlcove, midWall, smoothstep(-0.34, -0.02, up));
+  bg = mix(bg, upperVault, smoothstep(0.02, 0.50, up));
 
   // Subtle out-of-focus architectural limestone bay & pilaster tonal modulation
   let az = atan2(d.x, d.z);
-  let archMod = 0.86 + 0.14 * cos(az * 2.5 - 0.5);
-  let dadoShadow = 1.0 - 0.16 * (1.0 - smoothstep(0.01, 0.06, abs(up + 0.04)));
+  let archMod = mix(0.88, 0.92, aMix) + mix(0.12, 0.08, aMix) * cos(az * 2.5 - 0.5);
+  let dadoShadow = 1.0 - mix(0.12, 0.08, aMix) * (1.0 - smoothstep(0.015, 0.07, abs(up + 0.24)));
   bg *= archMod * dadoShadow;
 
   // Oblique warm sunlight wash grazing the studio wall from the window side
   let sunAlign = dot(normalize(vec2<f32>(d.x, d.z + 1e-5)), normalize(vec2<f32>(sunDir.x, sunDir.z + 1e-5)));
   let shaftCoord = d.x * sunDir.z - d.z * sunDir.x;
-  let shaftBeam = exp(-shaftCoord * shaftCoord * 2.4) * smoothstep(-0.18, 0.52, up + sunAlign * 0.28);
-  let sideWarmth = smoothstep(-0.4, 0.85, sunAlign) * smoothstep(-0.10, 0.35, up);
-  bg += (sunColor * 0.022 + skyTint * 0.024) * shaftBeam + sunColor * 0.012 * sideWarmth;
+  let shaftBeam = exp(-shaftCoord * shaftCoord * 2.2) * smoothstep(-0.34, 0.26, up + sunAlign * 0.22);
+  let sideWarmth = smoothstep(-0.35, 0.85, sunAlign) * smoothstep(-0.30, 0.14, up);
+  bg += (sunColor * mix(0.044, 0.058, aMix) + skyTint * mix(0.042, 0.050, aMix)) * shaftBeam
+      + sunColor * mix(0.028, 0.038, aMix) * sideWarmth;
 
   return bg;
+}
+
+fn evaluateTableAmbientIrradiance(skyTint: vec3<f32>, skyScale: f32, atelierMix: f32) -> vec3<f32> {
+  let aMix = clamp(atelierMix, 0.0, 1.0);
+  return skyTint * mix(0.19, 0.30, aMix)
+       + mix(vec3<f32>(0.045, 0.037, 0.030), vec3<f32>(0.088, 0.076, 0.064), aMix) * skyScale;
 }
 
 struct TableMaterial {
@@ -435,14 +453,14 @@ struct TableMaterial {
 };
 
 /**
- * Evaluates artisan quarter-sawn fumed dark walnut / smoked oak stave tabletop + recessed brushed-brass inlay:
- * - Elliptical cathedral growth-ring arches per plank (eliminating uniform parallel sine stripes!)
- * - Anisotropic open wood vessel pores with 3D normal dips & higher micro-roughness
- * - Hand-planed V-groove plank joinery seams with 3D bevel normals
- * - Narrow (1.1 mm) recessed brushed-brass regulation base square & outer rim line
+ * Evaluates artisan quarter-sawn stave tabletop + recessed brushed-brass inlay:
+ * - atelierMix == 0: Fumed dark walnut staves (high dynamic range jewel caustic contrast)
+ * - atelierMix == 1: Natural European honeyed white oak / ash staves (sunlit Daylight Atelier)
+ * - Elliptical cathedral growth-ring arches per plank + anisotropic open vessel pores + 3D V-groove seams
  */
-fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32) -> TableMaterial {
+fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32, atelierMix: f32) -> TableMaterial {
   let r = length(xz);
+  let aMix = clamp(atelierMix, 0.0, 1.0);
   // 7.2 cm (0.72 dm) solid hardwood staves running along X
   let staveCoord = (xz.y + 4.6) / 0.72;
   let plankId = floor(staveCoord);
@@ -467,22 +485,22 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32) -> TableMaterial {
   let ringPhase = fract(radialTree * 26.0 + hPlank * 6.0);
   let latewood = smoothstep(0.0, 0.24, ringPhase) * (1.0 - smoothstep(0.72, 0.96, ringPhase));
 
-  // Quarter-sawn medullary ray fleck + elongated open walnut vessel pores (14:1 aspect along X)
+  // Quarter-sawn medullary ray fleck + elongated open wood vessel pores (14:1 aspect along X)
   let vesselNoise = noise3D(vec3<f32>(xz.x * 22.0 + plankId * 13.0, 2.0, xz.y * 210.0));
   let openPore = smoothstep(0.72, 0.90, vesselNoise);
-  let rayFleck = smoothstep(0.62, 0.88, noise3D(vec3<f32>(xz.x * 7.5, plankId * 8.2, xz.y * 52.0))) * 0.18;
+  let rayFleck = smoothstep(0.62, 0.88, noise3D(vec3<f32>(xz.x * 7.5, plankId * 8.2, xz.y * 52.0))) * mix(0.18, 0.24, aMix);
 
-  // Rich fumed dark walnut palette (low-key albedo lets colored glass caustics glow with high dynamic range!)
-  let deepHeart = vec3<f32>(0.036, 0.021, 0.013);
-  let warmWalnut = vec3<f32>(0.082, 0.049, 0.029);
-  let plankTone = 0.86 + 0.26 * hPlank2;
+  // Fumed dark walnut (aMix = 0) vs quarter-sawn honeyed European oak / ash (aMix = 1)
+  let deepHeart = mix(vec3<f32>(0.036, 0.021, 0.013), vec3<f32>(0.142, 0.094, 0.055), aMix);
+  let warmWood  = mix(vec3<f32>(0.082, 0.049, 0.029), vec3<f32>(0.258, 0.182, 0.112), aMix);
+  let plankTone = mix(0.86 + 0.26 * hPlank2, 0.90 + 0.19 * hPlank2, aMix);
 
-  var woodAlbedo = mix(deepHeart, warmWalnut, latewood * 0.74 + rayFleck) * plankTone;
-  woodAlbedo *= (1.0 - openPore * 0.34);
+  var woodAlbedo = mix(deepHeart, warmWood, latewood * 0.74 + rayFleck) * plankTone;
+  woodAlbedo *= (1.0 - openPore * mix(0.34, 0.26, aMix));
 
   // Subtle 0.6 mm beveled V-groove between hardwood staves
   let seamGroove = 1.0 - smoothstep(0.0012, 0.0055 + aaWidth * 0.5, distToSeamDm);
-  woodAlbedo *= (1.0 - seamGroove * 0.42);
+  woodAlbedo *= (1.0 - seamGroove * mix(0.42, 0.34, aMix));
 
   let seamSign = select(1.0, -1.0, plankFrac > 0.5);
   let poreBumpZ = (vesselNoise - 0.5) * 0.035 - openPore * 0.045;
@@ -493,10 +511,10 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32) -> TableMaterial {
     seamGroove * seamSign * 0.22 + poreBumpZ + ringBumpZ
   );
 
-  // Hand-rubbed satin wax finish: smoother on dense latewood (0.27), rougher inside open pores & plank seams (0.56)
-  var roughness = clamp(0.31 - latewood * 0.05 + openPore * 0.24 + seamGroove * 0.20, 0.22, 0.65);
+  // Hand-rubbed satin wax finish: smoother on dense latewood, rougher inside open pores & plank seams
+  var roughness = clamp(0.31 - aMix * 0.02 - latewood * 0.05 + openPore * 0.24 + seamGroove * 0.20, 0.22, 0.65);
 
-  // Narrow (1.1 mm) recessed brushed-brass regulation 7.5 x 7.5 cm tower square + subtle outer compass hairline
+  // Narrow (1.1 mm) recessed brushed-brass / antique-bronze regulation 7.5 x 7.5 cm tower square + outer hairline
   let boxDist = max(abs(xz.x), abs(xz.y)) - 0.392;
   let aa = max(0.0008, aaWidth * 1.15);
   let innerBrass = 1.0 - smoothstep(0.0022 - aa, 0.0032 + aa, abs(boxDist));
@@ -510,7 +528,7 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32) -> TableMaterial {
   mat.metallic = brassMask;
   if (brassMask > 0.001) {
     let brushTex = noise3D(vec3<f32>(xz.x * 160.0, 5.0, xz.y * 160.0));
-    let agedBrassAlbedo = vec3<f32>(0.58, 0.43, 0.21) * (0.90 + 0.18 * brushTex);
+    let agedBrassAlbedo = mix(vec3<f32>(0.58, 0.43, 0.21), vec3<f32>(0.42, 0.30, 0.15), aMix * 0.55) * (0.90 + 0.18 * brushTex);
     mat.albedo = mix(woodAlbedo, agedBrassAlbedo, brassMask);
     mat.normalPerturb = mix(normalPerturb, vec3<f32>(0.0, 0.0, (brushTex - 0.5) * 0.025), brassMask);
     mat.roughness = mix(roughness, 0.27, brassMask);
@@ -521,7 +539,7 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32) -> TableMaterial {
 /**
  * Legacy helper alias for lightweight refracted floor albedo lookups inside multi-bounce rays.
  */
-fn evaluateOakTableAlbedo(xz: vec2<f32>) -> vec3<f32> {
-  return evaluateWalnutTableMaterial(xz, 0.002).albedo;
+fn evaluateOakTableAlbedo(xz: vec2<f32>, atelierMix: f32) -> vec3<f32> {
+  return evaluateWalnutTableMaterial(xz, 0.002, atelierMix).albedo;
 }
 `;

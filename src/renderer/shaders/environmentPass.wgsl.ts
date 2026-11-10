@@ -48,7 +48,8 @@ fn fs_sky(input: SkyOut) -> @location(0) vec4<f32> {
     rayDir,
     safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0)),
     uScene.sunColorAndAspect.xyz,
-    uScene.skyTintAndMode.xyz
+    uScene.skyTintAndMode.xyz,
+    uScene.tableAoCounts.w
   );
   // Alpha stores linear camera distance (14.0 dm = distant studio background for macro DoF)
   return vec4<f32>(col, 14.0);
@@ -365,12 +366,15 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   let sunColor = uScene.sunColorAndAspect.xyz;
   let skyTint = uScene.skyTintAndMode.xyz;
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
+  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
 
   let isUnderStructure = input.worldPos.y < -0.342;
-  var mat = evaluateWalnutTableMaterial(input.worldPos.xz, aaWidth);
+  var mat = evaluateWalnutTableMaterial(input.worldPos.xz, aaWidth, atelierMix);
   if (isUnderStructure) {
     let pedGrain = noise3D(vec3<f32>(input.worldPos.x * 9.0, input.worldPos.y * 22.0, input.worldPos.z * 9.0));
-    mat.albedo = mix(vec3<f32>(0.028, 0.017, 0.011), vec3<f32>(0.056, 0.034, 0.021), pedGrain);
+    let pedLo = mix(vec3<f32>(0.028, 0.017, 0.011), vec3<f32>(0.105, 0.070, 0.042), atelierMix);
+    let pedHi = mix(vec3<f32>(0.056, 0.034, 0.021), vec3<f32>(0.190, 0.132, 0.080), atelierMix);
+    mat.albedo = mix(pedLo, pedHi, pedGrain);
     mat.normalPerturb = vec3<f32>(0.0, (pedGrain - 0.5) * 0.02, 0.0);
     mat.roughness = 0.44;
     mat.metallic = 0.0;
@@ -382,7 +386,7 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   var windowGobo: f32 = 0.0;
   if (!isUnderStructure) {
     causticRGB = sampleContactHardeningCaustics(input.worldPos, L);
-    windowGobo = evaluateStudioWindowGobo(input.worldPos, L);
+    windowGobo = evaluateStudioWindowGobo(input.worldPos, L, atelierMix);
   }
 
   // Dual-scale Contact Ambient Occlusion gated by tableAoBounds + Y-sorted storage pointers
@@ -469,17 +473,17 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
 
   // Soft glossy environment reflection attenuated by surface roughness & contact AO
   let envRoughScale = (1.0 - mat.roughness * 0.72) * mix(0.32, 0.85, mat.metallic);
-  let envRefl = sampleCathedralEnvironment(reflect(-V, N), L, sunColor, skyTint) * fresnel * envRoughScale * aoBounce * aoCrevice;
+  let envRefl = sampleCathedralEnvironment(reflect(-V, N), L, sunColor, skyTint, atelierMix) * fresnel * envRoughScale * aoBounce * aoCrevice;
 
   // Concentrated HDR jewel caustics illuminate the wood fibers while colored refractive shadows ground the silhouettes!
   let directIrradiance = sunColor * nDotL * causticRGB * windowGobo;
-  let ambientIrradiance = (skyTint * 0.11 + vec3<f32>(0.024, 0.019, 0.016) * skyScale) * aoBounce * aoCrevice;
+  let ambientIrradiance = evaluateTableAmbientIrradiance(skyTint, skyScale, atelierMix) * aoBounce * aoCrevice;
 
-  // Subsurface wood-grain scatter ONLY where focused stained-glass ribbons (> 1.02x unobstructed sun) hit the walnut
+  // Subsurface wood-grain scatter ONLY where focused stained-glass ribbons (> 1.02x unobstructed sun) hit the wood
   let focalExcess = max(vec3<f32>(0.0), causticRGB - vec3<f32>(1.02)) * windowGobo;
   let woodCausticScatter = diffuseAlbedo * focalExcess * sunColor * 0.18;
 
-  let edgeVignette = 1.0 - smoothstep(3.45, 4.30, length(input.worldPos.xz)) * 0.32;
+  let edgeVignette = 1.0 - smoothstep(3.45, 4.30, length(input.worldPos.xz)) * mix(0.32, 0.14, atelierMix);
   let finalColor = (diffuseAlbedo * (directIrradiance + ambientIrradiance) + woodCausticScatter + specDirect + envRefl) * edgeVignette
                  + vec3<f32>(_keepShards + _keepDepth + _keepOpt);
 

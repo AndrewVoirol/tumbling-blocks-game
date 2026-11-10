@@ -135,8 +135,9 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let vitrail = evaluateVitrailPattern(input.parentLocalPos, motifId, seed);
 
   // Colored upstream solar transmittance through overlying shards & glass blocks!
+  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
   let rawSunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, input.worldPos, geomN, L, 0.018);
-  let windowGobo = evaluateStudioWindowGobo(input.worldPos, L);
+  let windowGobo = evaluateStudioWindowGobo(input.worldPos, L, atelierMix);
   let optSample = sampleSunOpticalDepth(uSunOpticalDepthTex, uScene.sunViewProj, input.worldPos);
   let sigmaSelf = mix(shAbs, shAcc.xyz, vitrail.accentMix) + SODA_LIME_IRON_SIGMA;
   let tauSelfApprox = sigmaSelf * 0.09 + vec3<f32>(0.088);
@@ -251,7 +252,7 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
     if (length(outWorldDir) < 1e-4) {
       outWorldDir = reflect(bouncedWorld, -finalExitNWorld);
     }
-    tirGlow = min(sampleCathedralEnvironment(bouncedWorld, L, reflSunColor, skyTint), vec3<f32>(1.05))
+    tirGlow = min(sampleCathedralEnvironment(bouncedWorld, L, reflSunColor, skyTint, atelierMix), vec3<f32>(1.05))
             * (vec3<f32>(0.24 * skyScale) + 0.58 * sunTransRGB);
     tirWeight = 0.10;
   }
@@ -301,7 +302,7 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
 
   let facetRough = select(0.036, 0.052, input.isOuter > 0.5);
   let sunSpec = evalGGXSpecular(N, V, L, facetRough) * fresnel * sunColor * sunTransRGB * 0.72;
-  let envRefl = sampleCathedralEnvironment(reflect(incidentDir, N), L, reflSunColor, skyTint);
+  let envRefl = sampleCathedralEnvironment(reflect(incidentDir, N), L, reflSunColor, skyTint, atelierMix);
   let facetEnv = envRefl / (vec3<f32>(1.0) + envRefl * 0.58);
 
   // Physical dihedral glass ridge optics: dark refractive rim + colored-sun-gated crystal ridge flash
@@ -310,7 +311,7 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let ridgeWorldN = safeNormalize((shL2W * vec4<f32>(ridgeLocalN, 0.0)).xyz, N);
   let ridgeGGX = evalGGXSpecular(ridgeWorldN, V, L, 0.075) * sunColor * sunTransRGB * 0.34;
   let ridgeFresnel = pow(1.0 - clamp(abs(dot(ridgeWorldN, V)), 0.0, 1.0), 4.0);
-  let ridgeSkyGlint = sampleCathedralEnvironment(reflect(incidentDir, ridgeWorldN), L, reflSunColor, skyTint) * ridgeFresnel * 0.18;
+  let ridgeSkyGlint = sampleCathedralEnvironment(reflect(incidentDir, ridgeWorldN), L, reflSunColor, skyTint, atelierMix) * ridgeFresnel * 0.18;
   let edgeSpecGlint = sharpEdgeBand * (ridgeGGX + ridgeSkyGlint);
 
   let dihedralEdgeDarken = mix(0.68, 1.0, smoothstep(0.0, 0.0040, minCleavageEdgeDist));
@@ -413,7 +414,7 @@ fn fs_splinter(input: SplinterOut) -> @location(0) vec4<f32> {
   let N = safeNormalize(input.facetNormal, vec3<f32>(0.0, 1.0, 0.0));
   let rawSunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, input.worldPos, N, L, 0.015);
   let optSample = sampleSunOpticalDepth(uSunOpticalDepthTex, uScene.sunViewProj, input.worldPos);
-  let sunTransRGB = mix(exp(-optSample.rgb * 0.65), vec3<f32>(1.0), rawSunVis) * evaluateStudioWindowGobo(input.worldPos, L);
+  let sunTransRGB = mix(exp(-optSample.rgb * 0.65), vec3<f32>(1.0), rawSunVis) * evaluateStudioWindowGobo(input.worldPos, L, clamp(uScene.tableAoCounts.w, 0.0, 1.0));
 
   let cosTheta = clamp(abs(dot(N, V)), 0.0, 1.0);
   let fresnel = 0.043 + 0.68 * pow(1.0 - cosTheta, 5.0);

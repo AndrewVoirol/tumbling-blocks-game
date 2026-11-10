@@ -1424,7 +1424,7 @@ export class WebGPURenderer {
     this.sceneUniformData[68] = intactCount;
     this.sceneUniformData[69] = shardStride;
     this.sceneUniformData[70] = maxBlockHalfY;
-    this.sceneUniformData[71] = 0;
+    this.sceneUniformData[71] = this.lightingPreset.atelierMix ?? 0;
 
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, this.sceneUniformData.buffer);
 
