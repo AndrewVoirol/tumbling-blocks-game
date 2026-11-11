@@ -4,7 +4,7 @@
 
 1. **Mandatory Turn-0 Skill Read**: Read `/Users/andrewvoirol/.gemini/config/skills/webgpu-interactive-simulation/SKILL.md` before designing, editing, or delegating any WGSL shader, optical pass, fracture geometry, or MuJoCo physics solver changes.
 2. **Core Commands**:
-   - **Physics, Tribology & Voronoi Fracture Suite (`12/12` `T1–T9` Invariants)**: `npx vitest run` (or `npm run test:blast -- <file-or-symbol>`)
+   - **Complete Vitest Suite (`33/33` across `4` suites: `T1–T9` Physics/Fracture, `C1–C5` Colosseum, Acoustics & Multiplayer)**: `npx vitest run` (or `npm run test:blast -- <file-or-symbol>`)
    - **Offline MuJoCo 4.0 Calibration & Invariant Scorecard (`~7 s`)**: `npm run calibrate:physics` (`node scripts/calibrate-mujoco-physics.mjs`)
    - **6-Probe Continuous Dynamics & Swarm Simulation Audit (`~6 s`, see `.agents/skills/vitrail-simulation-audit/SKILL.md`)**: `node .agents/skills/vitrail-simulation-audit/scripts/audit-dynamics.mjs`
    - **Static WGSL AST, Struct Alignment & Control-Flow Lint**: `npm run lint:wgsl`
@@ -24,10 +24,10 @@
 - **Renderer Orchestrator**: [`src/renderer/WebGPURenderer.ts`](src/renderer/WebGPURenderer.ts) — single-encoder `rgba16float` HDR pipeline with `4x` MSAA, `timestamp-query` GPU pass profiling, and linear `Float32` HDR resolve readback (`readHdrResolveFloat32()`).
 - **Shader Modules (`src/renderer/shaders/*.wgsl.ts`)**:
   - [`commonGlass.wgsl.ts`](src/renderer/shaders/commonGlass.wgsl.ts): Shared Beer-Lambert spectral extinction, dielectric Fresnel, Abbe chromatic dispersion, and copper-foil solder came helpers (`COMMON_GLASS_WGSL`).
-  - [`causticPass.wgsl.ts`](src/renderer/shaders/causticPass.wgsl.ts): Oblique `2048 × 2048` sun transmission & waterglass caustic projection onto the beveled oak table.
-  - [`environmentPass.wgsl.ts`](src/renderer/shaders/environmentPass.wgsl.ts): Studio backdrop and caustic-lit oak table surface.
-  - [`glassTower.wgsl.ts`](src/renderer/shaders/glassTower.wgsl.ts): Raytraced beveled regulation Jenga blocks (`n = 1.522`, `BLOCK_FLOATS = 52` / `208 B` `GPUBlockData`) with multi-block interior refraction (`<= 2` interior blocks), Total Internal Reflection, 3D seed air bubbles, internal crazing spiderweb cracks, and 3-sample ray-chord Brewster stress-optic birefringence (`photoelastic: vec4<f32>` = local `-X`, `0`, `+X` through-thickness bearing stress + Euler-Bernoulli flexural bending, toggled into dark-field **Polariscope** mode via `uBlockCenters[97].w`).
-  - [`glassShard.wgsl.ts`](src/renderer/shaders/glassShard.wgsl.ts): Convex 3D Voronoi glass shards (`MAX_ACTIVE_SHARDS = 512`, `SHARD_SLOT_STRIDE_VERTS = 132`) differentiating outer leaded faces from inner conchoidal cleavage planes.
+  - [`causticPass.wgsl.ts`](src/renderer/shaders/causticPass.wgsl.ts): Oblique `2048 × 2048` sun transmission & waterglass caustic projection onto the beveled oak table across both intact blocks and 12-plane 3D Voronoi shards (`uCausticTex.a` shard caustic tag).
+  - [`environmentPass.wgsl.ts`](src/renderer/shaders/environmentPass.wgsl.ts): Studio backdrop and caustic-lit quarter-sawn ring-porous oak table surface with tangent-projected $C^1$ bullnose normals and solar-gated wood subsurface scatter.
+  - [`glassTower.wgsl.ts`](src/renderer/shaders/glassTower.wgsl.ts): Raytraced beveled regulation Jenga blocks (`n = 1.522`, exact Maxwell-Fresnel `0.5 * (R_s + R_p)` + Cauchy $V_d \approx 58$ dispersion, `BLOCK_FLOATS = 52` / `208 B` `GPUBlockData`) with multi-block interior refraction (`<= 2` interior blocks), Total Internal Reflection, hollow-sphere seed air bubble TIR rings, block-local Griffith crazing cleavage planes around `crackLocalOrigin`, and 3-sample ray-chord Brewster stress-optic birefringence (`photoelastic: vec4<f32>` = local `-X`, `0`, `+X` through-thickness bearing stress + Euler-Bernoulli flexural bending, toggled into dark-field **Polariscope** mode via `uBlockCenters[97].w`).
+  - [`glassShard.wgsl.ts`](src/renderer/shaders/glassShard.wgsl.ts): Convex 3D Voronoi glass shards (`MAX_ACTIVE_SHARDS = 512`, `SHARD_SLOT_STRIDE_VERTS = 132`) differentiating outer leaded faces from inner conchoidal cleavage planes, with cross-polarized dark-field Polariscope extinction and cleavage-edge residual retardation fringes even when `intactCount === 0`.
   - [`overlayPass.wgsl.ts`](src/renderer/shaders/overlayPass.wgsl.ts) & [`postProcess.wgsl.ts`](src/renderer/shaders/postProcess.wgsl.ts): Top-row placement guides (`depthCompare: 'less-equal'`, `depthWriteEnabled: false`) and ACES HDR tone mapping.
 - **Swapchain Color Contract**: [`postProcess.wgsl.ts`](src/renderer/shaders/postProcess.wgsl.ts) compiles dual pipelines (`pipeCompositeHdr` with `HDR_EXTENDED = 1` on `rgba16float` + `toneMapping: { mode: 'extended' }` for Apple Silicon XDR displays, and `pipeCompositeSdr` with `HDR_EXTENDED = 0` on `bgra8unorm` / `rgba8unorm` for SDR monitors), switching automatically on `window.matchMedia('(dynamic-range: high)')` or via `renderer.setExtendedHdr(boolean)`.
 
@@ -52,3 +52,21 @@
   - `T5` / `T6` / `T7`: Asymmetric collapse (`>= 15` intact + `>= 4` crazed + `100%` sleeping survivors), bevel-to-bevel side-abutment, counterbalance lean, and mid-drag/sandbox parallax guards.
   - `T8`: Elliptic `condim=4` torsional spin resistance, photoelastic force-chain stress contrast, three-point flexural mid-span snap, and zero-mutation `mj_copyState` counterfactual oracle discrimination.
   - `T9`: Flat `26 cm` drop 3D shard rebound (`avgInitVySim > 0.8`, `median >= 6 mm`, `p90 >= 11 mm`), `15 cm` mid-air shard bounce & `100%` sleep, and `0` floating off-rim pieces / `0` solver resets across `43 cm` rimward collapse.
+  - `C1–C5` ([`tests/physicsColosseum.test.ts`](tests/physicsColosseum.test.ts)): Griffith progressive crazing weakening (`v_shatter(d) = v_0 * (1 - 0.36 * d)` + flexural degradation), Housner beveled-prism rocking sign flips (`WobbleRockEvent`), post-`22 ms` airborne `ShardImpactEvent` telemetry + worker Voronoi mass parity, `< 16.0 ms` collapse `stepMsP95` staggered Voronoi fracture, and `PhysicsNetworkSnapshot` round-trip fidelity.
+
+---
+
+## 3. Computational Modal & Impact Acoustics (`src/audio/`)
+
+- [`src/audio/physicalModalModels.ts`](src/audio/physicalModalModels.ts) & [`src/audio/GlassAudioEngine.ts`](src/audio/GlassAudioEngine.ts) (`8/8` physical invariants in [`tests/acoustics.test.ts`](tests/acoustics.test.ts)):
+  - **Timoshenko Thick-Bar Dispersion**: Cowper ($\kappa_s = 0.8461$) + Timoshenko rotary/shear free-free flexural (`y` & `z`), Saint-Venant torsional, and Rayleigh longitudinal modes on the `75 × 25 × 15 mm` (`71.1 g`) soda-lime prism with Reuss compliance across copper-foil / 60-40 $\text{Sn-Pb}$ solder cames and crazing stiffness softening ($E(d)/E_0 = 1 - 0.060 d - 0.018 d^2$).
+  - **Hertzian Velocity-Bandwidth Cutoff, Oak Kirchhoff Plate & Shard Similarity**: $\tau_c \propto m_{\text{eff}}^{2/5} R_{\text{eff}}^{-1/5} v_n^{-1/5} (E^*)^{-2/5}$ (`f_c = 1 / (2 * tau_c)`), Leissa orthotropic circular white-oak Bessel plate modes ($f_{01}..f_{02}$), deterministic $f_0 \propto m_i^{-1/3}$ secondary Voronoi shard chattering (`MAX_SHARD_GRAINS = 12`), accelerating Housner bevel rocking ticks, and clamping-load-coupled Stribeck stick-slip singing.
+
+---
+
+## 4. Dual-Transport Internet Multiplayer & Science Reference Docs (`src/multiplayer/`, `docs/`)
+
+- **Multiplayer Stack** (`8/8` `T-MP1..T-MP8` in [`tests/multiplayer.test.ts`](tests/multiplayer.test.ts)):
+  - [`src/multiplayer/VitrailMultiplayerClient.ts`](src/multiplayer/VitrailMultiplayerClient.ts), [`src/multiplayer/protocol.ts`](src/multiplayer/protocol.ts), [`src/multiplayer/MultiplayerGuestWorld.ts`](src/multiplayer/MultiplayerGuestWorld.ts), synchronous Vite `/__vitrail_mp` relay in [`vite.config.ts`](vite.config.ts) ([`workers/vitrail-rooms/nodeRelay.mjs`](workers/vitrail-rooms/nodeRelay.mjs)), and optional hibernatable Cloudflare Durable Object [`workers/vitrail-rooms/src/index.ts`](workers/vitrail-rooms/src/index.ts).
+  - Supports zero-backend public-internet WebRTC `RTCDataChannel` (`"ctrl"` reliable + `"state"` `maxRetransmits: 0` `< 4 KB` binary `0x564d` snapshots) via 5-char Room Codes (`?room=K7M4P`) + WebSocket relay fallback, sequential `mulberry32` `54/54` Worker/Host/Guest palette parity, `quatSlerpHemisphere` ($\tau = 36\text{ ms}$) `30 Hz -> 120 Hz` smoothing, occluded-Host `30 Hz` background pump, and zombie `RTCDataChannel` reload teardown.
+- **Reference Ledgers**: [`docs/COLOSSEUM_AUDIT_REPORT.md`](docs/COLOSSEUM_AUDIT_REPORT.md) and [`docs/SCIENCE_AND_MATHEMATICS_OF_VITRAIL.md`](docs/SCIENCE_AND_MATHEMATICS_OF_VITRAIL.md).
