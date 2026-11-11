@@ -61,19 +61,12 @@ When running a native `swarm` (`workspace: "share"` for concurrent authors, `wor
 
 ---
 
-## 3. High-Leverage Adversarial Audit Targets for Simulation Mastery
+## 3. Mandatory Regression Invariants (Anti-Goodharting Checklist)
 
-Use these concrete cross-subsystem questions to drive adversarial inspection and upgrades:
-
-1. **Cross-Pass Shard Optical Continuity (`causticPass.wgsl.ts` & `glassShard.wgsl.ts`)**:
-   - Currently `causticPass.wgsl.ts` projects oblique sun caustics from intact `uBlockCenters` blocks. When a block shatters into 20+ stained-glass Voronoi shards on the oak table, verify whether colored caustic patches abruptly vanish or whether resting/tumbling shards also refract colored caustic pools onto the oak surface.
-   - Verify `glassShard.wgsl.ts` under dark-field **Polariscope** mode (`uBlockCenters[97].w > 0.5`): intact blocks switch to dark-field cross-polarized transmission with stress fringes—ensure shattered shards exhibit physically consistent dark-field extinction / residual cleavage-edge stress rather than glowing as unpolarized bright blocks.
-2. **Post-Shatter Secondary Acoustic Chattering (`GlassAudioEngine.ts` <-> `MujocoPhysicsEngine.ts`)**:
-   - Initial fracture triggers `playGlassShatter`, while `oak_table_shard` (`shardSolref = [0.0060, 0.48]`) now produces genuine secondary 3D shard hops (`3–17 mm`) over `150–350 ms`. Verify whether secondary shard-table and shard-block impacts emit rate-limited, mass/pitch-scaled crystalline tinkle grains (`f ~ m^-1/3`) that decay naturally into silence as `ntree_awake -> 0`.
-3. **Progressive Internal Crazing & Multi-Hit Structural Memory**:
-   - Inspect how `block.damage` and `block.crackLocalOrigin` accumulate across sub-shatter impacts (`effCrazeSpeed = 5.33 dm/s`), whether `glassTower.wgsl.ts` spiderweb cleavage planes orient physically toward `crackLocalOrigin` with proper Fresnel internal reflection, and whether weakened crazed blocks exhibit lower flexural/impact fracture thresholds on subsequent collisions.
-4. **Tall-Stack (`22L–28L`) Tribology, Mocap Pull Ergonomics & Glazier AI Strategy**:
-   - Test real DOM pointer pulls across steep top-down, grazing horizontal, and off-center camera angles, Layer-0 bottom pulls, single-center-block supporting rows, and counterbalance top-row placement.
-   - Verify `evaluateCounterfactualBlockCriticality()` and `updateMasterGlazierAi` across full 10-turn rallies so AI placement accurately counterbalances lean without edge overhang clips or stall states.
-5. **Peak Collapse Burst Step Budget (`stepMsP95 ~ 27 ms -> < 16 ms`)**:
-   - While `stepMsAvg` across a 260-frame 21-block collapse is `~5.5 ms`, `stepMsP95` spikes to `~27 ms` on frames where 4–5 blocks run `fractureBlockVoronoi()` + `d.contact.get(i)` across ~400 contacts simultaneously. Profile whether skipping shard-shard `contacts.get(i)` Embind wrapper allocation inside `processWrenchCollisionsAndFractures` (e.g., capping fractures to `<= 2` blocks per substep or early-filtering before `efc` math) brings `stepMsP95` under `16.6 ms`.
+1. **Force-Verified Shard Support & Parked-Pool Hygiene (`MujocoPhysicsEngine.ts`, `mujocoWorldCompat.ts`)**:
+   - Above `y = 2.6 cm`, never gate shard velocity settle or `zeroSnap` on elevation/age without `d.qfrc_constraint[dofAdr + 1] > bodyMass * 1.5` (`shardNoSupportSubsteps <= 4`).
+   - Guard every block/shard pool wakeup with `if (geomContype[geomId] === 0) continue;` so parked hidden-shelf bodies stay asleep (`stepMsP95 < 16 ms`), require strictly lower CoM (`dy > 0.06 dm`) in unsupported-sleep sweeps, and keep `MAX_FRACTURES_PER_SUBSTEP = 2` (`deferredFractures` queue).
+2. **Two-Sided Polariscope Translucency & Caustic Continuity (`causticPass`, `glassTower`, `glassShard`)**:
+   - Verify both `uCausticTex.a` Voronoi shard caustic ribbons on the oak table when `intactCount === 0` AND smoked neutral-density crystal refraction (`~30%` passband background visibility on unloaded prisms/shards + `0.11` dark-field trough extinction inside stressed courses)—never pass Polariscope dark-field by crushing transmission into `< 1%` matte-black silhouettes, and never pass negative bases to WGSL `pow()`.
+3. **Outlier-Trimmed `Plumb`, Sandbox `Toppled` Parity & Multiplayer Seed Sync (`App.tsx`, `src/multiplayer/*`)**:
+   - Keep internal `solverLeanAngleDeg` separate from HUD `leanAngleDeg` (`standingTilts[tiltLen - 5]` column consensus when stationary, `maxDynamicTipTiltRad` when tipping), assert `isToppled` (`— Toppled`) on collapsed Sandbox heaps (`currentLayers === 0 && shatteredCount > 0`), and preserve sequential `mulberry32` `54/54` Host/Worker/Guest block palette parity.
