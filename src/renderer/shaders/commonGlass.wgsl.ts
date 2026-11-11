@@ -10,6 +10,33 @@ const PI: f32 = 3.14159265359;
 // Authentic soda-lime architectural glass iron-oxide base attenuation (gives thick 7.5 cm paths subtle sea-green depth)
 const SODA_LIME_IRON_SIGMA: vec3<f32> = vec3<f32>(0.15, 0.045, 0.095);
 
+// Soda-lime cathedral glass Cauchy dispersion indices (n_d = 1.522, Abbe V_d ~ 58)
+const GLASS_IOR_R: f32 = 1.514;
+const GLASS_IOR_G: f32 = 1.522;
+const GLASS_IOR_B: f32 = 1.533;
+
+/**
+ * Exact unpolarized Maxwell-Fresnel dielectric reflectance 0.5 * (R_s + R_p) across interface n1 -> n2.
+ * Returns exact 1.0 under Total Internal Reflection (sin^2(theta_t) >= 1.0, e.g. theta_i >= 41.07 deg for 1.522 -> 1.0),
+ * eliminating the 7.6x Schlick under-reflection error near the internal critical angle.
+ */
+fn dielectricFresnel(cosThetaI: f32, n1: f32, n2: f32) -> f32 {
+  let cI = clamp(cosThetaI, 0.0, 1.0);
+  let eta = n1 / max(n2, 1e-4);
+  let sin2T = eta * eta * max(0.0, 1.0 - cI * cI);
+  if (sin2T >= 1.0) {
+    return 1.0;
+  }
+  let cT = sqrt(max(0.0, 1.0 - sin2T));
+  let n1cI = n1 * cI;
+  let n2cT = n2 * cT;
+  let n1cT = n1 * cT;
+  let n2cI = n2 * cI;
+  let rs = (n1cI - n2cT) / max(n1cI + n2cT, 1e-6);
+  let rp = (n2cI - n1cT) / max(n2cI + n1cT, 1e-6);
+  return clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+}
+
 struct SceneUniforms {
   viewProj: mat4x4<f32>,
   invViewProj: mat4x4<f32>,
@@ -90,89 +117,205 @@ struct VitrailSample {
  * - Motifs 1..3 feature delicate, physically inset 3D half-round pewter/aged-brass filigree inlays
  *   with true cylindrical normal profiles and adjacent putty/groove contact shadowing.
  */
-fn evaluateVitrailPattern(pLocal: vec3<f32>, _motifId: i32, seed: f32) -> VitrailSample {
+fn evaluateVitrailPattern(pLocal: vec3<f32>, motifId: i32, seed: f32) -> VitrailSample {
   let u = pLocal.x / BLOCK_HX; // [-1, 1]
 
-  // Option A: Pure Unadorned Hand-Rolled Cathedral Glass Brick with subtle lengthwise flashed-glass tone shift
-  let accentMix = clamp(smoothstep(-0.55, 0.65, u * sign(sin(seed * 4.1) + 0.01)) * 0.42, 0.0, 1.0);
+  // Base lengthwise flashed-glass tone shift (preserves exact 0.18315 at u = 0 for motifId == 0)
+  var accentMix = clamp(smoothstep(-0.55, 0.65, u * sign(sin(seed * 4.1) + 0.01)) * 0.42, 0.0, 1.0);
 
-  // Hand-rolled cathedral waterglass undulation: analytical height, slope, and Laplacian curvature!
-  let kx: f32 = 13.5;
-  let ky: f32 = 21.0;
-  let kz: f32 = 18.0;
-  let phX = pLocal.x * kx + seed * 3.7 + sin(pLocal.z * 9.0 + seed) * 0.35;
-  let phY = pLocal.y * ky + seed * 2.9 + sin(pLocal.z * 14.0 - seed) * 0.30;
-  let phZ = pLocal.z * kz + seed * 5.3 - cos(pLocal.x * 8.0 - seed * 0.7) * 0.35;
+  // Conservative 3D C-infinity hand-rolled cathedral waterglass scalar potential H(p):
+  // Non-axis-aligned wavevectors eliminate Cartesian grid alignment while guaranteeing curl(grad H) == 0.
+  let k1 = vec3<f32>(12.8, 6.4, 3.9);
+  let k2 = vec3<f32>(-4.3, 8.5, 16.8);
+  let k3 = vec3<f32>(8.6, 17.5, -10.4);
+  let ph1 = dot(pLocal, k1) + seed * 3.71;
+  let ph2 = dot(pLocal, k2) + seed * 5.29;
+  let ph3 = dot(pLocal, k3) - seed * 2.83;
 
-  let w1 = sin(phX) * 0.56;
-  let w2 = cos(phZ) * 0.44;
-  let ripple = (w1 + w2) * 0.5;
+  let a1: f32 = 0.28;
+  let a2: f32 = 0.22;
+  let a3: f32 = 0.12;
+  let s1 = sin(ph1);
+  let c1 = cos(ph1);
+  let s2 = cos(ph2);
+  let d2 = -sin(ph2);
+  let s3 = sin(ph3);
+  let c3 = cos(ph3);
 
-  let gx = cos(phX) * kx * 0.28;
-  let gy = cos(phY) * ky * 0.18;
-  let gz = -sin(phZ) * kz * 0.22;
+  let ripple = a1 * s1 + a2 * s2 + a3 * s3;
+  let gradH = (a1 * c1) * k1 + (a2 * d2) * k2 + (a3 * c3) * k3;
+  let laplacian = -(a1 * s1 * dot(k1, k1) + a2 * s2 * dot(k2, k2) + a3 * s3 * dot(k3, k3)) / 260.0;
 
-  // Second derivative (-sin(phX)*kx^2 - cos(phZ)*kz^2) drives optical Jacobian convergence/divergence!
-  let d2x = -sin(phX) * 0.56;
-  let d2z = -cos(phZ) * 0.44;
-  let laplacian = (d2x + d2z) * 0.5;
+  var cameMask: f32 = 0.0;
+  var paneMeniscusAO: f32 = 1.0;
+  var cameNormalLocal = vec3<f32>(0.0);
+
+  // Motifs 1..3: Recessed 3D half-round 60/40 tin-lead (1, 2) & copper-foil (3) solder came ribs
+  // strictly inset from all 12 diamond-polished 1.25 mm outer bevels, with patinated flux meniscus AO.
+  if (motifId > 0) {
+    let ax = BLOCK_HX - abs(pLocal.x);
+    let ay = BLOCK_HY - abs(pLocal.y);
+    let az = BLOCK_HZ - abs(pLocal.z);
+    let dMin = min(ax, min(ay, az));
+    let dMax = max(ax, max(ay, az));
+    let dMid = ax + ay + az - dMin - dMax;
+    let faceInterior = smoothstep(0.015, 0.025, dMid);
+
+    if (faceInterior > 0.005) {
+      let isSideFace = ay > az;
+      let vCoord = select(pLocal.y / BLOCK_HY, pLocal.z / BLOCK_HZ, !isSideFace);
+      let vScale = select(BLOCK_HY, BLOCK_HZ, !isSideFace);
+
+      var sDist: f32 = 1.0;
+      var gradUV = vec2<f32>(1.0, 0.0);
+      if (motifId == 1) {
+        // Gothic lancet arch + central tie bar (60/40 tin-lead came)
+        let archCurve = (abs(vCoord) - (0.52 - 0.34 * u * u)) * vScale;
+        let tieBar = abs(pLocal.x);
+        if (abs(archCurve) < tieBar) {
+          sDist = archCurve;
+          gradUV = normalize(vec2<f32>(0.68 * u * vScale / BLOCK_HX, select(-1.0, 1.0, vCoord >= 0.0)));
+        } else {
+          sDist = select(-tieBar, tieBar, pLocal.x >= 0.0);
+          gradUV = vec2<f32>(1.0, 0.0);
+        }
+      } else if (motifId == 2) {
+        // Cathedral diamond quarry lattice (60/40 tin-lead came)
+        let dA = (u * 0.85 + vCoord * 0.65) * 0.095;
+        let dB = (u * 0.85 - vCoord * 0.65) * 0.095;
+        if (abs(dA) < abs(dB)) {
+          sDist = dA;
+          gradUV = normalize(vec2<f32>(0.85 / BLOCK_HX, 0.65 / vScale));
+        } else {
+          sDist = dB;
+          gradUV = normalize(vec2<f32>(0.85 / BLOCK_HX, -0.65 / vScale));
+        }
+      } else {
+        // Tiffany copper-foil rose medallion + axial spine
+        let ell = vec2<f32>(pLocal.x * 0.36, vCoord * vScale);
+        let rEll = length(ell);
+        sDist = rEll - 0.064;
+        gradUV = normalize(vec2<f32>(ell.x * 0.36, ell.y) + vec2<f32>(1e-5, 0.0));
+      }
+
+      let cameHalfW = select(0.0052, 0.0040, motifId == 3);
+      let dCame = abs(sDist);
+      cameMask = (1.0 - smoothstep(cameHalfW * 0.76, cameHalfW, dCame)) * faceInterior;
+      let fluxGroove = (1.0 - smoothstep(cameHalfW * 0.82, cameHalfW * 2.85, dCame)) * (1.0 - cameMask * 0.62) * faceInterior;
+      paneMeniscusAO = 1.0 - fluxGroove * 0.44;
+
+      let uBead = clamp(sDist / cameHalfW, -0.95, 0.95);
+      let tangent3 = select(
+        vec3<f32>(gradUV.x, gradUV.y, 0.0),
+        vec3<f32>(gradUV.x, 0.0, gradUV.y),
+        !isSideFace
+      );
+      let outSignY = select(-1.0, 1.0, pLocal.y >= 0.0);
+      let outSignZ = select(-1.0, 1.0, pLocal.z >= 0.0);
+      let faceOutN = select(vec3<f32>(0.0, 0.0, outSignZ), vec3<f32>(0.0, outSignY, 0.0), isSideFace);
+      let cylN = normalize(tangent3 * uBead + faceOutN * sqrt(max(0.05, 1.0 - uBead * uBead)));
+      cameNormalLocal = (cylN - faceOutN) * cameMask;
+
+      let paneFlip = smoothstep(-0.003, 0.003, -sDist) * faceInterior;
+      accentMix = clamp(mix(accentMix, 0.88 - accentMix * 0.55, paneFlip * 0.78), 0.0, 1.0);
+    }
+  }
 
   var out: VitrailSample;
-  out.cameMask = 0.0;
+  out.cameMask = cameMask;
   out.accentMix = accentMix;
-  out.paneMeniscusAO = 1.0;
-  out.cameNormalLocal = vec3<f32>(0.0);
+  out.paneMeniscusAO = paneMeniscusAO;
+  out.cameNormalLocal = cameNormalLocal;
   out.rippleHeight = ripple;
-  out.rippleGrad = vec3<f32>(gx, gy, gz) * 0.0011;
+  out.rippleGrad = gradH * 0.0011;
   out.rippleLaplacian = laplacian;
   return out;
 }
 
+struct InternalCrackSample {
+  mask: f32,
+  normalLocal: vec3<f32>, // Block-local cleavage plane unit normal (rotates with block tilt/wobble)
+  gapNm: f32,             // LEFM crack-opening air-film thickness in nm for Newton/Airy interference
+  tipStress: f32,         // Arrested K_I crack-tip residual stress for Polariscope birefringence
+};
+
 /**
- * Evaluates asymmetric, sparse (< 0.25 mm) 3D brittle glass fracture planes & chordal
- * cross-cracks radiating from crackOrigin when damage > 0.
+ * Evaluates asymmetric, sparse (< 0.25 mm) 3D Griffith radial cleavage planes, Hertzian impact frustum,
+ * and chordal cross-cracks radiating from crackOrigin when damage > 0, returning exact block-local
+ * cleavage plane normals, air-gap thickness (nm), and crack-tip stress concentration.
  */
-fn evaluateInternalCracks(pLocal: vec3<f32>, crackOrigin: vec3<f32>, damage: f32, seed: f32) -> f32 {
+fn evaluateInternalCrackField(pLocal: vec3<f32>, crackOrigin: vec3<f32>, damage: f32, seed: f32) -> InternalCrackSample {
+  var res: InternalCrackSample;
+  res.mask = 0.0;
+  res.normalLocal = vec3<f32>(0.0, 1.0, 0.0);
+  res.gapNm = 0.0;
+  res.tipStress = 0.0;
+
   if (damage <= 0.01) {
-    return 0.0;
+    return res;
   }
   let rel = pLocal - crackOrigin;
   let dist = length(rel);
   let maxRadius = 0.10 + damage * 0.46;
   if (dist > maxRadius || dist < 1e-4) {
-    return 0.0;
+    return res;
   }
 
   let warpCoarse = (noise3D(pLocal * 21.0 + vec3<f32>(seed * 2.3)) - 0.5) * 0.0085;
   let warpFine = (noise3D(pLocal * 58.0 - vec3<f32>(seed * 4.1)) - 0.5) * 0.0028;
   let warp = warpCoarse + warpFine;
 
-  let theta = atan2(rel.z + rel.y * 0.34, rel.x - rel.y * 0.24);
+  let uCoord = rel.x - rel.y * 0.24;
+  let vCoord = rel.z + rel.y * 0.34;
+  let theta = atan2(vCoord, uCoord);
   let numSectors: f32 = 7.0;
   let sectorCoord = ((theta + PI) / (2.0 * PI)) * numSectors + seed * 1.73;
   let sectorId = floor(sectorCoord);
   let sectorFrac = fract(sectorCoord) - 0.5;
 
+  // Crisp Roesler/Hertzian conical impact shell around crackOrigin (replaces blurry spherical smudge)
+  let hertzShellDist = abs(dist - 0.014) + warpFine * 0.35;
+  let hertzCone = (1.0 - smoothstep(0.0012, 0.0065, hertzShellDist)) * (1.0 - smoothstep(0.010, 0.030, dist)) * 0.72;
+  let hertzNormal = safeNormalize(rel + vec3<f32>(0.0, 0.42 * dist, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+
   let hSec = hash31(vec3<f32>(sectorId, seed * 3.17, 2.0));
+  let dmgScale = clamp(damage * 1.25, 0.0, 1.0);
   if (fract(hSec * 19.37) < 0.38) {
-    let hertzOnly = (1.0 - smoothstep(0.005, 0.024, dist)) * 0.45;
-    return hertzOnly * clamp(damage * 1.2, 0.0, 1.0);
+    res.mask = hertzCone * dmgScale;
+    res.normalLocal = hertzNormal;
+    res.gapNm = 260.0 * clamp(damage, 0.0, 1.0);
+    res.tipStress = res.mask * 0.55;
+    return res;
   }
 
   let sectorReach = maxRadius * (0.35 + 0.65 * fract(hSec * 7.91));
   if (dist > sectorReach) {
-    return 0.0;
+    return res;
   }
 
   let spokeOffset = (hSec - 0.5) * 0.38;
-  let perpDistDm = abs((sectorFrac - spokeOffset) * (2.0 * PI / numSectors) * dist + warp);
+  let spokeAng = ((sectorId + 0.5 + spokeOffset - seed * 1.73) / numSectors) * 2.0 * PI - PI;
+  // Circumferential unit normal perpendicular to the radial Griffith cleavage plane!
+  let spokeCleavageN = safeNormalize(
+    vec3<f32>(-sin(spokeAng), 0.24 * sin(spokeAng) - 0.34 * cos(spokeAng), cos(spokeAng))
+      + vec3<f32>(warpFine * 18.0, warpCoarse * 14.0, -warpFine * 16.0),
+    hertzNormal
+  );
 
-  var crack = 1.0 - smoothstep(0.0005, 0.0022, perpDistDm);
+  let perpDistDm = abs((sectorFrac - spokeOffset) * (2.0 * PI / numSectors) * dist + warp);
+  var crack = 1.0 - smoothstep(0.00045, 0.0021, perpDistDm);
+  var bestN = spokeCleavageN;
 
   if (fract(hSec * 13.3) > 0.46 && dist > 0.05) {
-    let forkSpread = (dist - 0.05) * (0.20 + 0.14 * fract(hSec * 3.7));
+    let forkSlope = 0.20 + 0.14 * fract(hSec * 3.7);
+    let forkSpread = (dist - 0.05) * forkSlope;
     let forkDistDm = abs(perpDistDm - forkSpread + warpFine * 0.8);
-    crack = max(crack, (1.0 - smoothstep(0.0004, 0.0018, forkDistDm)) * 0.78);
+    let forkMask = (1.0 - smoothstep(0.0004, 0.0018, forkDistDm)) * 0.80;
+    if (forkMask > crack) {
+      crack = forkMask;
+      let forkAng = spokeAng + forkSlope * select(-1.0, 1.0, sectorFrac >= spokeOffset);
+      bestN = safeNormalize(vec3<f32>(-sin(forkAng), 0.20 * sin(forkAng) - 0.30 * cos(forkAng), cos(forkAng)), spokeCleavageN);
+    }
   }
 
   if (fract(hSec * 29.7) > 0.56 && perpDistDm < 0.022) {
@@ -181,12 +324,32 @@ fn evaluateInternalCracks(pLocal: vec3<f32>, crackOrigin: vec3<f32>, damage: f32
     let projChord = dot(rel, chordDir);
     let chordStep = 0.065 + fract(hSec * 5.3) * 0.085;
     let chordDistDm = abs(projChord - chordStep + warpFine);
-    crack = max(crack, (1.0 - smoothstep(0.0004, 0.0017, chordDistDm)) * 0.65);
+    let chordMask = (1.0 - smoothstep(0.0004, 0.0017, chordDistDm)) * 0.68;
+    if (chordMask > crack) {
+      crack = chordMask;
+      bestN = chordDir;
+    }
   }
 
-  let hertzCore = (1.0 - smoothstep(0.005, 0.025, dist)) * 0.45;
-  let tipFade = 1.0 - smoothstep(sectorReach * 0.62, sectorReach, dist);
-  return clamp(max(crack * tipFade, hertzCore) * clamp(damage * 1.25, 0.0, 1.0), 0.0, 1.0);
+  let tipFade = 1.0 - smoothstep(sectorReach * 0.64, sectorReach, dist);
+  let radialMask = crack * tipFade;
+  if (hertzCone > radialMask) {
+    bestN = hertzNormal;
+  }
+  let finalMask = clamp(max(radialMask, hertzCone) * dmgScale, 0.0, 1.0);
+  // Irwin LEFM elliptic crack-opening profile delta(r) ~ sqrt(1 - r / a) in [140 nm, 680 nm]
+  let codProfile = sqrt(max(0.02, 1.0 - dist / max(sectorReach, 1e-3)));
+  let filmRipple = 0.82 + 0.36 * fract(hSec * 41.3 + warpCoarse * 40.0);
+
+  res.mask = finalMask;
+  res.normalLocal = bestN;
+  res.gapNm = (140.0 + 520.0 * clamp(damage, 0.0, 1.0) * codProfile) * filmRipple;
+  res.tipStress = finalMask * (0.30 + 0.70 * smoothstep(sectorReach * 0.30, sectorReach * 0.88, dist)) * clamp(damage * 1.35, 0.0, 1.0);
+  return res;
+}
+
+fn evaluateInternalCracks(pLocal: vec3<f32>, crackOrigin: vec3<f32>, damage: f32, seed: f32) -> f32 {
+  return evaluateInternalCrackField(pLocal, crackOrigin, damage, seed).mask;
 }
 
 fn safeNormalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
@@ -485,35 +648,50 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32, atelierMix: f32) -> 
   // Asymmetric latewood/earlywood growth ring profile (sharper dark winter growth lines, broader warm summerwood)
   let ringPhase = fract(radialTree * 26.0 + hPlank * 6.0);
   let latewood = smoothstep(0.0, 0.24, ringPhase) * (1.0 - smoothstep(0.72, 0.96, ringPhase));
+  let earlywoodBand = 1.0 - latewood;
 
-  // Quarter-sawn medullary ray fleck + elongated open wood vessel pores (14:1 aspect along X)
+  // Ring-porous quarter-sawn oak / semi-ring-porous walnut anatomy:
+  // Open earlywood tyloses/vessels concentrate inside springwood bands, while chatoyant quarter-sawn
+  // medullary ray ribbons cross obliquely with satin sheen and lower micro-roughness.
   let vesselNoise = noise3D(vec3<f32>(xz.x * 22.0 + plankId * 13.0, 2.0, xz.y * 210.0));
-  let openPore = smoothstep(0.72, 0.90, vesselNoise);
-  let rayFleck = smoothstep(0.62, 0.88, noise3D(vec3<f32>(xz.x * 7.5, plankId * 8.2, xz.y * 52.0))) * mix(0.18, 0.24, aMix);
+  let ringPorosityBias = mix(0.58 + 0.42 * earlywoodBand, 0.24 + 0.88 * earlywoodBand, aMix);
+  let openPore = smoothstep(0.70, 0.89, vesselNoise) * ringPorosityBias;
 
-  // Fumed dark walnut (aMix = 0) vs quarter-sawn honeyed European oak / ash (aMix = 1)
+  let rayWave = xz.x * 6.8 + sin(xz.y * 16.0 + plankId * 3.7) * 0.42;
+  let rayPrimary = smoothstep(0.60, 0.88, noise3D(vec3<f32>(rayWave, plankId * 8.2, xz.y * 46.0)));
+  let rayFine = smoothstep(0.66, 0.90, noise3D(vec3<f32>(xz.x * 15.0 + plankId * 4.1, 6.0, xz.y * 84.0)));
+  let rayFleck = (rayPrimary * 0.72 + rayFine * 0.28) * mix(0.16, 0.30, aMix);
+
+  // Fumed dark walnut (aMix = 0) vs quarter-sawn honeyed European white oak (aMix = 1)
   let deepHeart = mix(vec3<f32>(0.036, 0.021, 0.013), vec3<f32>(0.142, 0.094, 0.055), aMix);
   let warmWood  = mix(vec3<f32>(0.082, 0.049, 0.029), vec3<f32>(0.258, 0.182, 0.112), aMix);
+  let rayTint   = mix(vec3<f32>(0.104, 0.066, 0.040), vec3<f32>(0.312, 0.226, 0.142), aMix);
   let plankTone = mix(0.86 + 0.26 * hPlank2, 0.90 + 0.19 * hPlank2, aMix);
 
-  var woodAlbedo = mix(deepHeart, warmWood, latewood * 0.74 + rayFleck) * plankTone;
-  woodAlbedo *= (1.0 - openPore * mix(0.34, 0.26, aMix));
+  var woodAlbedo = mix(deepHeart, warmWood, latewood * 0.76) * plankTone;
+  woodAlbedo = mix(woodAlbedo, rayTint * plankTone, rayFleck);
+  woodAlbedo *= (1.0 - openPore * mix(0.35, 0.29, aMix));
 
   // Subtle 0.6 mm beveled V-groove between hardwood staves
   let seamGroove = 1.0 - smoothstep(0.0012, 0.0055 + aaWidth * 0.5, distToSeamDm);
   woodAlbedo *= (1.0 - seamGroove * mix(0.42, 0.34, aMix));
 
   let seamSign = select(1.0, -1.0, plankFrac > 0.5);
-  let poreBumpZ = (vesselNoise - 0.5) * 0.035 - openPore * 0.045;
-  let ringBumpZ = (latewood - 0.5) * 0.018;
+  let poreBumpZ = (vesselNoise - 0.5) * 0.032 - openPore * 0.052;
+  let ringBumpZ = (latewood - 0.5) * 0.020;
+  let rayBumpX = (rayPrimary - 0.5) * 0.016 * aMix;
   var normalPerturb = vec3<f32>(
-    (noise3D(vec3<f32>(xz.x * 35.0, 3.0, xz.y * 35.0)) - 0.5) * 0.012,
+    (noise3D(vec3<f32>(xz.x * 35.0, 3.0, xz.y * 35.0)) - 0.5) * 0.012 + rayBumpX,
     0.0,
     seamGroove * seamSign * 0.22 + poreBumpZ + ringBumpZ
   );
 
-  // Hand-rubbed satin wax finish: smoother on dense latewood, rougher inside open pores & plank seams
-  var roughness = clamp(0.31 - aMix * 0.02 - latewood * 0.05 + openPore * 0.24 + seamGroove * 0.20, 0.22, 0.65);
+  // Hand-rubbed satin wax finish: glossier on dense latewood & chatoyant medullary rays, rougher in open earlywood pores & seams
+  var roughness = clamp(
+    0.31 - aMix * 0.02 - latewood * 0.065 - rayFleck * 0.08 + openPore * 0.26 + seamGroove * 0.20,
+    0.20,
+    0.66
+  );
 
   // Narrow (1.1 mm) recessed brushed-brass / antique-bronze regulation 7.5 x 7.5 cm tower square + outer hairline
   let boxDist = max(abs(xz.x), abs(xz.y)) - 0.392;
