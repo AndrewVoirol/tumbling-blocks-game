@@ -73,6 +73,9 @@ body,
   width: 100%;
   height: 100%;
   touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
 
 /* ============================================================================
@@ -85,7 +88,11 @@ body,
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 18px 24px 18px;
+  gap: 10px;
+  padding-top: calc(18px + env(safe-area-inset-top, 0px));
+  padding-right: calc(24px + env(safe-area-inset-right, 0px));
+  padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  padding-left: calc(24px + env(safe-area-inset-left, 0px));
 }
 
 /* Oblique atmospheric sunbeam softly coupling the left stained-glass window to the room */
@@ -162,7 +169,10 @@ body,
   outline: none;
   background: var(--lead-came-deep);
   padding: 0;
+  min-width: 44px;
+  min-height: 44px;
   cursor: pointer;
+  touch-action: manipulation;
   position: relative;
   display: inline-flex;
   align-items: stretch;
@@ -171,9 +181,14 @@ body,
   -webkit-tap-highlight-color: transparent;
 }
 
+.quarry-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
 .quarry-btn:focus-visible {
   z-index: 4;
-  outline: 1.5px solid rgba(253, 230, 138, 0.9);
+  outline: 2px solid rgba(253, 230, 138, 0.95);
   outline-offset: 1px;
 }
 
@@ -393,13 +408,14 @@ body,
 /* Clerestory Sky Panes (2x2 Gothic Bifora Mullion Grid: Morning / Atelier / Noon / Vespers) */
 .sky-course {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-auto-rows: 46px;
+  grid-template-columns: repeat(2, minmax(44px, 1fr));
+  grid-auto-rows: minmax(46px, auto);
   gap: 2.5px;
 }
 
 .sky-lancet-pane {
   width: 100%;
+  min-height: 44px;
 }
 
 .sky-lancet-pane .quarry-etch-content {
@@ -469,7 +485,7 @@ body,
   white-space: nowrap;
 }
 
-/* 3 Horizontal Inlaid Stained-Glass Mode Courses */
+/* 4 Horizontal Inlaid Stained-Glass Mode Courses */
 .lancet-mode-stack {
   display: flex;
   flex-direction: column;
@@ -478,7 +494,7 @@ body,
 }
 
 .mode-course-btn {
-  height: 38px;
+  min-height: 44px;
   width: 100%;
 }
 
@@ -489,14 +505,14 @@ body,
 
 .mode-medallion-svg {
   width: 46px;
-  height: 38px;
+  height: 44px;
   flex-shrink: 0;
   border-right: 2px solid var(--lead-came);
 }
 
 .mode-right-jewel-svg {
   width: 11px;
-  height: 38px;
+  height: 44px;
   flex-shrink: 0;
   border-left: 2px solid var(--lead-came);
 }
@@ -528,15 +544,18 @@ body,
   text-shadow: 0 1px 2px rgba(8, 6, 12, 0.65);
 }
 
-/* Pass & Play Inlaid Sub-Course */
+/* Pass & Play Inlaid Sub-Course + Apprentice / Master Glazier Selector */
 .party-subcourse {
-  height: 34px;
+  flex-direction: column;
+  height: auto;
+  gap: 2px;
 }
 
 .party-turn-pane {
-  flex: 1;
+  width: 100%;
+  min-height: 30px;
   min-width: 0;
-  padding: 0 9px;
+  padding: 5px 9px;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -563,22 +582,45 @@ body,
 }
 
 .party-count-strip {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(44px, 1fr));
   gap: 2px;
+  min-height: 44px;
   background: var(--lead-came);
 }
 
-.player-num-pane {
-  width: 28px;
-}
-
+.player-num-pane,
 .vs-ai-pane {
-  width: 30px;
+  width: 100%;
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .player-num-pane .quarry-etch-content {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.ai-difficulty-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(44px, 1fr));
+  gap: 2px;
+  min-height: 44px;
+  background: var(--lead-came);
+}
+
+.ai-difficulty-pane {
+  width: 100%;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.ai-difficulty-pane .quarry-etch-content {
+  padding: 0 6px;
   font-size: 10.5px;
   font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
 /* Online 2P Internet Room Inlaid Sub-Course */
@@ -588,17 +630,26 @@ body,
 }
 
 .online-lobby-row,
-.online-room-bar,
+.online-room-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-height: 44px;
+  background: var(--lead-came);
+}
+
 .online-status-row {
   display: flex;
   align-items: stretch;
   gap: 2px;
-  height: 32px;
+  min-height: 32px;
   background: var(--lead-came);
 }
 
 .online-host-btn {
-  width: 74px;
+  width: 54px;
+  min-width: 48px;
+  min-height: 44px;
   flex-shrink: 0;
 }
 
@@ -613,14 +664,18 @@ body,
 
 .online-code-input {
   flex: 1;
-  min-width: 0;
+  min-width: 48px;
+  min-height: 44px;
   border: none;
   outline: none;
   padding: 0 7px;
+  user-select: text;
+  -webkit-user-select: text;
+  touch-action: manipulation;
   font-family: 'Cinzel', Georgia, serif;
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: #ffffff;
   background: linear-gradient(135deg, rgba(22, 34, 42, 0.88), rgba(12, 18, 24, 0.94));
@@ -634,12 +689,17 @@ body,
   color: rgba(226, 232, 240, 0.48);
 }
 
-.online-code-input:focus {
+.online-code-input:focus,
+.online-code-input:focus-visible {
+  outline: 2px solid rgba(253, 230, 138, 0.92);
+  outline-offset: -2px;
   box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.65), inset 0 0 0 1px rgba(103, 232, 249, 0.68);
 }
 
 .online-join-btn {
-  width: 52px;
+  width: 50px;
+  min-width: 46px;
+  min-height: 44px;
   flex-shrink: 0;
 }
 
@@ -666,18 +726,22 @@ body,
   font-family: 'Cinzel', Georgia, serif;
   font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.12em;
   color: #fde047;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
 }
 
 .online-action-btn {
-  width: 56px;
+  width: 52px;
+  min-width: 48px;
+  min-height: 44px;
   flex-shrink: 0;
 }
 
 .online-leave-btn {
-  width: 44px;
+  width: 46px;
+  min-width: 44px;
+  min-height: 44px;
   flex-shrink: 0;
 }
 
@@ -719,11 +783,12 @@ body,
 
 /* Sandbox Smash Sub-Course */
 .sandbox-subcourse {
-  height: 36px;
+  min-height: 44px;
 }
 
 .smash-course-btn {
   width: 100%;
+  min-height: 44px;
 }
 
 .smash-course-btn .quarry-etch-content {
@@ -736,11 +801,13 @@ body,
 
 /* Lower Sill Trio (Glass-in-Glass Panes: Chime, Rebuild, Guide) */
 .sill-course {
-  height: 52px;
+  min-height: 52px;
 }
 
 .sill-pane-btn {
   flex: 1;
+  min-width: 44px;
+  min-height: 48px;
 }
 
 .sill-pane-btn .quarry-etch-content {
@@ -975,7 +1042,7 @@ body,
 
 .polariscope-lens-btn {
   width: 100%;
-  height: 30px;
+  min-height: 44px;
 }
 
 .polariscope-lens-btn .quarry-etch-content {
@@ -1036,8 +1103,8 @@ body,
   pointer-events: auto;
   display: flex;
   align-items: stretch;
-  min-height: 46px;
-  max-width: min(94vw, 860px);
+  min-height: 52px;
+  max-width: min(96vw, 940px);
   border-top: 1px solid rgba(255, 253, 246, 0.44);
   border-bottom: 1px solid rgba(255, 253, 246, 0.18);
   border-left: 1px solid rgba(255, 253, 246, 0.32);
@@ -1055,10 +1122,12 @@ body,
 }
 
 .prism-bevel-chamber {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 5px 14px;
+  padding: 6px 14px;
   background-image:
     var(--prism-corner-tl),
     var(--prism-corner-tr),
@@ -1106,6 +1175,7 @@ body,
 }
 
 .prism-copy-group {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -1188,28 +1258,40 @@ body,
   box-shadow: 0 0 7px rgba(16, 185, 129, 0.45);
 }
 
-/* Placement Inlaid Glass Keys inside the Bottom Prism */
+/* Placement Inlaid Glass Keys inside the Bottom Prism (>= 44x44 CSS px tap targets) */
 .prism-inlaid-keys {
   display: flex;
+  flex-wrap: wrap;
   align-items: stretch;
-  gap: 2px;
+  justify-content: center;
+  gap: 3px;
   padding: 2px;
   background: var(--lead-came);
   border: 1px solid rgba(255, 252, 242, 0.24);
-  height: 34px;
+  min-height: 48px;
+}
+
+.prism-key-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.prism-release-btn {
+  min-width: 116px;
+  min-height: 44px;
 }
 
 .prism-key-btn .quarry-etch-content {
-  padding: 0 9px;
+  padding: 0 10px;
   gap: 4px;
-  font-size: 11px;
-  font-weight: 500;
+  font-size: 11.5px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
 .prism-release-btn .quarry-etch-content {
-  padding: 0 13px;
-  gap: 5px;
+  padding: 0 14px;
+  gap: 6px;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -1240,7 +1322,7 @@ body,
 
 .collapse-crystal-plaque {
   max-width: 470px;
-  width: calc(100vw - 40px);
+  width: calc(100vw - 32px);
 }
 
 .monument-spandrel-bar {
@@ -1312,7 +1394,7 @@ body,
 
 .keystone-cta {
   margin-top: 4px;
-  height: 38px;
+  min-height: 44px;
   min-width: 240px;
 }
 
@@ -1335,11 +1417,16 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding-top: calc(20px + env(safe-area-inset-top, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
+  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  padding-left: calc(20px + env(safe-area-inset-left, 0px));
 }
 
 .codex-window {
   width: min(550px, 100%);
+  max-height: calc(100% - 8px);
+  overflow-y: auto;
 }
 
 .codex-pane-inner {
@@ -1398,6 +1485,8 @@ body,
 
 .codex-close-quarry {
   width: 50px;
+  min-width: 48px;
+  min-height: 44px;
 }
 
 .codex-courses {
@@ -1459,12 +1548,12 @@ body,
   display: flex;
   align-items: stretch;
   gap: 2.5px;
-  min-height: 40px;
+  min-height: 46px;
 }
 
 .codex-hint-quarry {
   flex: 1;
-  padding: 0 14px;
+  padding: 6px 14px;
   display: flex;
   align-items: center;
   font-family: 'Cormorant Garamond', Georgia, serif;
@@ -1472,6 +1561,11 @@ body,
   font-size: 13.5px;
   color: var(--silica-soft);
   background: rgba(26, 24, 30, 0.92);
+}
+
+.codex-enter-quarry {
+  min-width: 132px;
+  min-height: 44px;
 }
 
 .codex-enter-quarry .quarry-etch-content {
@@ -1482,9 +1576,30 @@ body,
   text-transform: uppercase;
 }
 
+/* iPad Portrait (1024px) & Tablet Breakpoint: stack interactive placement keys cleanly when wide copy is present */
+@media (max-width: 1120px) {
+  .cut-glass-prism-bar.is-interactive-prism .prism-bevel-chamber {
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px 12px;
+  }
+
+  .cut-glass-prism-bar.is-interactive-prism .prism-copy-group {
+    flex: 1 1 280px;
+  }
+
+  .prism-primary-line,
+  .prism-secondary-line {
+    white-space: normal;
+  }
+}
+
 @media (max-width: 900px) {
   .hud-layer {
-    padding: 12px;
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
+    padding-right: calc(12px + env(safe-area-inset-right, 0px));
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    padding-left: calc(12px + env(safe-area-inset-left, 0px));
   }
 
   .vitrail-lancet-window {
@@ -1498,19 +1613,19 @@ body,
   }
 
   .crystal-optical-plate {
-    width: 176px;
+    width: 180px;
     padding: 10px 12px;
-  }
-
-  .prism-primary-line,
-  .prism-secondary-line {
-    white-space: normal;
   }
 }
 
-@media (max-width: 560px) {
+/* Mobile Portrait (390x844 & similar phones): zero overlap + >= 44x44 CSS px tap targets */
+@media (max-width: 600px) {
   .hud-layer {
-    padding: 10px;
+    gap: 8px;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    padding-right: calc(10px + env(safe-area-inset-right, 0px));
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    padding-left: calc(10px + env(safe-area-inset-left, 0px));
   }
 
   .hud-upper-space {
@@ -1521,49 +1636,123 @@ body,
   .lancet-arch-crown,
   .lancet-apex-svg,
   .lancet-apron-svg {
-    width: 176px;
+    width: 194px;
+  }
+
+  .lancet-arch-crown,
+  .lancet-apex-svg {
+    height: 44px;
+  }
+
+  .lancet-apron-svg {
+    height: 16px;
+  }
+
+  .sky-course {
+    grid-auto-rows: minmax(44px, auto);
+  }
+
+  .cartouche-course {
+    height: 36px;
   }
 
   .margin-inlay-cell,
   .mode-course-meta,
-  .vitrail-spec {
+  .vitrail-spec,
+  .polariscope-state-tag {
     display: none;
   }
 
   .crystal-optical-plate {
-    width: 146px;
-    padding: 8px 10px;
+    width: 164px;
+    padding: 9px 10px;
   }
 
-  .codex-window {
-    width: calc(100vw - 20px);
-    max-height: calc(100vh - 20px);
-    overflow-y: auto;
+  .etched-plumb-section {
+    gap: 8px;
+    padding-bottom: 8px;
+  }
+
+  .etched-compass-wrap {
+    width: 44px;
+    height: 44px;
+  }
+
+  .cut-glass-prism-bar {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .prism-end-inlay-svg {
+    width: 12px;
+  }
+
+  .prism-bevel-chamber {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    padding: 6px 8px;
+  }
+
+  .prism-copy-group {
+    flex: 1 1 170px;
+  }
+
+  .prism-primary-line {
+    font-size: 11.5px;
+    line-height: 1.25;
+  }
+
+  .prism-secondary-line {
+    font-size: 12px;
+    line-height: 1.2;
+  }
+
+  .prism-inlaid-keys {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .prism-inlaid-keys .prism-key-btn {
+    flex: 1 1 auto;
+  }
+
+  .prism-inlaid-keys .prism-release-btn {
+    flex: 2 1 124px;
+  }
+
+  .codex-backdrop {
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    padding-right: calc(10px + env(safe-area-inset-right, 0px));
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    padding-left: calc(10px + env(safe-area-inset-left, 0px));
+  }
+
+  .codex-diagram-quarry {
+    width: 56px;
+    padding: 8px;
+  }
+
+  .codex-medallion-svg {
+    width: 40px;
+    height: 40px;
   }
 }
 
 @media (max-height: 580px) {
   .hud-layer {
-    padding: 8px 12px;
+    padding-top: calc(8px + env(safe-area-inset-top, 0px));
+    padding-right: calc(12px + env(safe-area-inset-right, 0px));
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    padding-left: calc(12px + env(safe-area-inset-left, 0px));
   }
 
   .lancet-arch-crown,
-  .lancet-sill-apron {
+  .lancet-apron-svg {
     display: none;
   }
 
   .vitrail-lancet-window {
-    transform-origin: top left;
-    transform: scale(0.84);
-  }
-
-  .crystal-optical-plate {
-    transform-origin: top right;
-    transform: scale(0.84);
-  }
-
-  .codex-window {
-    max-height: calc(100vh - 16px);
+    max-height: 100%;
     overflow-y: auto;
   }
 }

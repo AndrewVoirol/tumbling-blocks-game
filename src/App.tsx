@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { GameEngine, VitrailHudTelemetry } from './engine/GameEngine';
+import { AiDifficulty, GameEngine, VitrailHudTelemetry } from './engine/GameEngine';
 import {
   INITIAL_LAYERS,
   LIGHTING_PRESETS,
@@ -51,7 +51,10 @@ export type QuarryGlassTone =
   | 'grisaille-amethyst'
   | 'grisaille-teal';
 
-type UiSoundTone = 'default' | 'tab' | 'primary' | 'danger' | 'step';
+export type UiSoundTone = 'default' | 'tab' | 'primary' | 'danger' | 'step';
+
+const FOCUSABLE_MODAL_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 const INITIAL_TELEMETRY: VitrailHudTelemetry = {
   turnPhase: 'SELECT_BLOCK',
@@ -78,9 +81,10 @@ const INITIAL_TELEMETRY: VitrailHudTelemetry = {
   lockedMinRow: INITIAL_LAYERS,
   settleProgress01: 0,
   collapseReason: null,
+  aiDifficulty: 'master',
 };
 
-interface QuarryButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+export interface QuarryButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   tone?: QuarryGlassTone;
   active?: boolean;
   soundTone?: UiSoundTone;
@@ -92,130 +96,196 @@ interface QuarryButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement
 /**
  * Interactive Stained-Glass / Beveled-Crystal Pane:
  * Seated inside a stationary lead came or crystal bezel; physically recesses inward
- * on pointerdown and rebounds via an underdamped spring + refractive caustic sweep.
+ * on pointerdown or keyboard Enter/Space and rebounds via an underdamped spring + refractive caustic sweep.
  */
-const QuarryButton: React.FC<QuarryButtonProps> = ({
-  tone = 'crystal',
-  active = false,
-  soundTone = 'default',
-  inlayArt,
-  onAudioDown,
-  onAudioUp,
-  className = '',
-  children,
-  onPointerDown,
-  onPointerUp,
-  onPointerLeave,
-  onPointerCancel,
-  onPointerMove,
-  onClick,
-  ...rest
-}) => {
-  const [pressing, setPressing] = useState(false);
-  const [rebounding, setRebounding] = useState(false);
-  const reboundTimerRef = useRef<number | null>(null);
-  const btnRef = useRef<HTMLButtonElement | null>(null);
+export const QuarryButton = React.forwardRef<HTMLButtonElement, QuarryButtonProps>(
+  (
+    {
+      tone = 'crystal',
+      active = false,
+      soundTone = 'default',
+      inlayArt,
+      onAudioDown,
+      onAudioUp,
+      className = '',
+      children,
+      onPointerDown,
+      onPointerUp,
+      onPointerLeave,
+      onPointerCancel,
+      onPointerMove,
+      onKeyDown,
+      onKeyUp,
+      onBlur,
+      onClick,
+      disabled,
+      ...rest
+    },
+    forwardedRef
+  ) => {
+    const [pressing, setPressing] = useState(false);
+    const [rebounding, setRebounding] = useState(false);
+    const reboundTimerRef = useRef<number | null>(null);
+    const btnRef = useRef<HTMLButtonElement | null>(null);
+    const keyboardPressActiveRef = useRef<boolean>(false);
 
-  useEffect(() => {
-    return () => {
+    const setMergedRef = useCallback(
+      (el: HTMLButtonElement | null) => {
+        btnRef.current = el;
+        if (typeof forwardedRef === 'function') {
+          forwardedRef(el);
+        } else if (forwardedRef) {
+          forwardedRef.current = el;
+        }
+      },
+      [forwardedRef]
+    );
+
+    useEffect(() => {
+      return () => {
+        if (reboundTimerRef.current !== null && typeof window !== 'undefined') {
+          window.clearTimeout(reboundTimerRef.current);
+        }
+      };
+    }, []);
+
+    const triggerSpringRebound = useCallback(() => {
+      if (typeof window === 'undefined') return;
       if (reboundTimerRef.current !== null) {
         window.clearTimeout(reboundTimerRef.current);
       }
-    };
-  }, []);
-
-  const triggerSpringRebound = useCallback(() => {
-    if (reboundTimerRef.current !== null) {
-      window.clearTimeout(reboundTimerRef.current);
-    }
-    setRebounding(false);
-    requestAnimationFrame(() => {
-      setRebounding(true);
-      reboundTimerRef.current = window.setTimeout(() => {
-        setRebounding(false);
-        reboundTimerRef.current = null;
-      }, 300);
-    });
-  }, []);
-
-  const handlePtrMove = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const el = btnRef.current;
-    if (el) {
-      const r = el.getBoundingClientRect();
-      const gx = ((e.clientX - r.left) / Math.max(1, r.width)) * 100;
-      const gy = ((e.clientY - r.top) / Math.max(1, r.height)) * 100;
-      el.style.setProperty('--qx', `${gx.toFixed(1)}%`);
-      el.style.setProperty('--qy', `${gy.toFixed(1)}%`);
-    }
-    onPointerMove?.(e);
-  };
-
-  const handlePtrDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (e.button === 0 && !rest.disabled) {
-      setPressing(true);
       setRebounding(false);
-      onAudioDown?.(soundTone);
-    }
-    onPointerDown?.(e);
-  };
+      const scheduleFrame =
+        typeof requestAnimationFrame === 'function'
+          ? requestAnimationFrame
+          : (cb: FrameRequestCallback) => window.setTimeout(() => cb(Date.now()), 0);
+      scheduleFrame(() => {
+        setRebounding(true);
+        reboundTimerRef.current = window.setTimeout(() => {
+          setRebounding(false);
+          reboundTimerRef.current = null;
+        }, 300);
+      });
+    }, []);
 
-  const handlePtrUp = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (pressing) {
+    const handlePtrMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+      const el = btnRef.current;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        const gx = ((e.clientX - r.left) / Math.max(1, r.width)) * 100;
+        const gy = ((e.clientY - r.top) / Math.max(1, r.height)) * 100;
+        el.style.setProperty('--qx', `${gx.toFixed(1)}%`);
+        el.style.setProperty('--qy', `${gy.toFixed(1)}%`);
+      }
+      onPointerMove?.(e);
+    };
+
+    const handlePtrDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+      if ((e.button === 0 || e.pointerType === 'touch') && !disabled) {
+        setPressing(true);
+        setRebounding(false);
+        onAudioDown?.(soundTone);
+      }
+      onPointerDown?.(e);
+    };
+
+    const handlePtrUp = (e: React.PointerEvent<HTMLButtonElement>) => {
+      if (pressing) {
+        setPressing(false);
+        triggerSpringRebound();
+        onAudioUp?.(soundTone);
+      }
+      onPointerUp?.(e);
+    };
+
+    const handlePtrLeave = (e: React.PointerEvent<HTMLButtonElement>) => {
+      if (pressing) {
+        setPressing(false);
+      }
+      onPointerLeave?.(e);
+    };
+
+    const handlePtrCancel = (e: React.PointerEvent<HTMLButtonElement>) => {
       setPressing(false);
-      triggerSpringRebound();
-      onAudioUp?.(soundTone);
-    }
-    onPointerUp?.(e);
-  };
+      keyboardPressActiveRef.current = false;
+      onPointerCancel?.(e);
+    };
 
-  const handlePtrLeave = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (pressing) {
-      setPressing(false);
-    }
-    onPointerLeave?.(e);
-  };
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if ((e.key === 'Enter' || e.key === ' ') && !e.repeat && !disabled) {
+        keyboardPressActiveRef.current = true;
+        setPressing(true);
+        setRebounding(false);
+        onAudioDown?.(soundTone);
+      }
+      onKeyDown?.(e);
+    };
 
-  const handlePtrCancel = (e: React.PointerEvent<HTMLButtonElement>) => {
-    setPressing(false);
-    onPointerCancel?.(e);
-  };
+    const handleKeyUp = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if ((e.key === 'Enter' || e.key === ' ') && keyboardPressActiveRef.current) {
+        keyboardPressActiveRef.current = false;
+        setPressing(false);
+        triggerSpringRebound();
+        onAudioUp?.(soundTone);
+      }
+      onKeyUp?.(e);
+    };
 
-  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
-    if (e.detail === 0 && !rest.disabled) {
-      onAudioDown?.(soundTone);
-      triggerSpringRebound();
-      onAudioUp?.(soundTone);
-    }
-    onClick?.(e);
-  };
+    const handleBlur = (e: React.FocusEvent<HTMLButtonElement>) => {
+      if (pressing || keyboardPressActiveRef.current) {
+        setPressing(false);
+        keyboardPressActiveRef.current = false;
+      }
+      onBlur?.(e);
+    };
 
-  return (
-    <button
-      ref={btnRef}
-      type="button"
-      data-pressing={pressing ? 'true' : undefined}
-      data-rebounding={rebounding ? 'true' : undefined}
-      className={`quarry-btn quarry-tone-${tone} ${active ? 'is-lit' : ''} ${className}`}
-      onPointerMove={handlePtrMove}
-      onPointerDown={handlePtrDown}
-      onPointerUp={handlePtrUp}
-      onPointerLeave={handlePtrLeave}
-      onPointerCancel={handlePtrCancel}
-      onClick={handleClick}
-      {...rest}
-    >
-      <span className="quarry-glass-pane">
-        {inlayArt}
-        <span className="quarry-caustic-glint" aria-hidden="true" />
-        <span className="quarry-etch-content">{children}</span>
-      </span>
-    </button>
-  );
-};
+    const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+      if (e.detail === 0 && !disabled && !keyboardPressActiveRef.current) {
+        onAudioDown?.(soundTone);
+        triggerSpringRebound();
+        onAudioUp?.(soundTone);
+      }
+      onClick?.(e);
+    };
+
+    return (
+      <button
+        ref={setMergedRef}
+        type="button"
+        disabled={disabled}
+        aria-disabled={disabled ? true : undefined}
+        data-pressing={pressing ? 'true' : undefined}
+        data-rebounding={rebounding ? 'true' : undefined}
+        className={`quarry-btn quarry-tone-${tone} ${active ? 'is-lit' : ''} ${className}`.trim()}
+        onPointerMove={handlePtrMove}
+        onPointerDown={handlePtrDown}
+        onPointerUp={handlePtrUp}
+        onPointerLeave={handlePtrLeave}
+        onPointerCancel={handlePtrCancel}
+        onKeyDown={handleKeyDown}
+        onKeyUp={handleKeyUp}
+        onBlur={handleBlur}
+        onClick={handleClick}
+        {...rest}
+      >
+        <span className="quarry-glass-pane">
+          {inlayArt}
+          <span className="quarry-caustic-glint" aria-hidden="true" />
+          <span className="quarry-etch-content">{children}</span>
+        </span>
+      </button>
+    );
+  }
+);
+QuarryButton.displayName = 'QuarryButton';
 
 export const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<GameEngine | null>(null);
+  const guideBtnRef = useRef<HTMLButtonElement | null>(null);
+  const codexWindowRef = useRef<HTMLDivElement | null>(null);
+  const codexCloseBtnRef = useRef<HTMLButtonElement | null>(null);
+  const wasHelpOpenRef = useRef<boolean>(false);
 
   const [telemetry, setTelemetry] = useState<VitrailHudTelemetry>(INITIAL_TELEMETRY);
   const [muted, setMuted] = useState<boolean>(false);
@@ -230,6 +300,19 @@ export const App: React.FC = () => {
   const copyFeedbackTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (typeof document !== 'undefined') {
+      const viewportMeta = document.querySelector('meta[name="viewport"]');
+      if (viewportMeta) {
+        const content = viewportMeta.getAttribute('content') ?? '';
+        if (!content.includes('viewport-fit=')) {
+          viewportMeta.setAttribute(
+            'content',
+            content ? `${content}, viewport-fit=cover` : 'width=device-width, initial-scale=1.0, viewport-fit=cover'
+          );
+        }
+      }
+    }
+
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -261,12 +344,46 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     engineRef.current?.setModalOpen(showHelp);
-    if (!showHelp) return;
+    if (!showHelp) {
+      if (wasHelpOpenRef.current) {
+        wasHelpOpenRef.current = false;
+        guideBtnRef.current?.focus();
+      }
+      return;
+    }
+
+    wasHelpOpenRef.current = true;
+    codexCloseBtnRef.current?.focus();
+
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
         engineRef.current?.audio.playUiKeyUp('default');
         setShowHelp(false);
+        return;
+      }
+      if (e.key === 'Tab') {
+        const dialogEl = codexWindowRef.current;
+        if (!dialogEl) return;
+        const focusables = Array.from(
+          dialogEl.querySelectorAll<HTMLElement>(FOCUSABLE_MODAL_SELECTOR)
+        );
+        if (focusables.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        const firstEl = focusables[0];
+        const lastEl = focusables[focusables.length - 1];
+        const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+        if (e.shiftKey) {
+          if (activeEl === firstEl || !dialogEl.contains(activeEl)) {
+            e.preventDefault();
+            lastEl.focus();
+          }
+        } else if (activeEl === lastEl || !dialogEl.contains(activeEl)) {
+          e.preventDefault();
+          firstEl.focus();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -341,7 +458,16 @@ export const App: React.FC = () => {
   const handleToggleVsAi = () => {
     setOnlineDrawerOpen(false);
     const next = !telemetry.aiOpponentEnabled;
-    engineRef.current?.setAiOpponentEnabled(next);
+    engineRef.current?.setAiOpponentEnabled(next, telemetry.aiDifficulty ?? 'master');
+  };
+
+  const handleSelectAiDifficulty = (difficulty: AiDifficulty) => {
+    setOnlineDrawerOpen(false);
+    if (!telemetry.aiOpponentEnabled) {
+      engineRef.current?.setAiOpponentEnabled(true, difficulty);
+    } else {
+      engineRef.current?.setAiDifficulty(difficulty);
+    }
   };
 
   const handleTogglePolariscope = () => {
@@ -443,17 +569,30 @@ export const App: React.FC = () => {
       ? '#fcd34d'
       : '#fca5a5';
 
+  const activeAiDifficulty: AiDifficulty = telemetry.aiDifficulty ?? 'master';
+  const aiDisplayName =
+    activeAiDifficulty === 'apprentice' ? 'Apprentice AI' : 'Master Glazier';
+
   const partyTurnLabel = (() => {
     const vsAi = Boolean(telemetry.aiOpponentEnabled);
     const nameOf = (idx: number) =>
-      vsAi ? (idx === 0 ? 'You' : 'Glazier AI') : `Player ${idx + 1}`;
-    const shortOf = (idx: number) => (vsAi ? (idx === 0 ? 'You' : 'AI') : `P${idx + 1}`);
+      vsAi ? (idx === 0 ? 'You' : aiDisplayName) : `Player ${idx + 1}`;
+    const shortOf = (idx: number) =>
+      vsAi
+        ? idx === 0
+          ? 'You'
+          : activeAiDifficulty === 'apprentice'
+          ? 'Apprentice'
+          : 'Master'
+        : `P${idx + 1}`;
     if (telemetry.turnPhase !== 'COLLAPSED') {
       if (vsAi) {
         return telemetry.currentPlayer === 0
           ? 'Your Turn'
           : telemetry.aiActionLabel ||
-            (telemetry.aiThinking ? 'Glazier AI Reading Stack…' : "Glazier AI's Turn");
+            (telemetry.aiThinking
+              ? `${aiDisplayName} Reading Stack…`
+              : `${aiDisplayName}'s Turn`);
       }
       return `Player ${telemetry.currentPlayer + 1}'s Turn`;
     }
@@ -519,17 +658,30 @@ export const App: React.FC = () => {
 
   const isBench =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('bench');
+  const isModalOverlayOpen = showHelp || Boolean(gpuError);
 
   return (
     <div className="app-shell" data-lighting={lightPreset}>
       <VitrailSvgDefs />
-      <canvas ref={canvasRef} className="webgpu-canvas" />
+      <canvas
+        ref={canvasRef}
+        className="webgpu-canvas"
+        aria-label="Vitrail 3D Stained-Glass Tower Canvas"
+        aria-hidden={isModalOverlayOpen ? true : undefined}
+      />
 
       {gpuError && (
         <div className="codex-backdrop">
-          <div className="codex-window">
+          <div
+            className="codex-window"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="vitrail-gpu-error-heading"
+          >
             <div className="codex-pane-inner">
-              <h2 className="etched-heading">WebGPU Required</h2>
+              <h2 id="vitrail-gpu-error-heading" className="etched-heading">
+                WebGPU Required
+              </h2>
               <p className="etched-prose">
                 {gpuError} Open Vitrail in a WebGPU-enabled browser (Chrome 113+, Edge 113+, or
                 Safari 18+).
@@ -539,7 +691,11 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      <div className="hud-layer" style={{ display: isBench ? 'none' : undefined }}>
+      <div
+        className="hud-layer"
+        aria-hidden={isModalOverlayOpen ? true : undefined}
+        style={{ display: isBench ? 'none' : undefined }}
+      >
         {/* Subtle oblique clerestory sunbeam cast from the left stained-glass lancet into the room */}
         <div className="lancet-sunbeam-veil" aria-hidden="true" />
 
@@ -654,6 +810,7 @@ export const App: React.FC = () => {
                     <div className="party-turn-pane">
                       <span
                         className="player-cabochon"
+                        aria-hidden="true"
                         style={{
                           backgroundColor: PLAYER_COLORS[partyAccentIndex % PLAYER_COLORS.length],
                           boxShadow: `0 0 8px ${PLAYER_COLORS[partyAccentIndex % PLAYER_COLORS.length]}`,
@@ -665,12 +822,14 @@ export const App: React.FC = () => {
                       <QuarryButton
                         tone={telemetry.aiOpponentEnabled ? 'cobalt' : 'crystal'}
                         active={Boolean(telemetry.aiOpponentEnabled)}
+                        aria-pressed={Boolean(telemetry.aiOpponentEnabled)}
+                        aria-label="Play against Glazier AI"
                         soundTone="step"
                         onAudioDown={playUiDown}
                         onAudioUp={playUiUp}
                         className="player-num-pane vs-ai-pane"
                         onClick={handleToggleVsAi}
-                        title="Play vs. Counterfactual Master Glazier AI"
+                        title="Play vs. Counterfactual Glazier AI"
                       >
                         <span>AI</span>
                       </QuarryButton>
@@ -682,6 +841,8 @@ export const App: React.FC = () => {
                             key={cnt}
                             tone={isCountActive ? 'amber' : 'crystal'}
                             active={isCountActive}
+                            aria-pressed={isCountActive}
+                            aria-label={`${cnt} Players`}
                             soundTone="step"
                             onAudioDown={playUiDown}
                             onAudioUp={playUiUp}
@@ -694,6 +855,42 @@ export const App: React.FC = () => {
                         );
                       })}
                     </div>
+                    {Boolean(telemetry.aiOpponentEnabled) && (
+                      <div
+                        className="ai-difficulty-strip"
+                        role="radiogroup"
+                        aria-label="AI Difficulty"
+                      >
+                        <QuarryButton
+                          role="radio"
+                          aria-checked={activeAiDifficulty === 'apprentice'}
+                          tone={activeAiDifficulty === 'apprentice' ? 'teal' : 'crystal'}
+                          active={activeAiDifficulty === 'apprentice'}
+                          soundTone="step"
+                          onAudioDown={playUiDown}
+                          onAudioUp={playUiUp}
+                          className="ai-difficulty-pane"
+                          onClick={() => handleSelectAiDifficulty('apprentice')}
+                          title="Apprentice AI: Conservative extractions & center-counterbalance stacks"
+                        >
+                          <span>Apprentice</span>
+                        </QuarryButton>
+                        <QuarryButton
+                          role="radio"
+                          aria-checked={activeAiDifficulty === 'master'}
+                          tone={activeAiDifficulty === 'master' ? 'cobalt' : 'crystal'}
+                          active={activeAiDifficulty === 'master'}
+                          soundTone="step"
+                          onAudioDown={playUiDown}
+                          onAudioUp={playUiUp}
+                          className="ai-difficulty-pane"
+                          onClick={() => handleSelectAiDifficulty('master')}
+                          title="Master Glazier (2-Ply): Continuous clearance-azimuth pulls & adversarial eccentric stacks"
+                        >
+                          <span>Master Glazier</span>
+                        </QuarryButton>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -733,6 +930,7 @@ export const App: React.FC = () => {
                           onAudioUp={playUiUp}
                           className="online-host-btn"
                           onClick={handleHostOnlineRoom}
+                          aria-label="Host Online Room"
                           title="Create a 5-character Internet Room Code"
                         >
                           <span>Host</span>
@@ -749,6 +947,9 @@ export const App: React.FC = () => {
                           }}
                           placeholder="CODE…"
                           maxLength={8}
+                          autoComplete="off"
+                          autoCapitalize="characters"
+                          spellCheck={false}
                           aria-label="Enter 5-character Room Code"
                           className="online-code-input"
                         />
@@ -761,6 +962,7 @@ export const App: React.FC = () => {
                           onAudioUp={playUiUp}
                           className="online-join-btn"
                           onClick={handleJoinOnlineRoom}
+                          aria-label="Join Online Room"
                           title="Join Room Code"
                         >
                           <span>Join</span>
@@ -783,6 +985,7 @@ export const App: React.FC = () => {
                             onAudioUp={playUiUp}
                             className="online-action-btn"
                             onClick={handleCopyInviteLink}
+                            aria-label={copiedRoomLink ? 'Room Invite Link Copied' : 'Copy Room Invite Link'}
                             title="Copy shareable ?room= invite link"
                           >
                             <span>{copiedRoomLink ? 'Copied' : 'Invite'}</span>
@@ -794,6 +997,7 @@ export const App: React.FC = () => {
                             onAudioUp={playUiUp}
                             className="online-action-btn online-leave-btn"
                             onClick={handleLeaveOnlineRoom}
+                            aria-label="Leave Online Room"
                             title="Leave Online Room"
                           >
                             <span>Exit</span>
@@ -805,6 +1009,7 @@ export const App: React.FC = () => {
                             <span className="online-status-left">
                               <span
                                 className="player-cabochon"
+                                aria-hidden="true"
                                 style={{
                                   backgroundColor: telemetry.mpPeerConnected
                                     ? PLAYER_COLORS[telemetry.currentPlayer % 2]
@@ -866,6 +1071,7 @@ export const App: React.FC = () => {
                       onAudioUp={playUiUp}
                       className="smash-course-btn"
                       onClick={() => engineRef.current?.triggerCollapseDemo()}
+                      aria-label="Buckle and Shatter Tower"
                       title="Buckle lower courses to trigger 120Hz Voronoi shatter"
                     >
                       <SmashVoronoiSvg />
@@ -880,6 +1086,7 @@ export const App: React.FC = () => {
                 <QuarryButton
                   tone="crystal"
                   active={!muted}
+                  aria-pressed={!muted}
                   soundTone="default"
                   onAudioDown={playUiDown}
                   onAudioUp={playUiUp}
@@ -901,6 +1108,7 @@ export const App: React.FC = () => {
                   inlayArt={<SillGlassInGlassBgSvg variant="rebuild" />}
                   className="sill-pane-btn"
                   onClick={handleRebuild}
+                  aria-label="Rebuild 54-Prism Stained-Glass Tower"
                   title="Rebuild 54-Prism Stained-Glass Tower"
                 >
                   <RebuildTowerSvg />
@@ -908,8 +1116,11 @@ export const App: React.FC = () => {
                 </QuarryButton>
 
                 <QuarryButton
+                  ref={guideBtnRef}
                   tone="crystal"
                   active={showHelp}
+                  aria-haspopup="dialog"
+                  aria-expanded={showHelp}
                   soundTone="default"
                   onAudioDown={playUiDown}
                   onAudioUp={playUiUp}
@@ -1040,6 +1251,7 @@ export const App: React.FC = () => {
                 className="polariscope-lens-btn"
                 onClick={handleTogglePolariscope}
                 aria-pressed={Boolean(telemetry.polariscopeMode)}
+                aria-label="Toggle Polariscope Stress-Optic Lens"
                 title="Toggle Cross-Polarized Photoelastic Force-Chain Lens"
               >
                 <span
@@ -1134,17 +1346,17 @@ export const App: React.FC = () => {
                   <span className="prism-primary-line">
                     {isOnlineSession && !isLocalOnlineTurn
                       ? 'Opponent positioning extracted prism across top course…'
-                      : 'Position across top course & click to release'}
+                      : 'Drag or tap top course to position · Tap or Place Prism to release'}
                   </span>
                   <span className="prism-secondary-line">
                     {isOnlineSession && !isLocalOnlineTurn
-                      ? 'Drag anywhere to orbit 360° · Scroll to zoom'
-                      : 'Wheel or Q / E angles · R turns 90° · 0 aligns · Drag outside to orbit'}
+                      ? '1-finger drag orbits 360° · 2-finger pinch/pan or scroll zooms'
+                      : 'Q / 90° R / E angles · 0 aligns · Drag outside to orbit · 2-finger pinch/pan'}
                   </span>
                 </div>
 
                 {isLocalOnlineTurn && (
-                  <div className="prism-inlaid-keys">
+                  <div className="prism-inlaid-keys" role="toolbar" aria-label="Prism Placement Controls">
                     <QuarryButton
                       tone="crystal"
                       soundTone="step"
@@ -1152,6 +1364,7 @@ export const App: React.FC = () => {
                       onAudioUp={playUiUp}
                       className="prism-key-btn"
                       onClick={() => engineRef.current?.handleRotateCarried(-Math.PI / 24)}
+                      aria-label="Rotate prism counter-clockwise 7.5 degrees (Q)"
                       title="Angle −7.5° (Q)"
                     >
                       <PlacementGlyphSvg kind="ccw" />
@@ -1166,6 +1379,7 @@ export const App: React.FC = () => {
                       onAudioUp={playUiUp}
                       className="prism-key-btn"
                       onClick={() => engineRef.current?.handleRotateCarried(Math.PI * 0.5)}
+                      aria-label="Rotate prism 90 degrees (R)"
                       title="Turn 90° (R)"
                     >
                       <PlacementGlyphSvg kind="turn90" />
@@ -1179,6 +1393,7 @@ export const App: React.FC = () => {
                       onAudioUp={playUiUp}
                       className="prism-key-btn"
                       onClick={() => engineRef.current?.handleRotateCarried(Math.PI / 24)}
+                      aria-label="Rotate prism clockwise 7.5 degrees (E)"
                       title="Angle +7.5° (E)"
                     >
                       <span>E</span>
@@ -1194,6 +1409,7 @@ export const App: React.FC = () => {
                         onAudioUp={playUiUp}
                         className="prism-key-btn"
                         onClick={() => engineRef.current?.handleResetCarriedRotation()}
+                        aria-label="Align prism square with course (0)"
                         title="Align square with course (0)"
                       >
                         <PlacementGlyphSvg kind="align" />
@@ -1213,6 +1429,7 @@ export const App: React.FC = () => {
                       onAudioUp={playUiUp}
                       className="prism-release-btn"
                       onClick={() => engineRef.current?.handleReleaseOntoTop()}
+                      aria-label="Place Prism onto top course"
                       title="Release prism onto top course (Space / Enter)"
                     >
                       <PlacementGlyphSvg kind="place" />
@@ -1333,7 +1550,7 @@ export const App: React.FC = () => {
                         </span>
                       </span>
                     ) : (
-                      `Drag background (or Right-Click) to orbit 360° · Scroll to zoom · ${lockedRowsLabel}`
+                      `1-finger background orbits · 2-finger pinch/pan · ${lockedRowsLabel}`
                     )}
                   </span>
                 </div>
@@ -1352,10 +1569,12 @@ export const App: React.FC = () => {
       {showHelp && (
         <div className="codex-backdrop" onClick={() => setShowHelp(false)}>
           <div
+            ref={codexWindowRef}
             className="codex-window"
             role="dialog"
             aria-modal="true"
             aria-labelledby="vitrail-guide-heading"
+            aria-describedby="vitrail-guide-subtitle"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="monument-spandrel-bar" aria-hidden="true">
@@ -1375,12 +1594,13 @@ export const App: React.FC = () => {
                   <h2 id="vitrail-guide-heading" className="etched-heading">
                     Vitrail Studio Guide
                   </h2>
-                  <span className="etched-subtitle">
+                  <span id="vitrail-guide-subtitle" className="etched-subtitle">
                     Acoustic Tap-Testing · Spring Extraction · Voronoi Glass Fracture
                   </span>
                 </div>
               </div>
               <QuarryButton
+                ref={codexCloseBtnRef}
                 tone="crystal"
                 soundTone="default"
                 onAudioDown={playUiDown}
@@ -1402,7 +1622,7 @@ export const App: React.FC = () => {
                   <h4>1. Scout Loose Glass by Acoustic Resonance</h4>
                   <p>
                     Each 3-prism course has micro-tolerance variance: 1 prism sits free while 2
-                    bear the column load. <strong>Click</strong> any prism below the highest
+                    bear the column load. <strong>Tap or click</strong> any prism below the highest
                     completed course without locking your turn — free glass rings clearly at{' '}
                     <strong>2.3 kHz</strong>, while pinned glass ticks dryly at{' '}
                     <strong>3.8 kHz</strong>.
@@ -1432,11 +1652,11 @@ export const App: React.FC = () => {
                 <div className="codex-text-quarry">
                   <h4>3. Free-Hand Stack &amp; Guard Against Fracture</h4>
                   <p>
-                    Position the extracted prism anywhere across the top course (prisms abut flush
-                    bevel-to-bevel). Angle with the <strong>wheel</strong> or <strong>Q / E</strong>
-                    , turn <strong>90°</strong> with <strong>R</strong> (<strong>0</strong> aligns
-                    square), and <strong>click</strong> to release gently. Hard drops craze internal
-                    spiderwebs or shatter into 3D Voronoi shards.
+                    Drag or tap across the top course to position the extracted prism (prisms abut
+                    flush bevel-to-bevel). Angle with <strong>Q / 90° R / E</strong> or the{' '}
+                    <strong>wheel</strong>, then tap or press <strong>Place Prism</strong> to
+                    release gently. Hard drops craze internal spiderwebs or shatter into 3D Voronoi
+                    shards.
                   </p>
                 </div>
               </div>
@@ -1444,7 +1664,7 @@ export const App: React.FC = () => {
 
             <div className="codex-footer-course">
               <div className="codex-hint-quarry">
-                <span>Right-Click or background drag orbits 360° · Scroll zooms</span>
+                <span>1-finger background orbits 360° · 2-finger pinch zooms &amp; pans</span>
               </div>
               <QuarryButton
                 tone="amber"
