@@ -29,6 +29,7 @@ struct GPUBlockData {
   accentAndSeed: vec4<f32>,
   crackAndDamage: vec4<f32>,
   stateFlags: vec4<f32>,
+  photoelastic: vec4<f32>, // xyz = local (-X, 0, +X) bearing contact stress [0..1], w = flexural bending/shear [0..1]
 };
 
 const MAX_SHARD_PLANES: u32 = 12u;

@@ -11,10 +11,11 @@
     "map:symbols": "node \"$HOME/.gemini/config/skills/gpu-project-modernizer/scripts/map-symbols.mjs\"",
     "test:blast": "node \"$HOME/.gemini/config/skills/gpu-project-modernizer/scripts/test-blast.mjs\"",
     "test": "vitest run",
+    "calibrate:physics": "node scripts/calibrate-mujoco-physics.mjs",
     "bench:optical": "node scripts/optical-bench.mjs"
   },
   "dependencies": {
-    "@dimforge/rapier3d-compat": "^0.14.0",
+    "@mujoco/mujoco": "^4.0.0",
     "lucide-react": "^1.39.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"

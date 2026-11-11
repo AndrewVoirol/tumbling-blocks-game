@@ -29,7 +29,7 @@ import { OrbitCamera } from '../engine/OrbitCamera';
 const SUN_DEPTH_MAP_SIZE = 2048;
 const CAUSTIC_MAP_SIZE = 1024;
 const MAX_BLOCKS_GPU = 96;
-const BLOCK_FLOATS = 48; // 192 bytes per GPUBlockData
+const BLOCK_FLOATS = 52; // 208 bytes per GPUBlockData (2 mat4 + 5 vec4)
 const MAX_SHARDS_GPU = 512;
 const SHARD_FLOATS = 76; // 304 bytes per GPUShardInstance (mat4 + 3 vec4 + 12 convex planes)
 const MAX_SHARD_VERTICES = 67584; // 512 slots * 132 vertices/slot
@@ -177,6 +177,7 @@ export class WebGPURenderer {
   public lightingOverride: Partial<LightingPreset> | null = null;
   public referenceCardLuminance: number = 0;
   public benchHideBlocks: boolean = false;
+  public polariscopeMode: boolean = false;
   private width: number = 0;
   private height: number = 0;
   private bloomW: number = 32;
@@ -1134,7 +1135,13 @@ export class WebGPURenderer {
         this.blockStorageData[base + 44] = isHover;
         this.blockStorageData[base + 45] = isGrab;
         this.blockStorageData[base + 46] = b.isLegalTarget ? 1.0 : 0.0;
-        this.blockStorageData[base + 47] = isGrab > 0.5 ? physics.grabResistance01 : 0.0;
+        this.blockStorageData[base + 47] =
+          isGrab > 0.5 ? physics.grabResistance01 : physics.getBlockPhotoelasticStress01(b.id);
+        physics.writeBlockPhotoelasticWrench(b.id, this.blockStorageData, base + 48);
+        if (isGrab > 0.5 && physics.grabResistance01 > 0.04) {
+          const grabShear = physics.grabResistance01 * 0.62;
+          this.blockStorageData[base + 51] = Math.max(this.blockStorageData[base + 51], grabShear);
+        }
       }
     }
 
@@ -1146,7 +1153,7 @@ export class WebGPURenderer {
       this.blockCentersData[97 * 4 + 0] = blkMaxX;
       this.blockCentersData[97 * 4 + 1] = blkMaxY;
       this.blockCentersData[97 * 4 + 2] = blkMaxZ;
-      this.blockCentersData[97 * 4 + 3] = 0.0;
+      this.blockCentersData[97 * 4 + 3] = this.polariscopeMode ? 1.0 : 0.0;
 
       this.device.queue.writeBuffer(
         this.blockCentersUniformBuffer,

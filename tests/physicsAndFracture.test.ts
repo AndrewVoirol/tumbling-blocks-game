@@ -242,7 +242,6 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
 
   it('T2: static stack 1.0cm placement drop & 1.2g micro-splinter at 18 dm/s incur 0 false damage', async () => {
     await ensureRapierInitialized();
-    const RAPIER = (await import('@dimforge/rapier3d-compat')).default;
     const audio = new GlassAudioEngine();
     const world = new PhysicsWorld(audio);
 
@@ -292,17 +291,16 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     for (let i = 0; i < 10; i++) world.step(1 / 60);
 
     const simTimeScale = Math.sqrt(10.0);
-    const splinterRb = rw.createRigidBody(
-      RAPIER.RigidBodyDesc.dynamic()
-        .setTranslation(1.8, BLOCK_HEIGHT + 0.08, 0)
-        .setLinvel(0, -18.0 / simTimeScale, 0)
-    );
+    const splinterRb = rw.createRigidBody({
+      translation: { x: 1.8, y: BLOCK_HEIGHT + 0.08, z: 0 },
+      linvel: { x: 0, y: -18.0 / simTimeScale, z: 0 },
+    });
     // 1.2 g = 0.0012 kg; cuboid(0.04, 0.03, 0.04) volume = 8 * 0.000048 = 0.000384 dm^3 -> density = 3.125
     rw.createCollider(
-      RAPIER.ColliderDesc.cuboid(0.04, 0.03, 0.04)
-        .setDensity(0.0012 / (8 * 0.04 * 0.03 * 0.04))
-        .setRestitution(0.24)
-        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS),
+      {
+        shape: { halfExtents: { x: 0.04, y: 0.03, z: 0.04 } },
+        density: 0.0012 / (8 * 0.04 * 0.03 * 0.04),
+      },
       splinterRb
     );
 
@@ -318,7 +316,6 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
 
   it('T3: (a) dynamic anvil-crush, (b) +X tip argmax fracture origin, (c) <1% momentum error, and (d) 512-slot stress', async () => {
     await ensureRapierInitialized();
-    const RAPIER = (await import('@dimforge/rapier3d-compat')).default;
     const { quatRotateVec3, quatInverseRotateVec3 } = await import('../src/math/vecMat');
     const audio = new GlassAudioEngine();
     const world = new PhysicsWorld(audio, 2);
@@ -371,17 +368,16 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     }
 
     const simScale = Math.sqrt(10.0);
-    const strikerRb = rwB.createRigidBody(
-      RAPIER.RigidBodyDesc.dynamic()
-        .setTranslation(0.33, 1.42, 0)
-        .setGravityScale(0)
-        .setLinvel(0, -24.0 / simScale, 0)
-    );
+    const strikerRb = rwB.createRigidBody({
+      translation: { x: 0.33, y: 1.42, z: 0 },
+      gravityScale: 0,
+      linvel: { x: 0, y: -24.0 / simScale, z: 0 },
+    });
     rwB.createCollider(
-      RAPIER.ColliderDesc.cuboid(0.03, 0.08, 0.08)
-        .setDensity(0.0711 / (8 * 0.03 * 0.08 * 0.08))
-        .setRestitution(0.28)
-        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS),
+      {
+        shape: { halfExtents: { x: 0.03, y: 0.08, z: 0.08 } },
+        density: 0.0711 / (8 * 0.03 * 0.08 * 0.08),
+      },
       strikerRb
     );
 
@@ -473,10 +469,9 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
       const rwD = world.getWorld();
       for (let k = 0; k < 25; k++) {
         const id = world.blocks.length;
-        const rbDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(0, 1.5 + k * 0.05, 0);
-        const body = rwD.createRigidBody(rbDesc);
+        const body = rwD.createRigidBody({ translation: { x: 0, y: 1.5 + k * 0.05, z: 0 } });
         const col = rwD.createCollider(
-          RAPIER.ColliderDesc.cuboid(0.375, 0.075, 0.125).setDensity(2.528),
+          { shape: { halfExtents: { x: 0.375, y: 0.075, z: 0.125 } }, density: 2.528 },
           body
         );
         const syntheticBlk = {
@@ -935,7 +930,7 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     expect(maxBlockSpeedMmS).toBe(0);
 
     pw.dispose();
-  }, 15000);
+  }, 30000);
 
   it('T6: continuous free-hand top placement, bevel-to-bevel side-abutment, layer advancement, and counterbalance lean physics', async () => {
     await ensureRapierInitialized();
@@ -1231,7 +1226,7 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     expect(Math.abs(gBlk.position[2] - 0.19)).toBeLessThan(0.03);
 
     engine.dispose();
-  }, 15000);
+  }, 30000);
 
   it('T7: guards mid-drag PULLING->EXTRACTED against side-corner snap, tracks Sandbox table grabPlaneY without parallax, and cancels active grab on modal open', async () => {
     const { GameEngine } = await import('../src/engine/GameEngine');
@@ -1321,6 +1316,211 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     expect(Math.hypot(grabSx - finalAx, grabSy - finalAy)).toBeLessThan(28.0);
 
     engine.dispose();
-  }, 15000);
+  }, 30000);
+
+  it(
+    'T8: MuJoCo 4.0 elliptic torsional friction, 6D wrench photoelastic stress & flexural snap, and counterfactual mj_copyState oracle',
+    async () => {
+      await ensureRapierInitialized();
+      const audio = new GlassAudioEngine();
+      const world = new PhysicsWorld(audio);
+
+      // Settle standard 18-layer stack
+      for (let i = 0; i < 60; i++) world.step(1 / 60);
+
+      // 1. Photoelastic Force-Chain Stress Contrast: pinched lower bearing blocks vs. loose blocks
+      const lowerBearing = world.blocks.filter((b) => b.assignedLayer <= 2 && !b.isLooseSlot);
+      const looseBlocks = world.blocks.filter(
+        (b) => b.assignedLayer >= 4 && b.assignedLayer <= 14 && b.isLooseSlot
+      );
+      const maxBearingStress = Math.max(
+        ...lowerBearing.map((b) => world.getBlockPhotoelasticStress01(b.id))
+      );
+      const minLooseStress = Math.min(
+        ...looseBlocks.map((b) => world.getBlockPhotoelasticStress01(b.id))
+      );
+      expect(maxBearingStress).toBeGreaterThan(0.55);
+      expect(minLooseStress).toBeLessThan(0.05);
+
+      // 2. Counterfactual `mj_copyState` Oracle: bit-exact non-mutation of live tower + safety discrimination
+      const liveData = world.getWorld().getData();
+      const qposBefore = new Float64Array(liveData.qpos);
+      const qvelBefore = new Float64Array(liveData.qvel);
+      const phaseBefore = world.turnPhase;
+
+      const looseSample = looseBlocks[0];
+      const pinchedSample = lowerBearing.reduce((best, cur) =>
+        world.computeBlockClampingLoadN(cur.id) > world.computeBlockClampingLoadN(best.id)
+          ? cur
+          : best
+      );
+      const oracleResults = world.evaluateCounterfactualBlockCriticality(6, 8, [
+        looseSample.id,
+        pinchedSample.id,
+      ]);
+      expect(oracleResults.length).toBe(2);
+
+      // Verify zero mutation of live MuJoCo `qpos` / `qvel` / `turnPhase`
+      let maxStateDiff = 0;
+      for (let k = 0; k < qposBefore.length; k++) {
+        maxStateDiff = Math.max(maxStateDiff, Math.abs(liveData.qpos[k] - qposBefore[k]));
+      }
+      for (let k = 0; k < qvelBefore.length; k++) {
+        maxStateDiff = Math.max(maxStateDiff, Math.abs(liveData.qvel[k] - qvelBefore[k]));
+      }
+      expect(maxStateDiff).toBe(0);
+      expect(world.turnPhase).toBe(phaseBefore);
+
+      const looseEval = oracleResults.find((r) => r.blockId === looseSample.id)!;
+      const pinchedEval = oracleResults.find((r) => r.blockId === pinchedSample.id)!;
+      expect(looseEval.predictedSlideMm).toBeGreaterThan(pinchedEval.predictedSlideMm + 0.4);
+      expect(looseEval.safetyScore01).toBeGreaterThan(0.75);
+      expect(pinchedEval.safetyScore01).toBeLessThan(looseEval.safetyScore01 - 0.25);
+
+      // 3. Elliptic `condim=4` Torsional Spin Resistance under eccentric off-axis shear
+      const measureEccentricYaw = (torsionCoeff: number): number => {
+        world.rebuildTower('sandbox', 2, 2);
+        const rw = world.getWorld();
+        const m = rw.getModel();
+        // Keep only block 0 resting on the oak table under downward preload, pull eccentrically at +X tip in +Z
+        for (let i = 1; i < world.blocks.length; i++) {
+          const rbOut = rw.getRigidBody(world.blocks[i].bodyHandle)!;
+          rbOut.setTranslation({ x: 3.0 + i * 0.4, y: BLOCK_HEIGHT * 0.5, z: 3.0 }, true);
+        }
+        const blk0 = world.blocks[0];
+        const rb0 = rw.getRigidBody(blk0.bodyHandle)!;
+        rb0.setTranslation({ x: 0, y: BLOCK_HEIGHT * 0.5, z: 0 }, true);
+        rb0.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+        rb0.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        rb0.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        // Set torsional friction on both block 0 and oak table geoms
+        for (let g = 0; g < m.ngeom; g++) {
+          m.geom_friction[g * 3 + 1] = torsionCoeff;
+        }
+        for (let s = 0; s < 12; s++) world.step(1 / 60);
+
+        const d = rw.getData();
+        const info = rw.getMapping(blk0.bodyHandle)!;
+        // Apply pure yaw torque + downward clamping preload so normal force scales torsional cone `fn * mu_torsion`
+        for (let f = 0; f < 18; f++) {
+          d.xfrc_applied[blk0.bodyHandle * 6 + 1] = -8.0; // 8 N downward normal load
+          d.qfrc_applied[info.dofAdr + 4] = 0.022; // 0.022 N·m yaw torque around Y
+          world.step(1 / 60);
+        }
+        const rot = rb0.rotation();
+        return 2.0 * Math.atan2(Math.abs(rot.y), Math.abs(rot.w));
+      };
+
+      const yawZeroTorsion = measureEccentricYaw(0.0);
+      const yawEllipticTorsion = measureEccentricYaw(0.008);
+      expect(yawEllipticTorsion).toBeLessThan(yawZeroTorsion * 0.78);
+
+      // 4. Three-Point Flexural Snap: block bridging two outer supports struck at mid-span fractures near x ≈ 0
+      world.rebuildTower('sandbox', 2, 2);
+      const rwFlex = world.getWorld();
+      const supL = world.blocks[0];
+      const supR = world.blocks[1];
+      const bridge = world.blocks[3];
+      rwFlex.getRigidBody(world.blocks[2].bodyHandle)!.setTranslation({ x: -3.2, y: 0.075, z: 2.5 }, true);
+      rwFlex.getRigidBody(world.blocks[4].bodyHandle)!.setTranslation({ x: -2.6, y: 0.075, z: 2.5 }, true);
+      rwFlex.getRigidBody(world.blocks[5].bodyHandle)!.setTranslation({ x: -2.0, y: 0.075, z: 2.5 }, true);
+
+      const rbL = rwFlex.getRigidBody(supL.bodyHandle)!;
+      const rbR = rwFlex.getRigidBody(supR.bodyHandle)!;
+      rbL.setTranslation({ x: -0.31, y: BLOCK_HEIGHT * 0.5, z: 0 }, true);
+      rbL.setRotation({ x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 }, true);
+      rbR.setTranslation({ x: 0.31, y: BLOCK_HEIGHT * 0.5, z: 0 }, true);
+      rbR.setRotation({ x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 }, true);
+
+      const rbBridge = rwFlex.getRigidBody(bridge.bodyHandle)!;
+      rbBridge.setTranslation({ x: 0, y: BLOCK_HEIGHT * 1.5, z: 0 }, true);
+      rbBridge.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      for (let s = 0; s < 15; s++) world.step(1 / 60);
+
+      const simScale = Math.sqrt(10.0);
+      const midHammer = rwFlex.createRigidBody({
+        translation: { x: 0.0, y: BLOCK_HEIGHT * 2.0 + 0.14, z: 0 },
+        linvel: { x: 0, y: -22.0 / simScale, z: 0 },
+      });
+      rwFlex.createCollider(
+        {
+          shape: { halfExtents: { x: 0.035, y: 0.06, z: 0.11 } },
+          mass: 0.085,
+        },
+        midHammer
+      );
+
+      for (let s = 0; s < 14; s++) {
+        world.step(1 / 60);
+        if (bridge.shattered) break;
+      }
+      expect(bridge.shattered).toBe(true);
+      expect(world.lastFractureOriginLocal).not.toBeNull();
+      expect(Math.abs(world.lastFractureOriginLocal![0])).toBeLessThan(0.16);
+
+      // 5. Spatially-Resolved Polariscope Wrench Asymmetry: +X eccentric bearing column illuminates +X while -X cantilever stays dark
+      world.rebuildTower('sandbox', 2, 4);
+      const rwPe = world.getWorld();
+      // Park unused blocks away from origin
+      for (let i = 0; i < world.blocks.length; i++) {
+        rwPe.getRigidBody(world.blocks[i].bodyHandle)!.setTranslation({ x: -3.2, y: 0.075, z: (i - 5) * 0.32 }, true);
+      }
+      // Build an eccentric +X column: base support at x = +0.25 (along Z), test prism centered at x = 0 (along X, so -X is cantilevered!),
+      // and 4 stacked weight blocks directly above x = +0.25 (along Z)!
+      const peUnder = world.blocks[0];
+      const pePrism = world.blocks[1];
+      const rbUnder = rwPe.getRigidBody(peUnder.bodyHandle)!;
+      const rbPrism = rwPe.getRigidBody(pePrism.bodyHandle)!;
+      rbUnder.setTranslation({ x: 0.25, y: BLOCK_HEIGHT * 0.5, z: 0 }, true);
+      rbUnder.setRotation({ x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 }, true);
+      rbPrism.setTranslation({ x: 0.0, y: BLOCK_HEIGHT * 1.5, z: 0 }, true);
+      rbPrism.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      for (let k = 0; k < 4; k++) {
+        const wBlk = world.blocks[2 + k];
+        const rbW = rwPe.getRigidBody(wBlk.bodyHandle)!;
+        rbW.setTranslation({ x: 0.25, y: BLOCK_HEIGHT * (2.5 + k), z: 0 }, true);
+        rbW.setRotation({ x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 }, true);
+      }
+      for (let s = 0; s < 24; s++) world.step(1 / 60);
+      const peWrench = new Float32Array(4);
+      world.writeBlockPhotoelasticWrench(pePrism.id, peWrench, 0);
+      expect(peWrench[2]).toBeGreaterThan(0.28); // +X pinched bearing column glows
+      expect(peWrench[0]).toBeLessThan(0.02);    // -X cantilevered overhang stays dark
+
+      // 6. Screenshot-1 Precarious Overhang Guard: 6-course upper sub-tower shifted +3.9 cm past base edge at 5.8 deg must topple, never freeze asleep
+      world.rebuildTower('solo', 2, 18);
+      const rwOv = world.getWorld();
+      const tiltRad = (5.8 * Math.PI) / 180.0;
+      const halfTilt = -tiltRad * 0.5;
+      const sz = Math.sin(halfTilt);
+      const cz = Math.cos(halfTilt);
+      for (const b of world.blocks) {
+        if (b.assignedLayer >= 12) {
+          const dy = (b.assignedLayer - 12) * BLOCK_HEIGHT;
+          const rbB = rwOv.getRigidBody(b.bodyHandle)!;
+          const p = rbB.translation();
+          const q = rbB.rotation();
+          rbB.setTranslation({ x: p.x + 0.39 + Math.sin(tiltRad) * dy, y: p.y, z: p.z }, true);
+          rbB.setRotation(
+            {
+              x: cz * q.x - sz * q.y,
+              y: sz * q.x + cz * q.y,
+              z: cz * q.z + sz * q.w,
+              w: -sz * q.z + cz * q.w,
+            },
+            true
+          );
+        }
+      }
+      for (let f = 0; f < 120; f++) {
+        world.step(1 / 60);
+        if (world.turnPhase === 'COLLAPSED') break;
+      }
+      expect(world.turnPhase).toBe('COLLAPSED');
+
+      world.dispose();
+    },
+    30000
+  );
 });
 

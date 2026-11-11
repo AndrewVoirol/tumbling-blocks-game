@@ -567,6 +567,10 @@ body,
   width: 28px;
 }
 
+.vs-ai-pane {
+  width: 30px;
+}
+
 .player-num-pane .quarry-etch-content {
   font-size: 10.5px;
   font-weight: 600;
@@ -816,6 +820,38 @@ body,
 .gem-ruby {
   background: #ef4444;
   box-shadow: 0 0 8px rgba(239, 68, 68, 0.65);
+}
+.gem-teal {
+  background: #2dd4bf;
+  box-shadow: 0 0 8px rgba(45, 212, 191, 0.65);
+}
+
+.polariscope-lens-row {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 250, 240, 0.12);
+}
+
+.polariscope-lens-btn {
+  width: 100%;
+  height: 30px;
+}
+
+.polariscope-lens-btn .quarry-etch-content {
+  width: 100%;
+  padding: 0 8px;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.polariscope-state-tag {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+  font-size: 11.5px;
+  color: var(--silica-soft);
 }
 
 .etched-metric-main {

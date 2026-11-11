@@ -6,13 +6,15 @@ import {
   LIGHTING_PRESETS,
 } from '../physics/constants';
 import {
+  BlockCriticalityCandidate,
   ensureRapierInitialized,
   GameMode,
   PhysicsWorld,
   TowerTelemetry,
 } from '../physics/PhysicsWorld';
+import { MujocoWorkerBridge } from '../physics/MujocoWorkerBridge';
 import { WebGPURenderer } from '../renderer/WebGPURenderer';
-import { intersectRayOBB, RayOBBHit, Vec3 } from '../math/vecMat';
+import { intersectRayOBB, quatRotateVec3, RayOBBHit, Vec3 } from '../math/vecMat';
 import { OrbitCamera } from './OrbitCamera';
 
 export type TelemetryListener = (telemetry: TowerTelemetry) => void;
@@ -46,7 +48,28 @@ export class GameEngine {
   public modalOpen: boolean = false;
   public benchPaused: boolean = false;
   public benchCameraLocked: boolean = false;
+  public aiOpponentEnabled: boolean = false;
+  public aiThinking: boolean = false;
+  public aiActionLabel: string | null = null;
+  public polariscopeMode: boolean = false;
+  public physicsWorkerActive: boolean = false;
   private resizeObserver: ResizeObserver | null = null;
+
+  // Master Glazier AI turn controller state
+  private aiStage:
+    | 'idle'
+    | 'scouting'
+    | 'awaiting_oracle'
+    | 'probe_tight'
+    | 'post_tap'
+    | 'pulling'
+    | 'placing' = 'idle';
+  private aiTimerSec: number = 0;
+  private aiTargetBlockId: number | null = null;
+  private aiPullStartWorld: Vec3 = [0, 0, 0];
+  private aiPullDirXZ: [number, number] = [1, 0];
+  private aiHoverTargetXZ: [number, number] = [0, 0];
+  private aiHoverCurrentXZ: [number, number] = [0, 0];
 
   constructor(canvas?: HTMLCanvasElement, onTelemetry?: TelemetryListener) {
     this.canvas = (canvas ?? ({ style: {} } as HTMLCanvasElement));
@@ -66,9 +89,6 @@ export class GameEngine {
   }
 
   public async init(): Promise<void> {
-    await ensureRapierInitialized();
-    if (this.disposed) return;
-
     this.renderer = new WebGPURenderer(this.canvas);
     await this.renderer.init();
 
@@ -77,17 +97,37 @@ export class GameEngine {
       return;
     }
 
-    this.physics = new PhysicsWorld(this.audio);
+    const params =
+      typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+    const benchScene = params?.get('bench') ?? null;
+    const disableWorker = benchScene !== null || params?.get('worker') === '0';
 
-    if (typeof window !== 'undefined') {
-      const params = new URLSearchParams(window.location.search);
-      const benchScene = params.get('bench');
-      if (benchScene) {
-        const presetId = params.get('preset') ?? undefined;
-        const darkParam = params.get('darkroom');
-        const darkScale = darkParam !== null ? Number(darkParam) : undefined;
-        this.configureBenchScene(benchScene, presetId, darkScale);
+    if (!disableWorker && typeof Worker !== 'undefined') {
+      try {
+        const bridge = await MujocoWorkerBridge.create(this.audio);
+        if (this.disposed) {
+          bridge.dispose();
+          this.renderer.dispose();
+          return;
+        }
+        this.physics = bridge as unknown as PhysicsWorld;
+        this.physicsWorkerActive = true;
+      } catch {
+        await ensureRapierInitialized();
+        this.physics = new PhysicsWorld(this.audio);
+        this.physicsWorkerActive = false;
       }
+    } else {
+      await ensureRapierInitialized();
+      this.physics = new PhysicsWorld(this.audio);
+      this.physicsWorkerActive = false;
+    }
+
+    if (benchScene && params) {
+      const presetId = params.get('preset') ?? undefined;
+      const darkParam = params.get('darkroom');
+      const darkScale = darkParam !== null ? Number(darkParam) : undefined;
+      this.configureBenchScene(benchScene, presetId, darkScale);
     }
 
     this.attachEvents();
@@ -127,6 +167,7 @@ export class GameEngine {
     this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
 
     if (!this.benchPaused) {
+      this.updateMasterGlazierAi(dt);
       this.physics.step(dt);
     }
 
@@ -157,13 +198,268 @@ export class GameEngine {
   private emitTelemetry(force: boolean): void {
     if (!this.listener || !this.physics) return;
     void force;
-    this.listener(this.physics.getTelemetry());
+    const base = this.physics.getTelemetry();
+    this.listener({
+      ...base,
+      aiOpponentEnabled: this.aiOpponentEnabled,
+      aiThinking: this.aiThinking,
+      aiActionLabel: this.aiActionLabel,
+      polariscopeMode: this.polariscopeMode,
+      physicsWorkerActive: this.physicsWorkerActive,
+    });
+  }
+
+  public setPolariscopeMode(enabled: boolean): void {
+    this.polariscopeMode = enabled;
+    if (this.renderer) {
+      this.renderer.polariscopeMode = enabled;
+    }
+    this.emitTelemetry(true);
+  }
+
+  public setAiOpponentEnabled(enabled: boolean): void {
+    this.aiOpponentEnabled = enabled;
+    this.resetAiController();
+    if (enabled && this.physics && (this.physics.gameMode !== 'party' || this.physics.playerCount !== 2)) {
+      this.resetGame('party', 2);
+      return;
+    }
+    this.emitTelemetry(true);
+  }
+
+  private resetAiController(): void {
+    this.aiStage = 'idle';
+    this.aiTimerSec = 0;
+    this.aiTargetBlockId = null;
+    this.aiThinking = false;
+    this.aiActionLabel = null;
+  }
+
+  private isAiTurnActive(): boolean {
+    return (
+      this.aiOpponentEnabled &&
+      !this.modalOpen &&
+      Boolean(this.physics) &&
+      this.physics.gameMode === 'party' &&
+      this.physics.currentPlayer === 1 &&
+      this.physics.turnPhase !== 'COLLAPSED' &&
+      this.physics.turnPhase !== 'SETTLING'
+    );
+  }
+
+  private requestAiCounterfactualOracle(): Promise<BlockCriticalityCandidate[]> {
+    const maybeWorker = this.physics as unknown as {
+      evaluateCounterfactualBlockCriticalityAsync?: (
+        maxC: number,
+        steps: number
+      ) => Promise<BlockCriticalityCandidate[]>;
+    };
+    if (typeof maybeWorker.evaluateCounterfactualBlockCriticalityAsync === 'function') {
+      return maybeWorker.evaluateCounterfactualBlockCriticalityAsync(12, 8);
+    }
+    return Promise.resolve(this.physics.evaluateCounterfactualBlockCriticality(12, 8));
+  }
+
+  private updateMasterGlazierAi(dt: number): void {
+    if (!this.isAiTurnActive()) {
+      if (this.aiStage !== 'idle') {
+        this.resetAiController();
+      }
+      return;
+    }
+
+    if (this.aiStage === 'idle' && this.physics.turnPhase === 'SELECT_BLOCK') {
+      this.aiStage = 'scouting';
+      this.aiTimerSec = 0;
+      this.aiThinking = true;
+      this.aiActionLabel = 'Glazier AI Reading Stack…';
+      this.emitTelemetry(true);
+      return;
+    }
+
+    if (this.aiStage === 'scouting') {
+      this.aiTimerSec += dt;
+      if (this.aiTimerSec >= 0.80) {
+        this.aiStage = 'awaiting_oracle';
+        void this.requestAiCounterfactualOracle().then((candidates) => {
+          if (!this.isAiTurnActive() || this.aiStage !== 'awaiting_oracle') return;
+          const chosen =
+            candidates.find((c) => !c.collapseTriggered && c.safetyScore01 > 0.35) ?? candidates[0];
+          const blk = chosen ? this.physics.blocks[chosen.blockId] : undefined;
+          if (!blk || blk.shattered || !blk.isLegalTarget) {
+            this.resetAiController();
+            return;
+          }
+          this.aiTargetBlockId = blk.id;
+
+          // Pick a tighter/distinct candidate first so the player sees & hears the AI probe and reject a bearing column!
+          const tighterProbe = candidates.find(
+            (c) =>
+              c.blockId !== blk.id &&
+              this.physics.blocks[c.blockId] &&
+              !this.physics.blocks[c.blockId].shattered &&
+              this.physics.blocks[c.blockId].isLegalTarget &&
+              (c.safetyScore01 < chosen.safetyScore01 - 0.14 ||
+                this.physics.blocks[c.blockId].assignedLayer !== blk.assignedLayer)
+          );
+          if (tighterProbe) {
+            this.physics.hoveredBlockId = tighterProbe.blockId;
+            this.physics.tapNudgeBlock(tighterProbe.blockId, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
+            this.aiStage = 'probe_tight';
+            this.aiTimerSec = 0;
+            this.aiActionLabel = 'Glazier AI Testing Column…';
+          } else {
+            this.physics.hoveredBlockId = blk.id;
+            this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
+            this.aiStage = 'post_tap';
+            this.aiTimerSec = 0;
+            this.aiActionLabel = 'Glazier AI Selecting Prism…';
+          }
+          this.emitTelemetry(true);
+        });
+      }
+      return;
+    }
+
+    if (this.aiStage === 'probe_tight') {
+      this.aiTimerSec += dt;
+      if (this.aiTimerSec >= 0.95) {
+        const blk = this.aiTargetBlockId !== null ? this.physics.blocks[this.aiTargetBlockId] : undefined;
+        if (!blk || blk.shattered || !blk.isLegalTarget) {
+          this.resetAiController();
+          return;
+        }
+        this.physics.hoveredBlockId = blk.id;
+        this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
+        this.aiStage = 'post_tap';
+        this.aiTimerSec = 0;
+        this.aiActionLabel = 'Glazier AI Selecting Prism…';
+        this.emitTelemetry(true);
+      }
+      return;
+    }
+
+    if (this.aiStage === 'post_tap') {
+      this.aiTimerSec += dt;
+      if (this.aiTimerSec >= 0.90 && this.aiTargetBlockId !== null) {
+        const blk = this.physics.blocks[this.aiTargetBlockId];
+        if (!blk || blk.shattered) {
+          this.resetAiController();
+          return;
+        }
+        const axisX = quatRotateVec3(blk.rotation, [1, 0, 0]);
+        const horizLen = Math.hypot(axisX[0], axisX[2]) || 1.0;
+        const dirSign =
+          blk.position[0] * axisX[0] + blk.position[2] * axisX[2] >= 0 ? 1.0 : -1.0;
+        const pullX = (axisX[0] / horizLen) * dirSign;
+        const pullZ = (axisX[2] / horizLen) * dirSign;
+        const localGrab: Vec3 = [BLOCK_HALF_X * 0.84 * dirSign, 0, 0];
+        const grabOffset = quatRotateVec3(blk.rotation, localGrab);
+        const startWorld: Vec3 = [
+          blk.position[0] + grabOffset[0],
+          blk.position[1] + grabOffset[1],
+          blk.position[2] + grabOffset[2],
+        ];
+        if (this.physics.startGrabBlock(blk.id, localGrab, startWorld)) {
+          this.aiPullStartWorld = startWorld;
+          this.aiPullDirXZ = [pullX, pullZ];
+          this.aiStage = 'pulling';
+          this.aiTimerSec = 0;
+          this.aiThinking = false;
+          this.aiActionLabel = 'Glazier AI Drawing…';
+          this.emitTelemetry(true);
+        } else {
+          this.resetAiController();
+        }
+      }
+      return;
+    }
+
+    if (this.aiStage === 'pulling') {
+      if (this.physics.turnPhase === 'EXTRACTED') {
+        const comCm = this.physics.centerOfMassXZCm;
+        const slots = this.physics.openTopSlots;
+        let bestXZ: [number, number] = [
+          this.physics.topSupportFrame.layerCenter[0],
+          this.physics.topSupportFrame.layerCenter[2],
+        ];
+        if (slots.length > 0) {
+          // Choose the open top slot that best counterbalances current tower CoM eccentricity
+          let bestScore = Infinity;
+          for (const sl of slots) {
+            const projX = comCm[0] + sl.position[0] * 1.8;
+            const projZ = comCm[1] + sl.position[2] * 1.8;
+            const err = Math.hypot(projX, projZ);
+            if (err < bestScore) {
+              bestScore = err;
+              bestXZ = [sl.position[0], sl.position[2]];
+            }
+          }
+        }
+        this.aiHoverCurrentXZ = [
+          this.physics.carriedTargetPos[0],
+          this.physics.carriedTargetPos[2],
+        ];
+        this.aiHoverTargetXZ = bestXZ;
+        this.aiStage = 'placing';
+        this.aiTimerSec = 0;
+        this.aiActionLabel = 'Glazier AI Stacking…';
+        this.emitTelemetry(true);
+        return;
+      }
+
+      this.aiTimerSec += dt;
+      const tPull = Math.min(1.0, this.aiTimerSec / 1.58);
+      const easePull = tPull * tPull * (3.0 - 2.0 * tPull);
+      const pullDistDm = 1.38 * easePull;
+      const targetWorld: Vec3 = [
+        this.aiPullStartWorld[0] + this.aiPullDirXZ[0] * pullDistDm,
+        this.aiPullStartWorld[1],
+        this.aiPullStartWorld[2] + this.aiPullDirXZ[1] * pullDistDm,
+      ];
+      this.physics.updateGrabTarget(targetWorld);
+      if (this.aiTimerSec > 3.8 && this.physics.turnPhase === 'PULLING') {
+        // If unexpectedly jammed, abort cleanly and re-scout
+        this.physics.endGrab(false);
+        this.aiStage = 'idle';
+      }
+      return;
+    }
+
+    if (this.aiStage === 'placing') {
+      if (this.physics.turnPhase !== 'EXTRACTED') {
+        this.resetAiController();
+        return;
+      }
+      this.aiTimerSec += dt;
+      const u = Math.min(1.0, this.aiTimerSec / 0.95);
+      const smoothU = u * u * (3.0 - 2.0 * u);
+      const hx =
+        this.aiHoverCurrentXZ[0] + (this.aiHoverTargetXZ[0] - this.aiHoverCurrentXZ[0]) * smoothU;
+      const hz =
+        this.aiHoverCurrentXZ[1] + (this.aiHoverTargetXZ[1] - this.aiHoverCurrentXZ[1]) * smoothU;
+      const topY = this.physics.topSupportFrame.layerCenter[1] + 1.0;
+      this.physics.updateCarriedHover([hx, topY, hz], [0, -1, 0]);
+      // Hold a visible 0.50 s alignment poise over the chosen landing slot before releasing (`0.95s -> 1.45s`)
+      if (this.aiTimerSec >= 1.45 && this.physics.isExtractionLiftReady) {
+        this.physics.releaseExtractedBlockOntoTop();
+        this.resetAiController();
+        this.emitTelemetry(true);
+      }
+    }
   }
 
   public resetGame(mode?: GameMode, players?: number): void {
     if (!this.physics) return;
     this.benchPaused = false;
     this.benchCameraLocked = false;
+    this.resetAiController();
+    if (mode !== undefined && mode !== 'party') {
+      this.aiOpponentEnabled = false;
+    }
+    if (players !== undefined && players !== 2) {
+      this.aiOpponentEnabled = false;
+    }
     if (this.renderer) {
       this.renderer.lightingOverride = null;
       this.renderer.referenceCardLuminance = 0;
@@ -508,7 +804,7 @@ export class GameEngine {
     const rect = this.getViewportRect(overrideRect);
     const { origin, dir } = this.camera.screenToRay(clientX, clientY, rect);
 
-    if (button === 2 || altKey) {
+    if (button === 2 || altKey || this.isAiTurnActive()) {
       this.interactionMode = 'orbit';
       this.camera.isUserOrbiting = true;
       this.updateCursorStyle();

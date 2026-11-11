@@ -275,9 +275,20 @@ export const App: React.FC = () => {
   };
 
   const handleSetPlayerCount = (count: number) => {
-    if (count !== telemetry.playerCount) {
+    engineRef.current?.setAiOpponentEnabled(false);
+    if (count !== telemetry.playerCount || telemetry.aiOpponentEnabled) {
       engineRef.current?.resetGame('party', count);
     }
+  };
+
+  const handleToggleVsAi = () => {
+    const next = !telemetry.aiOpponentEnabled;
+    engineRef.current?.setAiOpponentEnabled(next);
+  };
+
+  const handleTogglePolariscope = () => {
+    const next = !telemetry.polariscopeMode;
+    engineRef.current?.setPolariscopeMode(next);
   };
 
   const handleToggleMute = () => {
@@ -368,15 +379,25 @@ export const App: React.FC = () => {
       : '#fca5a5';
 
   const partyTurnLabel = (() => {
+    const vsAi = Boolean(telemetry.aiOpponentEnabled);
+    const nameOf = (idx: number) =>
+      vsAi ? (idx === 0 ? 'You' : 'Glazier AI') : `Player ${idx + 1}`;
+    const shortOf = (idx: number) => (vsAi ? (idx === 0 ? 'You' : 'AI') : `P${idx + 1}`);
     if (telemetry.turnPhase !== 'COLLAPSED') {
+      if (vsAi) {
+        return telemetry.currentPlayer === 0
+          ? 'Your Turn'
+          : telemetry.aiActionLabel ||
+            (telemetry.aiThinking ? 'Glazier AI Reading Stack…' : "Glazier AI's Turn");
+      }
       return `Player ${telemetry.currentPlayer + 1}'s Turn`;
     }
     if (telemetry.blocksStacked === 0) {
-      return `Player ${telemetry.currentPlayer + 1} Toppled`;
+      return `${nameOf(telemetry.currentPlayer)} Toppled`;
     }
-    const winnerNum =
-      ((telemetry.currentPlayer + telemetry.playerCount - 1) % telemetry.playerCount) + 1;
-    return `P${winnerNum} Wins · P${telemetry.currentPlayer + 1} Toppled`;
+    const winnerIdx =
+      (telemetry.currentPlayer + telemetry.playerCount - 1) % telemetry.playerCount;
+    return `${shortOf(winnerIdx)} Wins · ${shortOf(telemetry.currentPlayer)} Toppled`;
   })();
 
   const partyAccentIndex =
@@ -532,21 +553,37 @@ export const App: React.FC = () => {
                       <span className="party-turn-copy">{partyTurnLabel}</span>
                     </div>
                     <div className="party-count-strip" role="group" aria-label="Player Count">
-                      {[2, 3, 4].map((cnt) => (
-                        <QuarryButton
-                          key={cnt}
-                          tone={telemetry.playerCount === cnt ? 'amber' : 'crystal'}
-                          active={telemetry.playerCount === cnt}
-                          soundTone="step"
-                          onAudioDown={playUiDown}
-                          onAudioUp={playUiUp}
-                          className="player-num-pane"
-                          onClick={() => handleSetPlayerCount(cnt)}
-                          title={`${cnt} Players`}
-                        >
-                          <span>{cnt}P</span>
-                        </QuarryButton>
-                      ))}
+                      <QuarryButton
+                        tone={telemetry.aiOpponentEnabled ? 'cobalt' : 'crystal'}
+                        active={Boolean(telemetry.aiOpponentEnabled)}
+                        soundTone="step"
+                        onAudioDown={playUiDown}
+                        onAudioUp={playUiUp}
+                        className="player-num-pane vs-ai-pane"
+                        onClick={handleToggleVsAi}
+                        title="Play vs. Counterfactual Master Glazier AI"
+                      >
+                        <span>AI</span>
+                      </QuarryButton>
+                      {[2, 3, 4].map((cnt) => {
+                        const isCountActive =
+                          !telemetry.aiOpponentEnabled && telemetry.playerCount === cnt;
+                        return (
+                          <QuarryButton
+                            key={cnt}
+                            tone={isCountActive ? 'amber' : 'crystal'}
+                            active={isCountActive}
+                            soundTone="step"
+                            onAudioDown={playUiDown}
+                            onAudioUp={playUiUp}
+                            className="player-num-pane"
+                            onClick={() => handleSetPlayerCount(cnt)}
+                            title={`${cnt} Players`}
+                          >
+                            <span>{cnt}P</span>
+                          </QuarryButton>
+                        );
+                      })}
                     </div>
                   </div>
                 )}
@@ -745,6 +782,32 @@ export const App: React.FC = () => {
                   {telemetry.shatteredCount > 0 ? telemetry.shatteredCount : telemetry.intactCount}
                 </span>
               </div>
+            </div>
+
+            {/* Cross-Polarized Photoelastic Force-Chain Polariscope Toggle */}
+            <div className="polariscope-lens-row">
+              <QuarryButton
+                tone={telemetry.polariscopeMode ? 'teal' : 'crystal'}
+                active={Boolean(telemetry.polariscopeMode)}
+                soundTone="tab"
+                onAudioDown={playUiDown}
+                onAudioUp={playUiUp}
+                className="polariscope-lens-btn"
+                onClick={handleTogglePolariscope}
+                aria-pressed={Boolean(telemetry.polariscopeMode)}
+                title="Toggle Cross-Polarized Photoelastic Force-Chain Lens"
+              >
+                <span
+                  className={`inlaid-gem ${
+                    telemetry.polariscopeMode ? 'gem-teal' : 'gem-opal'
+                  }`}
+                  aria-hidden="true"
+                />
+                <span>Polariscope</span>
+                <span className="polariscope-state-tag">
+                  {telemetry.polariscopeMode ? 'Isochromatic' : 'Natural'}
+                </span>
+              </QuarryButton>
             </div>
           </aside>
         </div>

@@ -174,22 +174,41 @@ export class GlassAudioEngine {
   }
 
   /**
-   * Modulates real-time glass-on-glass sliding resonance while pulling/nudging a block.
+   * Modulates real-time glass-on-glass sliding & torsional stick-slip resonance while pulling/nudging a block.
+   * Accepts optional dissipated frictional power (`slipPowerMilliwatts`) and torsional spin rate (`torsionRadPerSec`)
+   * computed directly from MuJoCo 4.0 `efc_force * efc_vel` (`condim = 4`).
    */
-  public updateSlideFriction(slideSpeedDmPerSec: number, resistance01: number): void {
+  public updateSlideFriction(
+    slideSpeedDmPerSec: number,
+    resistance01: number,
+    slipPowerMilliwatts: number = 0,
+    torsionRadPerSec: number = 0
+  ): void {
     if (!this.ctx || !this.slideGain || !this.slideFilterA || !this.slideFilterB) return;
     const now = this.ctx.currentTime;
-    const speedNorm = Math.min(1.0, Math.max(0.0, (slideSpeedDmPerSec - 0.04) / 4.2));
-    if (this.muted || speedNorm <= 0) {
+    const speedNorm = Math.min(1.0, Math.max(0.0, (slideSpeedDmPerSec - 0.035) / 4.2));
+    const powerNorm = Math.min(1.0, Math.max(0.0, slipPowerMilliwatts / 45.0));
+    const torsionNorm = Math.min(1.0, Math.max(0.0, (Math.abs(torsionRadPerSec) - 0.08) / 2.2));
+    const activeDrive = Math.max(speedNorm, powerNorm * 0.85, torsionNorm * 0.55);
+
+    if (this.muted || activeDrive <= 0) {
       this.slideGain.gain.cancelScheduledValues(now);
       this.slideGain.gain.setValueAtTime(this.slideGain.gain.value, now);
       this.slideGain.gain.linearRampToValueAtTime(0, now + 0.018);
       return;
     }
-    const targetGain = speedNorm * (0.025 + 0.062 * resistance01);
-    this.slideGain.gain.setTargetAtTime(targetGain, now, 0.02);
-    this.slideFilterA.frequency.setTargetAtTime(2100 + speedNorm * 650 + resistance01 * 420, now, 0.025);
-    this.slideFilterB.frequency.setTargetAtTime(3850 + speedNorm * 900 + resistance01 * 560, now, 0.025);
+    const targetGain = activeDrive * (0.025 + 0.062 * resistance01 + 0.028 * powerNorm);
+    this.slideGain.gain.setTargetAtTime(Math.min(0.14, targetGain), now, 0.018);
+    this.slideFilterA.frequency.setTargetAtTime(
+      2100 + speedNorm * 650 + resistance01 * 420 + torsionNorm * 310,
+      now,
+      0.022
+    );
+    this.slideFilterB.frequency.setTargetAtTime(
+      3850 + speedNorm * 900 + resistance01 * 560 + torsionNorm * 780,
+      now,
+      0.022
+    );
   }
 
   /**

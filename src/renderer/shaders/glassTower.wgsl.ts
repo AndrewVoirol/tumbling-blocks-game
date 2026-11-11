@@ -823,6 +823,51 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let grabbed = flags.y;
   let isLegal = flags.z;
   let resistance = flags.w;
+  let polariscope = uBlockCenters[97].w;
+  let pe = clamp((*pBlk).photoelastic, vec4<f32>(0.0), vec4<f32>(1.0));
+
+  // Spatially-Resolved Brewster Stress-Optic Birefringence & Cross-Polarized Polariscope Lens:
+  // Integrates MuJoCo's local 3-zone contact manifold (pe.xyz at local X = -2.5 cm, 0, +2.5 cm) plus
+  // Euler-Bernoulli flexural bending (|uY|) & Jourawski parabolic shear (1 - uY^2) (pe.w) across 3 quadrature
+  // samples along the internal refracted ray chord—so unloaded cantilever ends remain dark while true bearing
+  // fulcrums and bridge spans display physical Hertzian / bending isochromatics!
+  let incLocal = safeNormalize(((*pBlk).worldToLocal * vec4<f32>(incidentDir, 0.0)).xyz, vec3<f32>(0.0, 0.0, 1.0));
+  let rayChord = clamp(intersectLocalSlabRaw(input.localPos + incLocal * 0.001, incLocal).y, 0.06, 0.72);
+  var chordStress = 0.0;
+  for (var si = 0; si < 3; si = si + 1) {
+    let tFrac = 0.18 + f32(si) * 0.32;
+    let pS = input.localPos + incLocal * (rayChord * tFrac);
+    let uX = clamp(pS.x / BLOCK_HX, -1.0, 1.0);
+    let uY = clamp(pS.y / BLOCK_HY, -1.0, 1.0);
+    let uY2 = uY * uY;
+    // Flamant / Saint-Venant contact column spread: tighter near bearing faces (|uY| -> 1), diffusing toward mid-depth
+    let colHalfWidth = 0.25 + 0.11 * (1.0 - uY2);
+    let dNeg = (uX + 0.667) / colHalfWidth;
+    let dMidCol = uX / colHalfWidth;
+    let dPos = (uX - 0.667) / colHalfWidth;
+    let wNeg = exp(-(dNeg * dNeg));
+    let wMid = exp(-(dMidCol * dMidCol));
+    let wPos = exp(-(dPos * dPos));
+    let bearingCol = (pe.x * wNeg + pe.y * wMid + pe.z * wPos) * (0.76 + 0.28 * uY2);
+    // Euler-Bernoulli outer-fiber longitudinal stress + neutral-axis transverse shear
+    let bendSpan = pe.w * (abs(uY) * 1.12 + (1.0 - uY2) * 0.34) * (1.0 - 0.26 * uX * uX);
+    chordStress = chordStress + (bearingCol + bendSpan);
+  }
+  let localPhotoStress = clamp(chordStress * (1.0 / 3.0), 0.0, 1.35);
+  let retardNm = localPhotoStress * (250.0 + 950.0 * (rayChord / 0.28));
+  let phaseRGB = retardNm * vec3<f32>(3.14159265 / 635.0, 3.14159265 / 546.0, 3.14159265 / 455.0);
+  let sinP = sin(phaseRGB);
+  let isochromaticRGB = sinP * sinP;
+
+  if (polariscope > 0.5) {
+    let darkFieldRGB = refractedRGB * 0.14 + reflContrib * 0.42 + sunMicroSpec * 0.45;
+    let stressLum = max(0.24, dot(refractedRGB, vec3<f32>(0.2126, 0.7152, 0.0722)) * 2.15 + 0.22);
+    let stressGate = smoothstep(0.035, 0.42, localPhotoStress);
+    finalRGB = darkFieldRGB + isochromaticRGB * stressLum * stressGate * (1.0 - fresnel * 0.55) + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
+  } else if (localPhotoStress > 0.46 && grabbed < 0.5) {
+    let subtleBiref = smoothstep(0.46, 0.98, localPhotoStress) * 0.055;
+    finalRGB = mix(finalRGB, finalRGB * (0.94 + 0.22 * isochromaticRGB), subtleBiref);
+  }
 
   // Grazing Fresnel glint along surface-breaking hairline cleavage cracks ONLY when aligned with light
   let blkCrack = (*pBlk).crackAndDamage;
