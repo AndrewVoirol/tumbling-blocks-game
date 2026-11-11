@@ -42,15 +42,16 @@ export class OrbitCamera {
 
   public orbitBy(deltaAzimuth: number, deltaElevation: number): void {
     this.targetAzimuth += deltaAzimuth;
-    this.targetElevation = Math.max(0.06, Math.min(1.38, this.targetElevation + deltaElevation));
+    const minElev = this.desiredTargetY > 2.1 ? -0.22 : 0.06;
+    this.targetElevation = Math.max(minElev, Math.min(1.38, this.targetElevation + deltaElevation));
   }
 
   public zoomBy(deltaScale: number): void {
-    this.targetDistance = Math.max(2.35, Math.min(8.2, this.targetDistance * (1 + deltaScale)));
+    this.targetDistance = Math.max(2.35, Math.min(8.6, this.targetDistance * (1 + deltaScale)));
   }
 
   public setFocusHeight(yDm: number): void {
-    this.desiredTargetY = Math.max(0.8, Math.min(4.8, yDm));
+    this.desiredTargetY = Math.max(0.8, Math.min(5.8, yDm));
   }
 
   public focusTopForPlacement(topYDm: number): void {

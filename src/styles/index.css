@@ -331,6 +331,11 @@ body,
   --q-bot: rgba(66, 52, 86, 0.72);
 }
 
+.quarry-tone-grisaille-teal {
+  --q-top: rgba(118, 166, 174, 0.44);
+  --q-bot: rgba(44, 74, 82, 0.72);
+}
+
 /* ============================================================================
  * ZONE 1 (LEFT JAMB): THE ARCHITECTURAL STAINED-GLASS LANCET WINDOW
  * ============================================================================ */
@@ -574,6 +579,142 @@ body,
 .player-num-pane .quarry-etch-content {
   font-size: 10.5px;
   font-weight: 600;
+}
+
+/* Online 2P Internet Room Inlaid Sub-Course */
+.online-subcourse {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.online-lobby-row,
+.online-room-bar,
+.online-status-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  height: 32px;
+  background: var(--lead-came);
+}
+
+.online-host-btn {
+  width: 74px;
+  flex-shrink: 0;
+}
+
+.online-host-btn .quarry-etch-content,
+.online-join-btn .quarry-etch-content,
+.online-action-btn .quarry-etch-content {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.online-code-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  padding: 0 7px;
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #ffffff;
+  background: linear-gradient(135deg, rgba(22, 34, 42, 0.88), rgba(12, 18, 24, 0.94));
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.65), inset 0 0 0 1px rgba(125, 211, 252, 0.24);
+}
+
+.online-code-input::placeholder {
+  font-family: inherit;
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  color: rgba(226, 232, 240, 0.48);
+}
+
+.online-code-input:focus {
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.65), inset 0 0 0 1px rgba(103, 232, 249, 0.68);
+}
+
+.online-join-btn {
+  width: 52px;
+  flex-shrink: 0;
+}
+
+.online-code-plaque {
+  flex: 1;
+  min-width: 0;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  background: linear-gradient(135deg, rgba(24, 62, 72, 0.72), rgba(14, 34, 42, 0.88));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.online-code-caption {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.72);
+}
+
+.online-code-value {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: #fde047;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+}
+
+.online-action-btn {
+  width: 56px;
+  flex-shrink: 0;
+}
+
+.online-leave-btn {
+  width: 44px;
+  flex-shrink: 0;
+}
+
+.online-status-pane {
+  flex: 1;
+  min-width: 0;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  background: linear-gradient(135deg, rgba(54, 72, 76, 0.56), rgba(26, 36, 40, 0.84));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.online-status-left {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.online-ping-pill {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: #a5f3fc;
+  white-space: nowrap;
+}
+
+.online-error-banner {
+  padding: 4px 8px;
+  font-size: 10px;
+  line-height: 1.25;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.78);
 }
 
 /* Sandbox Smash Sub-Course */
