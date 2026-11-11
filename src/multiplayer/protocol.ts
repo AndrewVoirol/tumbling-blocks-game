@@ -196,6 +196,10 @@ export type MultiplayerControlMessage =
       t0: number;
     }
   | {
+      type: 'peer_bye';
+      clientId: string;
+    }
+  | {
       type: 'rtc_signal';
       from: MultiplayerRole;
       signalType: 'offer' | 'answer' | 'candidate';
@@ -280,9 +284,9 @@ const GAME_MODES: readonly GameMode[] = ['solo', 'party', 'sandbox'];
  * Deterministic 32-bit Mulberry32 PRNG (`[0, 1)`).
  */
 export function mulberry32(seed: number): () => number {
-  let a = seed | 0;
+  let a = seed >>> 0;
   return () => {
-    a = (a + 0x6d2b79f5) | 0;
+    a = (a + 0x6d2b79f5) >>> 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
@@ -327,35 +331,95 @@ export function generateRoomSeed(): number {
 }
 
 /**
- * Deterministically computes stained-glass palette swatch, tracery motif, and waterglass ripple phase
- * from `roomSeed` so Host and Guest construct 100% identical cathedral glass towers without `Math.random()`.
+ * Deterministically builds the sequential stained-glass palette swatch, tracery motif, and
+ * waterglass ripple phase table for an `N`-layer tower from `roomSeed`, matching
+ * `MujocoPhysicsEngine.rebuildTower`'s sequential `mulberry32` stream 1:1 (`54/54` parity
+ * across Worker Host, Sync Host, and Guest).
  */
+export function buildDeterministicTowerMaterials(
+  roomSeed: number,
+  towerLayers: number = 18
+): Array<{ swatchId: number; motif: TraceryMotif; rippleSeed: number }> {
+  const paletteLen = STAINED_GLASS_PALETTE.length;
+  const seed = roomSeed >>> 0;
+  const total = Math.max(0, towerLayers * 3);
+  const out: Array<{ swatchId: number; motif: TraceryMotif; rippleSeed: number }> = new Array(
+    total
+  );
+  const seedRng =
+    seed !== 0 ? mulberry32((seed ^ Math.imul(towerLayers, 0x9e3779b9)) >>> 0) : null;
+  let prevRowSwatch0 = -1;
+  let prevRowSwatch1 = -1;
+
+  for (let id = 0; id < total; id++) {
+    const layer = Math.floor(id / 3);
+    const slot = id % 3;
+    let swatchId: number;
+    let motif: TraceryMotif;
+    let rippleSeed: number;
+    if (seedRng) {
+      if (slot === 0) {
+        prevRowSwatch0 = -1;
+        prevRowSwatch1 = -1;
+      }
+      swatchId = Math.floor(seedRng() * paletteLen) % paletteLen;
+      if (slot === 2 && swatchId === prevRowSwatch0 && swatchId === prevRowSwatch1) {
+        swatchId = (swatchId + 1) % paletteLen;
+      }
+      if (slot === 0) prevRowSwatch0 = swatchId;
+      if (slot === 1) prevRowSwatch1 = swatchId;
+      motif = (Math.floor(seedRng() * 4) & 3) as TraceryMotif;
+      rippleSeed = +(0.25 + seedRng() * 96.0).toFixed(5);
+    } else {
+      swatchId = (layer * 3 + slot * 2 + Math.floor(layer / 2)) % paletteLen;
+      motif = 0;
+      rippleSeed = (id + 1) * 1.6180339;
+    }
+    out[id] = { swatchId, motif, rippleSeed };
+  }
+  return out;
+}
+
 export function computeDeterministicBlockMaterial(
   roomSeed: number,
   blockId: number,
   layer: number,
-  slot: number
+  slot: number,
+  towerLayers: number = 18
 ): { swatchId: number; motif: TraceryMotif; rippleSeed: number } {
-  const rng = mulberry32((roomSeed ^ Math.imul(blockId + 1, 0x9e3779b9) ^ (layer * 131 + slot * 17)) | 0);
+  const neededLayers = Math.max(towerLayers, Math.floor(blockId / 3) + 1);
+  if (blockId >= 0 && blockId < towerLayers * 3) {
+    return buildDeterministicTowerMaterials(roomSeed, towerLayers)[blockId];
+  }
+  const rng = mulberry32(
+    ((roomSeed >>> 0) ^ Math.imul(blockId + 1, 0x9e3779b9) ^ (neededLayers * 131 + layer * 17 + slot)) >>> 0
+  );
   const paletteLen = STAINED_GLASS_PALETTE.length;
-  const courseOffset = Math.floor(mulberry32((roomSeed ^ Math.imul(layer + 7, 0x85ebca6b)) | 0)() * paletteLen);
-  const swatchJitter = Math.floor(rng() * paletteLen);
-  const swatchId = (courseOffset + slot * 3 + swatchJitter) % paletteLen;
-  const motifRoll = rng();
-  const motif: TraceryMotif =
-    motifRoll < 0.52 ? 0 : motifRoll < 0.72 ? 1 : motifRoll < 0.88 ? 2 : 3;
-  const rippleSeed = +(0.65 + rng() * 11.5).toFixed(4);
+  const swatchId = Math.floor(rng() * paletteLen) % paletteLen;
+  const motif = (Math.floor(rng() * 4) & 3) as TraceryMotif;
+  const rippleSeed = +(0.25 + rng() * 96.0).toFixed(5);
   return { swatchId, motif, rippleSeed };
 }
 
 export function applyDeterministicTowerPalette(
   blocks: GlassBlockState[],
-  roomSeed: number
+  roomSeed: number,
+  towerLayers?: number
 ): void {
-  const seed = roomSeed >>> 0;
+  const inferredLayers =
+    towerLayers ?? (blocks.length >= 3 ? Math.round(blocks.length / 3) : 18);
+  const materials = buildDeterministicTowerMaterials(roomSeed >>> 0, inferredLayers);
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
-    const mat = computeDeterministicBlockMaterial(seed, b.id, b.initialLayer, b.assignedSlot);
+    const mat =
+      (b.id >= 0 && b.id < materials.length ? materials[b.id] : undefined) ??
+      computeDeterministicBlockMaterial(
+        roomSeed >>> 0,
+        b.id,
+        b.initialLayer,
+        b.assignedSlot,
+        inferredLayers
+      );
     b.swatchId = mat.swatchId;
     b.motif = mat.motif;
     b.rippleSeed = mat.rippleSeed;

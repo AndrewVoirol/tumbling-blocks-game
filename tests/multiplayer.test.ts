@@ -1,16 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import { GameEngine } from '../src/engine/GameEngine';
-import { BLOCK_HALF_X, BLOCK_HALF_Y, BLOCK_HALF_Z, SHARD_SLOT_STRIDE_VERTS } from '../src/physics/constants';
+import {
+  BLOCK_HALF_X,
+  BLOCK_HALF_Y,
+  BLOCK_HALF_Z,
+  SHARD_SLOT_STRIDE_VERTS,
+  STAINED_GLASS_PALETTE,
+} from '../src/physics/constants';
 import { fractureBlockVoronoi } from '../src/physics/voronoiFracture';
 import { quatRotateVec3, Vec3 } from '../src/math/vecMat';
 import {
   applyDeterministicTowerPalette,
+  buildDeterministicTowerMaterials,
   canonicalizeQuatHemisphere,
   decodeMultiplayerStateFrame,
   encodeMultiplayerStateFrame,
   inferShardLocalCentroid,
   MP_MAX_SHARDS_PER_FRAME,
   MP_MAX_SPLINTERS_PER_FRAME,
+  mulberry32,
   MultiplayerControlMessage,
   MultiplayerGuestWorld,
   MultiplayerStateFrame,
@@ -1077,4 +1085,193 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
       (globalThis as unknown as { RTCPeerConnection?: unknown }).RTCPeerConnection = origRtc;
     }
   });
+
+  it('T-MP8: verifies Colosseum M1 (54/54 worker sequential PRNG parity), M2 (zombie RTCDataChannel teardown on Guest reload), and M3 (Place Prism HUD hover isolation)', async () => {
+    // 1. M1: Exact 54/54 sequential mulberry32 parity with MujocoPhysicsEngine.rebuildTower
+    const seed = 0x9c41ef27;
+    const layers = 18;
+    const paletteLen = STAINED_GLASS_PALETTE.length;
+    const refRng = mulberry32((seed ^ Math.imul(layers, 0x9e3779b9)) >>> 0);
+    const materials = buildDeterministicTowerMaterials(seed, layers);
+    expect(materials.length).toBe(54);
+
+    let prev0 = -1;
+    let prev1 = -1;
+    for (let id = 0; id < 54; id++) {
+      const slot = id % 3;
+      if (slot === 0) {
+        prev0 = -1;
+        prev1 = -1;
+      }
+      let expectedSwatch = Math.floor(refRng() * paletteLen) % paletteLen;
+      if (slot === 2 && expectedSwatch === prev0 && expectedSwatch === prev1) {
+        expectedSwatch = (expectedSwatch + 1) % paletteLen;
+      }
+      if (slot === 0) prev0 = expectedSwatch;
+      if (slot === 1) prev1 = expectedSwatch;
+      const expectedMotif = Math.floor(refRng() * 4) & 3;
+      const expectedRipple = +(0.25 + refRng() * 96.0).toFixed(5);
+
+      expect(materials[id].swatchId).toBe(expectedSwatch);
+      expect(materials[id].motif).toBe(expectedMotif);
+      expect(materials[id].rippleSeed).toBe(expectedRipple);
+    }
+
+    // 2. M2: Zombie open RTCDataChannel on Host is torn down immediately when Guest reloads over relay
+    const httpModName = 'node:http';
+    const relayModPath = '../workers/vitrail-rooms/nodeRelay.mjs';
+    const http = (await import(/* @vite-ignore */ httpModName)) as unknown as MinimalHttpModule;
+    const { attachVitrailRoomRelay } = (await import(
+      /* @vite-ignore */ relayModPath
+    )) as unknown as NodeRelayModule;
+
+    const server = http.createServer();
+    const relay = attachVitrailRoomRelay(server, '/__vitrail_mp');
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    const relayUrl = `ws://127.0.0.1:${port}`;
+
+    const host = new GameEngine();
+    const guest1 = new GameEngine();
+    const guestReloaded = new GameEngine();
+    await host.initHeadless();
+    await guest1.initHeadless();
+    await guestReloaded.initHeadless();
+
+    try {
+      const code = host.startOnlineHost('RLD99', {
+        relayUrl,
+        roomSeed: seed,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+      guest1.joinOnlineRoom(code, {
+        relayUrl,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+
+      const pumpPair = async (g: GameEngine, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          host.stepHeadless(1 / 60);
+          g.stepHeadless(1 / 60);
+          await new Promise((r) => setTimeout(r, 4));
+        }
+      };
+
+      await waitUntil(
+        () =>
+          Boolean(host.getTelemetrySnapshot().mpPeerConnected) &&
+          Boolean(guest1.getTelemetrySnapshot().mpPeerConnected),
+        2500
+      );
+      await pumpPair(guest1, 8);
+
+      // Verify 54/54 swatch parity between Host and Guest1 even if Host blocks were dirtied before frame
+      host.physics.blocks[0].swatchId = (host.physics.blocks[0].swatchId + 5) % paletteLen;
+      await pumpPair(guest1, 4);
+      for (let i = 0; i < 54; i++) {
+        expect(host.physics.blocks[i].swatchId).toBe(materials[i].swatchId);
+        expect(guest1.physics.blocks[i].swatchId).toBe(materials[i].swatchId);
+      }
+
+      // Inject a zombie open RTCDataChannel onto Host's multiplayer client (simulating un-timed-out Chromium WebRTC on Guest reload)
+      let zombieCtrlClosed = false;
+      let zombieSentBlackholed = 0;
+      const hostMpInternal = (host as unknown as { mpClient: Record<string, unknown> }).mpClient;
+      hostMpInternal.pcRemoteClientId = 'guest-STALE01';
+      hostMpInternal.ctrlChannel = {
+        readyState: 'open',
+        send: () => {
+          zombieSentBlackholed++;
+        },
+        close: () => {
+          zombieCtrlClosed = true;
+        },
+      };
+      hostMpInternal.stateChannel = {
+        readyState: 'open',
+        bufferedAmount: 0,
+        send: () => {
+          zombieSentBlackholed++;
+        },
+        close: () => {},
+      };
+
+      // Simulate abrupt Guest1 tab reload without clean dispose (new Guest tab connects on relay)
+      guestReloaded.joinOnlineRoom(code, {
+        relayUrl,
+        roomSeed: 0x11111111, // Different initial seed -> must receive room_welcome with `seed`!
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+
+      await waitUntil(() => {
+        host.stepHeadless(1 / 60);
+        guestReloaded.stepHeadless(1 / 60);
+        return (
+          zombieCtrlClosed &&
+          Boolean(guestReloaded.getTelemetrySnapshot().mpPeerConnected) &&
+          guestReloaded.mpRoomSeed === seed
+        );
+      }, 2500);
+
+      expect(zombieCtrlClosed).toBe(true);
+      expect(zombieSentBlackholed).toBe(0);
+      expect(guestReloaded.mpRoomSeed).toBe(seed);
+      for (let i = 0; i < 54; i++) {
+        expect(guestReloaded.physics.blocks[i].swatchId).toBe(materials[i].swatchId);
+      }
+
+      // 3. M3: Passive cursor motion down toward `.prism-release-btn` at bottom HUD must NOT drag carriedLandingPos to corner overhang
+      host.leaveOnlineRoom('solo', 2);
+      for (let i = 0; i < 30; i++) host.stepHeadless(1 / 60);
+
+      const rect = { left: 0, top: 0, width: 1280, height: 800 };
+      host.camera.setPoseImmediate(0.68, 0.42, 4.9, [0, 1.44, 0], rect.width / rect.height);
+      const loose = host.physics.blocks.find((b) => b.assignedLayer === 8 && b.isLooseSlot)!;
+      host.physics.startGrabBlock(
+        loose.id,
+        [0.34, 0, 0],
+        [loose.position[0] + 0.34, loose.position[1], loose.position[2]]
+      );
+      for (let f = 1; f <= 160 && host.physics.turnPhase === 'PULLING'; f++) {
+        host.physics.updateGrabTarget([
+          loose.position[0] + 0.34 + Math.min(1.15, (f / 48) * 1.15),
+          loose.position[1],
+          loose.position[2],
+        ]);
+        host.stepHeadless(1 / 60);
+      }
+      for (let f = 0; f < 30 && !host.physics.isExtractionLiftReady; f++) {
+        host.stepHeadless(1 / 60);
+      }
+      expect(host.physics.turnPhase).toBe('EXTRACTED');
+      expect(host.physics.isExtractionLiftReady).toBe(true);
+      host.physics.endGrab(false);
+
+      // Sweep passive cursor (`activePointerId === null`) across the lower canvas down to `.prism-release-btn`
+      for (let y = 520; y <= 775; y += 25) {
+        host.handlePointerMove(640, y, 99, rect);
+      }
+      expect(
+        Math.hypot(host.physics.carriedLandingPos[0], host.physics.carriedLandingPos[2])
+      ).toBeLessThan(0.01);
+
+      // Click "Place Prism" (`handleReleaseOntoTop`) -> stacks cleanly with 0 collapse!
+      host.handleReleaseOntoTop();
+      for (let f = 0; f < 140 && host.physics.turnPhase === 'SETTLING'; f++) {
+        host.stepHeadless(1 / 60);
+      }
+      expect(host.physics.turnPhase).toBe('SELECT_BLOCK');
+      expect(host.physics.blocksStacked).toBe(1);
+    } finally {
+      guestReloaded.dispose();
+      guest1.dispose();
+      host.dispose();
+      relay.detach();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 15000);
 });

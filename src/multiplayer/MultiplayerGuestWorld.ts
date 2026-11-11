@@ -19,6 +19,7 @@ import {
 } from '../physics/PhysicsWorld';
 import {
   applyDeterministicTowerPalette,
+  computeDeterministicBlockMaterial,
   computeNominalTowerBlockPose,
   MultiplayerStateFrame,
   NetworkAudioEvent,
@@ -248,7 +249,7 @@ export class MultiplayerGuestWorld {
       }
     }
 
-    applyDeterministicTowerPalette(this.blocks, this.roomSeed);
+    applyDeterministicTowerPalette(this.blocks, this.roomSeed, layers);
     this.rebuildOpenTopSlotsFromSupportFrame();
   }
 
@@ -265,7 +266,7 @@ export class MultiplayerGuestWorld {
     ) {
       this.initDeterministicTower(params.initialLayers, params.roomSeed);
     } else {
-      applyDeterministicTowerPalette(this.blocks, params.roomSeed);
+      applyDeterministicTowerPalette(this.blocks, params.roomSeed, params.initialLayers);
       this.shardMap.clear();
       this.shards = [];
       this.lastAcceptedSeq = 0;
@@ -403,13 +404,19 @@ export class MultiplayerGuestWorld {
       const fb = frame.blocks[i];
       let blk = this.blocks[i];
       if (!blk) {
-        const mat = { swatchId: fb.swatchId, motif: fb.motif, rippleSeed: 1.0 + i * 0.618 };
+        const mat = computeDeterministicBlockMaterial(
+          this.roomSeed,
+          i,
+          fb.assignedLayer,
+          fb.assignedSlot,
+          INITIAL_LAYERS
+        );
         blk = {
           id: i,
           bodyHandle: i + 1,
           colliderHandle: i + 1,
-          swatchId: mat.swatchId,
-          motif: mat.motif,
+          swatchId: fb.swatchId,
+          motif: fb.motif,
           rippleSeed: mat.rippleSeed,
           initialLayer: fb.assignedLayer,
           assignedLayer: fb.assignedLayer,
@@ -432,7 +439,6 @@ export class MultiplayerGuestWorld {
         this.blocks.push(blk);
         this.targetBlockPos.push([...fb.position]);
         this.targetBlockQuat.push([...fb.rotation]);
-        applyDeterministicTowerPalette([blk], this.roomSeed);
       }
 
       this.targetBlockPos[i] = [...fb.position];
@@ -450,6 +456,8 @@ export class MultiplayerGuestWorld {
         blk.rotation = quatSlerpHemisphere(blk.rotation, fb.rotation, 1.0);
       }
 
+      blk.swatchId = fb.swatchId;
+      blk.motif = fb.motif;
       blk.damage = fb.damage;
       blk.shattered = fb.shattered;
       blk.extracted = fb.extracted;

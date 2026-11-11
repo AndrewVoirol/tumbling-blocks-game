@@ -6,6 +6,7 @@ import {
   INITIAL_LAYERS,
   LIGHTING_PRESETS,
   SHARD_SLOT_STRIDE_VERTS,
+  TraceryMotif,
 } from '../physics/constants';
 import {
   BlockCriticalityCandidate,
@@ -21,6 +22,7 @@ import { intersectRayOBB, quatRotateVec3, RayOBBHit, Vec3 } from '../math/vecMat
 import { OrbitCamera } from './OrbitCamera';
 import {
   applyDeterministicTowerPalette,
+  buildDeterministicTowerMaterials,
   DecodedBlockFrameState,
   DecodedShardFrameState,
   generateRoomCode,
@@ -187,6 +189,12 @@ export class GameEngine {
   private mpLastGuestCmdSentMs: number = 0;
   private mpLastSentGuestHoverId: number | null = null;
   private mpPendingPullTarget: Vec3 | null = null;
+  private mpExpectedPalette: Array<{
+    swatchId: number;
+    motif: TraceryMotif;
+    rippleSeed: number;
+  }> | null = null;
+  private mpHostBgTimer: ReturnType<typeof setInterval> | null = null;
 
   // Host Voronoi shard & discrete spatial audio replication buffers
   private hostRawConsumeShardUploads: (() => ShardMeshAppendEvent[]) | null = null;
@@ -509,12 +517,17 @@ export class GameEngine {
   }
 
   private shutdownMultiplayerSessionOnly(): void {
+    if (this.mpHostBgTimer !== null) {
+      clearInterval(this.mpHostBgTimer);
+      this.mpHostBgTimer = null;
+    }
     if (this.mpClient) {
       this.mpClient.dispose();
       this.mpClient = null;
     }
     this.mpRole = null;
     this.mpRoomCode = null;
+    this.mpExpectedPalette = null;
     this.mpStatus = {
       active: false,
       role: null,
@@ -534,10 +547,52 @@ export class GameEngine {
     this.hostActiveShardMetas.clear();
   }
 
+  private enforceHostPaletteParity(): void {
+    const palette = this.mpExpectedPalette;
+    if (!palette || !this.physics) return;
+    const blocks = this.physics.blocks;
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      const mat = b.id >= 0 && b.id < palette.length ? palette[b.id] : undefined;
+      if (mat) {
+        b.swatchId = mat.swatchId;
+        b.motif = mat.motif;
+        b.rippleSeed = mat.rippleSeed;
+      }
+    }
+  }
+
+  private startHostBackgroundPump(): void {
+    if (this.mpHostBgTimer !== null) {
+      clearInterval(this.mpHostBgTimer);
+    }
+    this.mpHostBgTimer = setInterval(() => {
+      if (!this.running || this.disposed || this.mpRole !== 'host') return;
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const isOccludedOrStalled =
+        (typeof document !== 'undefined' && document.hidden) || now - this.lastFrameMs > 55;
+      if (!isOccludedOrStalled) return;
+      const dt = Math.min(0.05, Math.max(0.008, (now - this.lastFrameMs) / 1000));
+      this.lastFrameMs = now;
+      this.elapsedSec += dt;
+      if (!this.benchPaused) {
+        this.updateMasterGlazierAi(dt);
+        this.stepPhysicsAndSecondaryAcoustics(dt);
+      }
+      this.pumpMultiplayerStep(now);
+      if (now - this.lastTelemetryEmitMs >= 60) {
+        this.emitTelemetry(false);
+        this.lastTelemetryEmitMs = now;
+      }
+    }, 33);
+  }
+
   private rebuildAuthoritativeTowerWithSeed(seed: number): void {
+    const cleanSeed = seed >>> 0;
+    this.mpExpectedPalette = buildDeterministicTowerMaterials(cleanSeed, INITIAL_LAYERS);
     const physHooks = this.physics as unknown as OptionalPhysicsHooks;
-    physHooks.rebuildTower('party', 2, INITIAL_LAYERS, seed >>> 0);
-    applyDeterministicTowerPalette(this.physics.blocks, seed >>> 0);
+    physHooks.rebuildTower('party', 2, INITIAL_LAYERS, cleanSeed);
+    applyDeterministicTowerPalette(this.physics.blocks, cleanSeed, INITIAL_LAYERS);
     this.hostStagedRendererUploads = [];
     this.hostSlotLocalCentroids.clear();
     this.hostActiveShardMetas.clear();
@@ -833,6 +888,7 @@ export class GameEngine {
     });
     this.mpClient = client;
     client.connect();
+    this.startHostBackgroundPump();
     this.mpStatus = client.getStatus();
     this.emitTelemetry(true);
     return code;
@@ -1032,6 +1088,7 @@ export class GameEngine {
   }
 
   private buildHostStateFrame(): MultiplayerStateFrame {
+    this.enforceHostPaletteParity();
     const blocksLen = this.physics.blocks.length;
     const blocks: DecodedBlockFrameState[] = new Array(blocksLen);
     const wScratch = this.scratchWrench4;
@@ -1137,7 +1194,8 @@ export class GameEngine {
       return;
     }
 
-    // Host role: synchronize new Voronoi shard geometries even while waiting for Guest so reconnects/joins have complete metadata
+    // Host role: synchronize seeded palette & new Voronoi shard geometries even while waiting for Guest so reconnects/joins have complete metadata
+    this.enforceHostPaletteParity();
     this.syncHostShardMetasAndBroadcast();
 
     if (!this.mpStatus.peerConnected) {
@@ -1252,7 +1310,10 @@ export class GameEngine {
         break;
       }
       case 'nudge_placement': {
-        if (this.physics.turnPhase === 'EXTRACTED') {
+        if (
+          this.physics.turnPhase === 'EXTRACTED' &&
+          this.isRayNearTopPlacementZone(cmd.rayOrigin, cmd.rayDir, 0.80)
+        ) {
           this.physics.updateCarriedHover(cmd.rayOrigin, cmd.rayDir);
         }
         break;
@@ -2075,6 +2136,17 @@ export class GameEngine {
     this.updateCursorStyle();
   }
 
+  private isRayNearTopPlacementZone(
+    origin: Vec3,
+    dir: Vec3,
+    maxRadiusDm: number = 0.80
+  ): boolean {
+    const ptTop = this.intersectTopSupportPlane(origin, dir);
+    if (!ptTop) return false;
+    const lc = this.physics.topSupportFrame.layerCenter;
+    return Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < maxRadiusDm;
+  }
+
   public handlePointerMove(
     clientX: number,
     clientY: number,
@@ -2096,7 +2168,10 @@ export class GameEngine {
 
       if (this.mpRole === 'guest') {
         if (this.physics.turnPhase === 'EXTRACTED') {
-          if (now - this.mpLastGuestCmdSentMs >= 15) {
+          if (
+            now - this.mpLastGuestCmdSentMs >= 15 &&
+            this.isRayNearTopPlacementZone(origin, dir, 0.80)
+          ) {
             this.sendGuestRemoteCommand(
               { kind: 'nudge_placement', rayOrigin: origin, rayDir: dir },
               now
@@ -2117,7 +2192,10 @@ export class GameEngine {
         return;
       }
 
-      if (this.physics.turnPhase === 'EXTRACTED') {
+      if (
+        this.physics.turnPhase === 'EXTRACTED' &&
+        this.isRayNearTopPlacementZone(origin, dir, 0.80)
+      ) {
         this.physics.updateCarriedHover(origin, dir);
       }
       if (this.physics.turnPhase === 'SELECT_BLOCK' || this.physics.gameMode === 'sandbox') {
@@ -2415,6 +2493,9 @@ export class GameEngine {
         this.lastPinchDist = dist;
         return;
       }
+    }
+    if (this.activePointerId === null && e.target !== this.canvas) {
+      return;
     }
     this.handlePointerMove(e.clientX, e.clientY, e.pointerId);
   };
