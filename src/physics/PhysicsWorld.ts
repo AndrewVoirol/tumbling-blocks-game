@@ -68,6 +68,97 @@ export interface GlassShardState {
   firstVertex: number;
   vertexCount: number;
   quietSubsteps: number;
+  /** Simulation timestamp (`simTime` in seconds) when this Voronoi shard was spawned */
+  spawnSimTime?: number;
+}
+
+export interface ShardImpactEvent {
+  /** Contact / shard position in Vitrail world decimeters (dm) */
+  pos: [number, number, number];
+  /** Closing normal speed in SI m/s (directly matches GlassAudioEngine ShardChatterImpact.speed) */
+  speed: number;
+  /** Shard mass in SI kg */
+  massKg: number;
+  /** Impacted substrate: oak table ('wood') vs intact block / shard ('glass') */
+  surface: 'wood' | 'glass';
+  /** Active 0..511 shard pool slot index */
+  slotIndex: number;
+}
+
+export interface WobbleRockEvent {
+  blockId: number;
+  tiltAngleRad: number;
+  angularSpeedRadPerSec: number;
+  clampingLoadN: number;
+  worldPos: [number, number, number];
+  surface: 'glass' | 'wood';
+  damage: number;
+}
+
+export interface PhysicsStepResult {
+  substeps: number;
+  simTime: number;
+  /** Top <= 8 energetic post-spawn secondary 3D shard bounces (ignoring initial fracture separation window) */
+  shardImpacts: ShardImpactEvent[];
+  /** Beveled-block Housner rocking / micro-tilt settle impulses */
+  wobbleEvents: WobbleRockEvent[];
+}
+
+export interface PhysicsShardSnapshotMeta {
+  id: number;
+  slotIndex: number;
+  swatchId: number;
+  motif: TraceryMotif;
+  rippleSeed: number;
+  volume: number;
+  massKg: number;
+  impactLocalPos: [number, number, number];
+  planeCount: number;
+  planes: Float32Array;
+  vertexCount: number;
+  renderVertices?: Float32Array;
+}
+
+export interface PhysicsNetworkSnapshot {
+  version: 1;
+  simTime: number;
+  towerSeed: number;
+  initialLayers: number;
+  gameMode: GameMode;
+  turnPhase: TurnPhase;
+  currentPlayer: number;
+  playerCount: number;
+  blocksStacked: number;
+  shatteredCount: number;
+  collapseReason: string | null;
+  activeBlockId: number | null;
+  hoveredSlotIndex: number | null;
+  isPointerDraggingBlock: boolean;
+  grabLocalPoint: [number, number, number];
+  grabWorldAnchor: [number, number, number];
+  grabCurrentWorldOnBlock: [number, number, number];
+  grabResistance01: number;
+  carriedTargetPos: [number, number, number];
+  carriedTargetQuat: [number, number, number, number];
+  carriedLandingPos: [number, number, number];
+  carriedYawOffsetRad: number;
+  /**
+   * Stride = 19 floats per block:
+   * [0..2] posDm, [3..6] quat(xyzw), [7..9] linVelSim, [10..12] angVelSim,
+   * [13] damage, [14..16] crackLocalOrigin, [17] rippleSeed,
+   * [18] packedIntBits (bit0=shattered, bit1=extracted, bit2=isLegalTarget, bit3=isLooseSlot,
+   *      bits 4..9=(assignedLayer + 1) & 0x3f, bits 10..11=assignedSlot, bits 12..15=swatchId, bits 16..17=motif)
+   */
+  blockStride: 19;
+  blockCount: number;
+  blockData: Float32Array;
+  /** 4 floats per block: [-X, 0, +X, bend] Brewster photoelastic stress wrench */
+  blockPhotoelasticWrench: Float32Array;
+  /** Stride = 15 floats per active shard: [0] id, [1] slotIndex, [2..4] posDm, [5..8] quat(xyzw), [9..11] linVelSim, [12..14] angVelSim */
+  shardStride: 15;
+  shardCount: number;
+  shardData: Float32Array;
+  shardMetas?: PhysicsShardSnapshotMeta[];
 }
 
 export interface MicroSplinter {
@@ -142,6 +233,7 @@ export type PhysicsBackendKind = 'mujoco';
 
 export interface PhysicsWorldOptions {
   backend?: PhysicsBackendKind;
+  seed?: number;
 }
 
 export async function ensurePhysicsInitialized(): Promise<void> {
@@ -161,8 +253,13 @@ export class PhysicsWorld {
   constructor(
     audio: GlassAudioEngine,
     initialLayers: number = INITIAL_LAYERS,
-    _options?: PhysicsWorldOptions
+    options?: PhysicsWorldOptions
   ) {
-    return new MujocoPhysicsEngine(audio, initialLayers) as unknown as PhysicsWorld;
+    return new MujocoPhysicsEngine(
+      audio,
+      initialLayers,
+      undefined,
+      options?.seed
+    ) as unknown as PhysicsWorld;
   }
 }

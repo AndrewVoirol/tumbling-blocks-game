@@ -34,11 +34,13 @@ import {
 import {
   buildMujocoTowerXml,
   MJ_CONAFFINITY_BLOCK_OFF_RIM,
+  MJ_CONAFFINITY_BLOCK_ON_TABLE,
   MJ_CONAFFINITY_CULLET_OFF_RIM,
   MJ_CONAFFINITY_CULLET_ON_TABLE,
   MJ_CONAFFINITY_HERO_SHARD_OFF_RIM,
   MJ_CONAFFINITY_HERO_SHARD_ON_TABLE,
   MJ_CONAFFINITY_PARKING,
+  MJ_CONTYPE_BLOCK,
   MJ_CONTYPE_CULLET_SHARD,
   MJ_CONTYPE_HERO_SHARD,
   MJ_PARKING_SHELF_TOP_Y_M,
@@ -63,11 +65,16 @@ import type {
   GlassBlockState,
   GlassShardState,
   MicroSplinter,
+  PhysicsNetworkSnapshot,
+  PhysicsShardSnapshotMeta,
+  PhysicsStepResult,
+  ShardImpactEvent,
   ShardMeshAppendEvent,
   TopPlacementSlot,
   TopSupportFrame,
   TowerTelemetry,
   TurnPhase,
+  WobbleRockEvent,
 } from './PhysicsWorld';
 
 export interface BlockCriticalityCandidate {
@@ -79,6 +86,67 @@ export interface BlockCriticalityCandidate {
   predictedSlideMm: number;
   collapseTriggered: boolean;
   safetyScore01: number;
+}
+
+interface ScratchGeomPairContact {
+  g1: number;
+  g2: number;
+  b1: number;
+  b2: number;
+  fnSum: number;
+  wx: number;
+  wy: number;
+  wz: number;
+  nx: number;
+  ny: number;
+  nz: number;
+}
+
+interface ScratchBlockContactEntry {
+  jnSim: number;
+  fnN: number;
+  localHitDm: Vec3;
+  nAtoB: Vec3;
+  vCloseReal: number;
+}
+
+interface ScratchBlockWrenchAccum {
+  blk: GlassBlockState;
+  dynamicImpulseSim: number;
+  peakDynamicImpulseSim: number;
+  maxVCloseReal: number;
+  bestLocalHitDm: Vec3;
+  bestNormalAtoB: Vec3;
+  bestHitTable: boolean;
+  upwardSupportFn: number;
+  downwardTopFn: number;
+  rockHitTable: boolean;
+  rockWorldPtDm: Vec3;
+  contacts: ScratchBlockContactEntry[];
+}
+
+interface DeferredFractureEntry {
+  blk: GlassBlockState;
+  localHit: Vec3;
+  impactSpeed: number;
+  worldNormal: Vec3;
+  hitTable: boolean;
+  closingSpeedReal: number;
+  isAnvilCrush: boolean;
+  savedPosDm: Vec3;
+  savedQuat: Quat;
+  savedLinVelSim: Vec3;
+  savedAngVelSim: Vec3;
+}
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 const TOP_HOVER_CLEARANCE_DM = 0.040;
@@ -157,6 +225,13 @@ export class MujocoPhysicsEngine {
   public peakHeightCm: number = INITIAL_LAYERS * BLOCK_HEIGHT * 10;
   public lockedMinRow: number | null = INITIAL_LAYERS;
   public lastFractureOriginLocal: Vec3 | null = null;
+  public towerSeed: number = 0;
+  public lastStepResult: PhysicsStepResult = {
+    substeps: 0,
+    simTime: 0,
+    shardImpacts: [],
+    wobbleEvents: [],
+  };
 
   private mj!: MainModule;
   private model: MjModel | null = null;
@@ -206,13 +281,51 @@ export class MujocoPhysicsEngine {
   private bodyToShard = new Map<number, GlassShardState>();
   private cachedClampingLoadN: Float64Array = new Float64Array(0);
   private blockLastCrazeTime = new Map<number, number>();
+  private blockLastImpactAudioTime = new Map<number, number>();
+  private blockLastWobbleTime = new Map<number, number>();
+  private blockRockTransferCount: Uint8Array = new Uint8Array(128);
+  private blockLastRockTime: Float64Array = new Float64Array(128);
   private freeShardSlots: number[] = [];
   private shardQuietSubsteps = new Uint16Array(MAX_ACTIVE_SHARDS);
+  private shardAirborneSubsteps = new Uint16Array(MAX_ACTIVE_SHARDS);
+  private shardHadContactSubstep = new Uint8Array(MAX_ACTIVE_SHARDS);
+  private shardLastImpactSimTime = new Float64Array(MAX_ACTIVE_SHARDS);
+  private shardLastAudioSimTime = new Float64Array(MAX_ACTIVE_SHARDS);
+  private slotRenderVertices: Array<Float32Array | null> = new Array(MAX_ACTIVE_SHARDS).fill(null);
+  private exportedShardIds = new Set<number>();
   private archGeomPos: Float64Array = new Float64Array(0);
   private archGeomQuat: Float64Array = new Float64Array(0);
   private pendingSlotUploads = new Map<number, Float32Array>();
   private shardBufferResetPending: boolean = true;
   private nextShardId: number = 1;
+  private minShardGeomId: number = 0x7fffffff;
+  private maxShardGeomId: number = -1;
+  private sandboxCollapseActive: boolean = false;
+  private deferredFractures: DeferredFractureEntry[] = [];
+  private pendingShardImpacts: ShardImpactEvent[] = [];
+  private pendingWobbleEvents: WobbleRockEvent[] = [];
+  private stepShardCandidates: ShardImpactEvent[] = [];
+  private stepWobbleCandidates: WobbleRockEvent[] = [];
+  private scratchPairMap = new Map<number, ScratchGeomPairContact>();
+  private scratchPairPool: ScratchGeomPairContact[] = [];
+  private scratchBlockImpacts = new Map<number, ScratchBlockWrenchAccum>();
+
+  private photoCap: number = 0;
+  private photoHasVert: Uint8Array = new Uint8Array(0);
+  private photoHasAny: Uint8Array = new Uint8Array(0);
+  private photoTopNeg: Float64Array = new Float64Array(0);
+  private photoTopCtr: Float64Array = new Float64Array(0);
+  private photoTopPos: Float64Array = new Float64Array(0);
+  private photoBotNeg: Float64Array = new Float64Array(0);
+  private photoBotCtr: Float64Array = new Float64Array(0);
+  private photoBotPos: Float64Array = new Float64Array(0);
+  private photoMidShear: Float64Array = new Float64Array(0);
+  private photoTopF: Float64Array = new Float64Array(0);
+  private photoTopAbsX: Float64Array = new Float64Array(0);
+  private photoTopSigX: Float64Array = new Float64Array(0);
+  private photoBotF: Float64Array = new Float64Array(0);
+  private photoBotAbsX: Float64Array = new Float64Array(0);
+  private photoBotSigX: Float64Array = new Float64Array(0);
 
   private carriedRawLocalVL: [number, number] = [0, 0];
   private hasCustomCarriedHover: boolean = false;
@@ -229,6 +342,7 @@ export class MujocoPhysicsEngine {
 
   private accumulatorSec: number = 0;
   private simTime: number = 0;
+  private frameShatterCount: number = 0;
   private isDisposed: boolean = false;
 
   private extraPreStep = new Map<
@@ -239,7 +353,8 @@ export class MujocoPhysicsEngine {
   constructor(
     audio: GlassAudioEngine,
     initialLayers: number = INITIAL_LAYERS,
-    cfg: MujocoCalibratedConfig = MUJOCO_CALIBRATED_CONFIG
+    cfg: MujocoCalibratedConfig = MUJOCO_CALIBRATED_CONFIG,
+    seed?: number
   ) {
     // Reap leaked un-disposed WASM engine instances (e.g. across test cases) before allocating a new MjModel/MjData
     for (let i = liveMujocoEngines.length - 1; i >= 0; i--) {
@@ -255,7 +370,7 @@ export class MujocoPhysicsEngine {
     this.cfg = cfg;
     const rt = getMujocoRuntimeSync();
     this.mj = rt.mj;
-    this.rebuildTower(undefined, undefined, initialLayers);
+    this.rebuildTower(undefined, undefined, initialLayers, seed);
   }
 
   public setListenerPose(camPos: Vec3, camRight: Vec3): void {
@@ -273,6 +388,28 @@ export class MujocoPhysicsEngine {
 
   public getClearContactSubsteps(): number {
     return this.clearContactSubsteps;
+  }
+
+  public getSimTime(): number {
+    return this.simTime;
+  }
+
+  public getInitialLayers(): number {
+    return this.compiledTowerLayers > 0 ? this.compiledTowerLayers : INITIAL_LAYERS;
+  }
+
+  public consumeShardImpacts(): ShardImpactEvent[] {
+    if (this.pendingShardImpacts.length === 0) return [];
+    const out = this.pendingShardImpacts;
+    this.pendingShardImpacts = [];
+    return out;
+  }
+
+  public consumeWobbleEvents(): WobbleRockEvent[] {
+    if (this.pendingWobbleEvents.length === 0) return [];
+    const out = this.pendingWobbleEvents;
+    this.pendingWobbleEvents = [];
+    return out;
   }
 
   public consumePendingShardUploads(): ShardMeshAppendEvent[] {
@@ -296,13 +433,25 @@ export class MujocoPhysicsEngine {
     return false;
   }
 
+  public resetTower(layers?: number, seed?: number): void {
+    const targetLayers =
+      layers !== undefined
+        ? layers
+        : this.compiledTowerLayers > 0
+          ? this.compiledTowerLayers
+          : INITIAL_LAYERS;
+    this.rebuildTower(this.gameMode, this.playerCount, targetLayers, seed);
+  }
+
   public rebuildTower(
     mode?: GameMode,
     players?: number,
-    layers: number = INITIAL_LAYERS
+    layers: number = INITIAL_LAYERS,
+    seed?: number
   ): void {
     if (mode) this.gameMode = mode;
     if (players !== undefined) this.playerCount = Math.max(2, Math.min(4, players));
+    this.towerSeed = seed !== undefined ? seed >>> 0 : 0;
     const towerLayers = Math.max(1, Math.min(32, Math.round(layers)));
     this.audio.updateSlideFriction(0, 0, 0, 0);
 
@@ -384,8 +533,34 @@ export class MujocoPhysicsEngine {
       }
     }
 
+    this.minShardGeomId =
+      this.map.shardGeomIds.length > 0 ? this.map.shardGeomIds[0] : 0x7fffffff;
+    this.maxShardGeomId =
+      this.map.shardGeomIds.length > 0
+        ? this.map.shardGeomIds[this.map.shardGeomIds.length - 1]
+        : -1;
+
     this.worldCompat = new MujocoWorldCompat(this.mj, this.model, this.data, this.map);
     this.shardQuietSubsteps.fill(0);
+    this.shardAirborneSubsteps.fill(0);
+    this.shardHadContactSubstep.fill(0);
+    this.shardLastImpactSimTime.fill(-10);
+    this.shardLastAudioSimTime.fill(-10);
+    this.slotRenderVertices.fill(null);
+    this.exportedShardIds.clear();
+    this.sandboxCollapseActive = false;
+    this.deferredFractures.length = 0;
+    this.pendingShardImpacts = [];
+    this.pendingWobbleEvents = [];
+    this.stepShardCandidates.length = 0;
+    this.stepWobbleCandidates.length = 0;
+    this.frameShatterCount = 0;
+    this.lastStepResult = {
+      substeps: 0,
+      simTime: 0,
+      shardImpacts: [],
+      wobbleEvents: [],
+    };
 
     this.blocks = [];
     this.shards = [];
@@ -418,6 +593,8 @@ export class MujocoPhysicsEngine {
     this.extractionArcTimer = 0;
     this.grabRampSec = 0;
     this.blockLastCrazeTime.clear();
+    this.blockLastImpactAudioTime.clear();
+    this.blockLastWobbleTime.clear();
     this.settleTimer = 0;
     this.accumulatorSec = 0;
     this.simTime = 0;
@@ -435,14 +612,45 @@ export class MujocoPhysicsEngine {
     this.cachedClampingLoadN = new Float64Array(blockCap);
     this.blockPhotoelasticStress01 = new Float32Array(blockCap);
     this.blockPhotoelasticWrench = new Float32Array(blockCap * 4);
+    if (this.blockRockTransferCount.length < blockCap) {
+      this.blockRockTransferCount = new Uint8Array(blockCap);
+      this.blockLastRockTime = new Float64Array(blockCap);
+    }
+    this.blockRockTransferCount.fill(0);
+    this.blockLastRockTime.fill(-10);
+
+    const paletteLen = STAINED_GLASS_PALETTE.length;
+    const seedRng =
+      this.towerSeed !== 0
+        ? mulberry32((this.towerSeed ^ Math.imul(towerLayers, 0x9e3779b9)) >>> 0)
+        : null;
+    let prevRowSwatch0 = -1;
+    let prevRowSwatch1 = -1;
 
     for (const spec of this.map.initialBlocks) {
       const bodyId = this.map.blockBodyIds[spec.id];
       const geomId = this.map.blockGeomIds[spec.id];
-      const swatchId =
-        (spec.layer * 3 + spec.slot * 2 + Math.floor(spec.layer / 2)) %
-        STAINED_GLASS_PALETTE.length;
-      const motif: TraceryMotif = 0;
+      let swatchId: number;
+      let motif: TraceryMotif;
+      let rippleSeed: number;
+      if (seedRng) {
+        if (spec.slot === 0) {
+          prevRowSwatch0 = -1;
+          prevRowSwatch1 = -1;
+        }
+        swatchId = Math.floor(seedRng() * paletteLen) % paletteLen;
+        if (spec.slot === 2 && swatchId === prevRowSwatch0 && swatchId === prevRowSwatch1) {
+          swatchId = (swatchId + 1) % paletteLen;
+        }
+        if (spec.slot === 0) prevRowSwatch0 = swatchId;
+        if (spec.slot === 1) prevRowSwatch1 = swatchId;
+        motif = (Math.floor(seedRng() * 4) & 3) as TraceryMotif;
+        rippleSeed = +(0.25 + seedRng() * 96.0).toFixed(5);
+      } else {
+        swatchId = (spec.layer * 3 + spec.slot * 2 + Math.floor(spec.layer / 2)) % paletteLen;
+        motif = 0;
+        rippleSeed = (spec.id + 1) * 1.6180339;
+      }
 
       const blk: GlassBlockState = {
         id: spec.id,
@@ -450,7 +658,7 @@ export class MujocoPhysicsEngine {
         colliderHandle: geomId,
         swatchId,
         motif,
-        rippleSeed: (spec.id + 1) * 1.6180339,
+        rippleSeed,
         initialLayer: spec.layer,
         assignedLayer: spec.layer,
         assignedSlot: spec.slot,
@@ -556,27 +764,65 @@ export class MujocoPhysicsEngine {
     }
   }
 
+  private ensurePhotoScratchCapacity(nBlocks: number): void {
+    if (this.photoCap >= nBlocks) {
+      this.photoHasVert.fill(0, 0, nBlocks);
+      this.photoHasAny.fill(0, 0, nBlocks);
+      this.photoTopNeg.fill(0, 0, nBlocks);
+      this.photoTopCtr.fill(0, 0, nBlocks);
+      this.photoTopPos.fill(0, 0, nBlocks);
+      this.photoBotNeg.fill(0, 0, nBlocks);
+      this.photoBotCtr.fill(0, 0, nBlocks);
+      this.photoBotPos.fill(0, 0, nBlocks);
+      this.photoMidShear.fill(0, 0, nBlocks);
+      this.photoTopF.fill(0, 0, nBlocks);
+      this.photoTopAbsX.fill(0, 0, nBlocks);
+      this.photoTopSigX.fill(0, 0, nBlocks);
+      this.photoBotF.fill(0, 0, nBlocks);
+      this.photoBotAbsX.fill(0, 0, nBlocks);
+      this.photoBotSigX.fill(0, 0, nBlocks);
+      return;
+    }
+    this.photoCap = Math.max(nBlocks, 96);
+    this.photoHasVert = new Uint8Array(this.photoCap);
+    this.photoHasAny = new Uint8Array(this.photoCap);
+    this.photoTopNeg = new Float64Array(this.photoCap);
+    this.photoTopCtr = new Float64Array(this.photoCap);
+    this.photoTopPos = new Float64Array(this.photoCap);
+    this.photoBotNeg = new Float64Array(this.photoCap);
+    this.photoBotCtr = new Float64Array(this.photoCap);
+    this.photoBotPos = new Float64Array(this.photoCap);
+    this.photoMidShear = new Float64Array(this.photoCap);
+    this.photoTopF = new Float64Array(this.photoCap);
+    this.photoTopAbsX = new Float64Array(this.photoCap);
+    this.photoTopSigX = new Float64Array(this.photoCap);
+    this.photoBotF = new Float64Array(this.photoCap);
+    this.photoBotAbsX = new Float64Array(this.photoCap);
+    this.photoBotSigX = new Float64Array(this.photoCap);
+  }
+
   private refreshClampingLoadsAndPhotoelasticStress(isWarmup: boolean = false): void {
     const m = this.model;
     const d = this.data;
     if (!m || !d || d.ntree_awake === 0) return;
 
     const nBlocks = this.blocks.length;
-    const hasVerticalContact = new Uint8Array(nBlocks);
-    const hasAnyPhotoContact = new Uint8Array(nBlocks);
-    const topZoneNeg = new Float64Array(nBlocks);
-    const topZoneCtr = new Float64Array(nBlocks);
-    const topZonePos = new Float64Array(nBlocks);
-    const botZoneNeg = new Float64Array(nBlocks);
-    const botZoneCtr = new Float64Array(nBlocks);
-    const botZonePos = new Float64Array(nBlocks);
-    const midShear = new Float64Array(nBlocks);
-    const topF = new Float64Array(nBlocks);
-    const topAbsX = new Float64Array(nBlocks);
-    const topSigX = new Float64Array(nBlocks);
-    const botF = new Float64Array(nBlocks);
-    const botAbsX = new Float64Array(nBlocks);
-    const botSigX = new Float64Array(nBlocks);
+    this.ensurePhotoScratchCapacity(nBlocks);
+    const hasVerticalContact = this.photoHasVert;
+    const hasAnyPhotoContact = this.photoHasAny;
+    const topZoneNeg = this.photoTopNeg;
+    const topZoneCtr = this.photoTopCtr;
+    const topZonePos = this.photoTopPos;
+    const botZoneNeg = this.photoBotNeg;
+    const botZoneCtr = this.photoBotCtr;
+    const botZonePos = this.photoBotPos;
+    const midShear = this.photoMidShear;
+    const topF = this.photoTopF;
+    const topAbsX = this.photoTopAbsX;
+    const topSigX = this.photoTopSigX;
+    const botF = this.photoBotF;
+    const botAbsX = this.photoBotAbsX;
+    const botSigX = this.photoBotSigX;
 
     const contacts = d.contact;
     const efc = d.efc_force;
@@ -586,6 +832,9 @@ export class MujocoPhysicsEngine {
     const bodyTreeId = m.body_treeid;
     const treeAsleep = d.tree_asleep;
     const ncon = d.ncon;
+    const minShardGid = this.minShardGeomId;
+    const maxShardGid = this.maxShardGeomId;
+    const parkingGid = this.map.parkingShelfGeomId;
 
     const accumBlockLocalContact = (
       blk: GlassBlockState,
@@ -639,43 +888,53 @@ export class MujocoPhysicsEngine {
     for (let i = 0; i < ncon; i++) {
       const c = contacts.get(i);
       if (!c) continue;
+      const cGeom = c.geom;
+      const g1 = cGeom[0];
+      const g2 = cGeom[1];
+      const nonBlock1 = g1 < 2 || g1 === parkingGid || (g1 >= minShardGid && g1 <= maxShardGid);
+      const nonBlock2 = g2 < 2 || g2 === parkingGid || (g2 >= minShardGid && g2 <= maxShardGid);
+      if (nonBlock1 && nonBlock2) {
+        c.delete();
+        continue;
+      }
       const adr = c.efc_address;
       if (adr >= 0) {
         const fn = Math.max(0, efc[adr]);
         if (fn > 1e-4) {
-          const b1 = geomBodyId[c.geom[0]];
-          const b2 = geomBodyId[c.geom[1]];
-          const ft = c.dim >= 3 ? Math.hypot(efc[adr + 1], efc[adr + 2]) : 0;
-          const cPos = c.pos;
-          const wxDm = cPos[0] * DM_PER_M;
-          const wyDm = cPos[1] * DM_PER_M;
-          const wzDm = cPos[2] * DM_PER_M;
+          const b1 = geomBodyId[g1];
+          const b2 = geomBodyId[g2];
+          const blk1 = !nonBlock1 && b1 >= 2 ? this.bodyToBlock.get(b1) : undefined;
+          const blk2 = !nonBlock2 && b2 >= 2 ? this.bodyToBlock.get(b2) : undefined;
+          if ((blk1 && !blk1.shattered && !blk1.extracted) || (blk2 && !blk2.shattered && !blk2.extracted)) {
+            const ft = c.dim >= 3 ? Math.hypot(efc[adr + 1], efc[adr + 2]) : 0;
+            const cPos = c.pos;
+            const wxDm = cPos[0] * DM_PER_M;
+            const wyDm = cPos[1] * DM_PER_M;
+            const wzDm = cPos[2] * DM_PER_M;
 
-          const blk1 = b1 >= 2 ? this.bodyToBlock.get(b1) : undefined;
-          const blk2 = b2 >= 2 ? this.bodyToBlock.get(b2) : undefined;
+            if (blk1 && !blk1.shattered && !blk1.extracted) {
+              accumBlockLocalContact(blk1, wxDm, wyDm, wzDm, fn, ft);
+            }
+            if (blk2 && !blk2.shattered && !blk2.extracted) {
+              accumBlockLocalContact(blk2, wxDm, wyDm, wzDm, fn, ft);
+            }
 
-          if (blk1 && !blk1.shattered && !blk1.extracted) {
-            accumBlockLocalContact(blk1, wxDm, wyDm, wzDm, fn, ft);
-          }
-          if (blk2 && !blk2.shattered && !blk2.extracted) {
-            accumBlockLocalContact(blk2, wxDm, wyDm, wzDm, fn, ft);
-          }
-
-          if (blk1 && blk2 && !blk1.shattered && !blk2.shattered && !blk1.extracted && !blk2.extracted) {
-            const y1 = xpos[b1 * 3 + 1];
-            const y2 = xpos[b2 * 3 + 1];
-            if (y2 > y1 + 0.0068 && blk1.id < nBlocks) {
-              if (hasVerticalContact[blk1.id] === 0) {
-                hasVerticalContact[blk1.id] = 1;
-                this.cachedClampingLoadN[blk1.id] = 0;
+            if (blk1 && blk2 && !blk1.shattered && !blk2.shattered && !blk1.extracted && !blk2.extracted) {
+              const y1 = xpos[b1 * 3 + 1];
+              const y2 = xpos[b2 * 3 + 1];
+              if (y2 > y1 + 0.0068 && blk1.id < nBlocks) {
+                if (hasVerticalContact[blk1.id] === 0) {
+                  hasVerticalContact[blk1.id] = 1;
+                  this.cachedClampingLoadN[blk1.id] = 0;
+                }
+                this.cachedClampingLoadN[blk1.id] += fn;
+              } else if (y1 > y2 + 0.0068 && blk2.id < nBlocks) {
+                if (hasVerticalContact[blk2.id] === 0) {
+                  hasVerticalContact[blk2.id] = 1;
+                  this.cachedClampingLoadN[blk2.id] = 0;
+                }
+                this.cachedClampingLoadN[blk2.id] += fn;
               }
-              this.cachedClampingLoadN[blk1.id] += fn;
-            } else if (y1 > y2 + 0.0068 && blk2.id < nBlocks) {
-              if (hasVerticalContact[blk2.id] === 0) {
-                hasVerticalContact[blk2.id] = 1;
-                this.cachedClampingLoadN[blk2.id] = 0;
-              }
-              this.cachedClampingLoadN[blk2.id] += fn;
             }
           }
         }
@@ -1457,6 +1716,7 @@ export class MujocoPhysicsEngine {
 
   public triggerSandboxCollapseImpulse(): void {
     if (!this.model || !this.data) return;
+    this.sandboxCollapseActive = true;
     this.wakeTowerForInteraction();
     for (const b of this.blocks) {
       if (b.shattered) continue;
@@ -1998,31 +2258,71 @@ export class MujocoPhysicsEngine {
 
   /**
    * Evaluates 6D contact wrenches (`efc_force`), reduced-mass impact strain energy, opposing-wrench anvil crush,
-   * and three-point flexural bending stress across all active MuJoCo contacts!
+   * three-point flexural bending stress, Housner beveled-prism rocking transfers, and secondary 3D shard bounces!
    */
   private processWrenchCollisionsAndFractures(subDtSec: number): void {
     const m = this.model;
     const d = this.data;
-    if (!m || !d || d.ncon === 0) return;
+    if (!m || !d) return;
 
-    interface BlockWrenchAccum {
-      blk: GlassBlockState;
-      dynamicImpulseSim: number;
-      peakDynamicImpulseSim: number;
-      maxVCloseReal: number;
-      bestLocalHitDm: Vec3;
-      bestNormalAtoB: Vec3;
-      bestHitTable: boolean;
-      contacts: Array<{
-        jnSim: number;
-        fnN: number;
-        localHitDm: Vec3;
-        nAtoB: Vec3;
-        vCloseReal: number;
-      }>;
+    let didAnyFractureSyncNeeded = false;
+    const useFrameShatterCap = this.sandboxCollapseActive || this.shards.length >= 160;
+    const maxShattersPerFrame = useFrameShatterCap ? 2 : 5;
+    if (this.deferredFractures.length > 0 && this.frameShatterCount < maxShattersPerFrame) {
+      while (
+        this.deferredFractures.length > 0 &&
+        this.frameShatterCount < maxShattersPerFrame
+      ) {
+        const def = this.deferredFractures.shift()!;
+        if (!def.blk.shattered) {
+          this.shatterBlock(
+            def.blk,
+            def.localHit,
+            def.impactSpeed,
+            def.worldNormal,
+            def.hitTable,
+            {
+              closingSpeedReal: def.closingSpeedReal,
+              isAnvilCrush: def.isAnvilCrush,
+              skipSyncKinematics: true,
+              savedPoseAndVel: {
+                posDm: def.savedPosDm,
+                quat: def.savedQuat,
+                linVelSim: def.savedLinVelSim,
+                angVelSim: def.savedAngVelSim,
+              },
+            }
+          );
+          didAnyFractureSyncNeeded = true;
+          this.frameShatterCount++;
+        }
+      }
     }
 
-    const blockImpacts = new Map<number, BlockWrenchAccum>();
+    const ncon = d.ncon;
+    if (ncon === 0) {
+      if (this.shards.length > 0) {
+        const bodyTreeId = m.body_treeid;
+        const treeAsleep = d.tree_asleep;
+        for (let i = 0; i < this.shards.length; i++) {
+          const s = this.shards[i];
+          const treeId = bodyTreeId[s.bodyHandle];
+          if (treeId < 0 || treeAsleep[treeId] < 0) {
+            this.shardAirborneSubsteps[s.slotIndex] = Math.min(
+              65535,
+              this.shardAirborneSubsteps[s.slotIndex] + 1
+            );
+          }
+        }
+      }
+      if (didAnyFractureSyncNeeded) {
+        this.worldCompat.syncKinematics();
+      }
+      return;
+    }
+
+    const blockImpacts = this.scratchBlockImpacts;
+    blockImpacts.clear();
     const shardAudioEvents: Array<{
       energy: number;
       intensity01: number;
@@ -2035,8 +2335,20 @@ export class MujocoPhysicsEngine {
     const efc = d.efc_force;
     const bodyMass = m.body_mass;
     const geomBodyId = m.geom_bodyid;
-    const ncon = d.ncon;
+    const qpos = d.qpos;
+    const qvel = d.qvel;
+    const bodyTreeId = m.body_treeid;
+    const treeAsleep = d.tree_asleep;
     const dtSim = subDtSec * SIM_TIME_SCALE;
+    const minShardGid = this.minShardGeomId;
+    const maxShardGid = this.maxShardGeomId;
+    const parkingGid = this.map.parkingShelfGeomId;
+    const tableGid = this.map.tableGeomId;
+    const shardTableGid = this.map.shardTableGeomId;
+
+    if (this.shards.length > 0) {
+      this.shardHadContactSubstep.fill(0);
+    }
 
     const recordForBlock = (
       blkA: GlassBlockState,
@@ -2077,7 +2389,7 @@ export class MujocoPhysicsEngine {
         Math.max(-BLOCK_HALF_Y, Math.min(BLOCK_HALF_Y, rawLocal[1])),
         Math.max(-BLOCK_HALF_Z, Math.min(BLOCK_HALF_Z, rawLocal[2])),
       ];
-      const hitTable = otherGeomId === this.map.tableGeomId;
+      const hitTable = otherGeomId === tableGid || otherGeomId === shardTableGid;
 
       let acc = blockImpacts.get(blkA.id);
       if (!acc) {
@@ -2089,9 +2401,21 @@ export class MujocoPhysicsEngine {
           bestLocalHitDm: localHitDm,
           bestNormalAtoB: nAtoB,
           bestHitTable: hitTable,
+          upwardSupportFn: 0,
+          downwardTopFn: 0,
+          rockHitTable: hitTable,
+          rockWorldPtDm: worldPtDm,
           contacts: [],
         };
         blockImpacts.set(blkA.id, acc);
+      }
+
+      if (nAtoB[1] < -0.75) {
+        acc.upwardSupportFn += fnN;
+        if (hitTable) acc.rockHitTable = true;
+        acc.rockWorldPtDm = worldPtDm;
+      } else if (nAtoB[1] > 0.75) {
+        acc.downwardTopFn += fnN;
       }
 
       // Mass-ratio-weighted effective closing speed so a 5g upward-bouncing shard grazing a 71.1g block
@@ -2113,57 +2437,92 @@ export class MujocoPhysicsEngine {
     };
 
     // First coalesce multi-point contacts (`multiccd` generates 2-4 vertices per geom pair) by `(g1, g2)` pair
-    // so total pair normal force `fnPair` matches the physical manifold resultant!
-    interface GeomPairContact {
-      g1: number;
-      g2: number;
-      b1: number;
-      b2: number;
-      fnSum: number;
-      wx: number;
-      wy: number;
-      wz: number;
-      nx: number;
-      ny: number;
-      nz: number;
-    }
-    const pairMap = new Map<number, GeomPairContact>();
+    // using a zero-GC pooled map and single Embind view reads per contact!
+    const pairMap = this.scratchPairMap;
+    pairMap.clear();
+    let poolUsed = 0;
 
     for (let i = 0; i < ncon; i++) {
       const c = contacts.get(i);
       if (!c) continue;
       const adr = c.efc_address;
       if (adr >= 0) {
-        const fnN = Math.max(0, efc[adr]);
-        if (fnN > 0.02) {
-          const g1 = c.geom[0];
-          const g2 = c.geom[1];
-          if (g1 !== this.map.parkingShelfGeomId && g2 !== this.map.parkingShelfGeomId) {
-            const key = g1 * 4096 + g2;
-            let pm = pairMap.get(key);
-            if (!pm) {
-              pm = {
-                g1,
-                g2,
-                b1: geomBodyId[g1],
-                b2: geomBodyId[g2],
-                fnSum: 0,
-                wx: 0,
-                wy: 0,
-                wz: 0,
-                nx: 0,
-                ny: 0,
-                nz: 0,
-              };
-              pairMap.set(key, pm);
+        const fnN = efc[adr];
+        if (fnN > 0.004) {
+          const cGeom = c.geom;
+          const g1 = cGeom[0];
+          const g2 = cGeom[1];
+          if (g1 !== parkingGid && g2 !== parkingGid) {
+            const isShard1 = g1 >= minShardGid && g1 <= maxShardGid;
+            const isShard2 = g2 >= minShardGid && g2 <= maxShardGid;
+            if (isShard1) this.shardHadContactSubstep[g1 - minShardGid] = 1;
+            if (isShard2) this.shardHadContactSubstep[g2 - minShardGid] = 1;
+
+            const isTable1 = g1 === tableGid || g1 === shardTableGid;
+            const isTable2 = g2 === tableGid || g2 === shardTableGid;
+            const isShardOnlyOrTablePair = (isShard1 || isTable1) && (isShard2 || isTable2);
+            let shouldRecordPair = true;
+            if (isShardOnlyOrTablePair) {
+              const s1 = g1 - minShardGid;
+              const s2 = g2 - minShardGid;
+              const ready1 =
+                isShard1 &&
+                this.shardAirborneSubsteps[s1] >= 3 &&
+                this.simTime - this.shardLastImpactSimTime[s1] >= 0.032;
+              const ready2 =
+                isShard2 &&
+                this.shardAirborneSubsteps[s2] >= 3 &&
+                this.simTime - this.shardLastImpactSimTime[s2] >= 0.032;
+              shouldRecordPair = ready1 || ready2;
             }
-            pm.fnSum += fnN;
-            pm.wx += c.pos[0] * DM_PER_M * fnN;
-            pm.wy += c.pos[1] * DM_PER_M * fnN;
-            pm.wz += c.pos[2] * DM_PER_M * fnN;
-            pm.nx += c.frame[0] * fnN;
-            pm.ny += c.frame[1] * fnN;
-            pm.nz += c.frame[2] * fnN;
+
+            if (shouldRecordPair) {
+              const key = g1 * 4096 + g2;
+              let pm = pairMap.get(key);
+              if (!pm) {
+                if (poolUsed < this.scratchPairPool.length) {
+                  pm = this.scratchPairPool[poolUsed++];
+                  pm.g1 = g1;
+                  pm.g2 = g2;
+                  pm.b1 = geomBodyId[g1];
+                  pm.b2 = geomBodyId[g2];
+                  pm.fnSum = 0;
+                  pm.wx = 0;
+                  pm.wy = 0;
+                  pm.wz = 0;
+                  pm.nx = 0;
+                  pm.ny = 0;
+                  pm.nz = 0;
+                } else {
+                  pm = {
+                    g1,
+                    g2,
+                    b1: geomBodyId[g1],
+                    b2: geomBodyId[g2],
+                    fnSum: 0,
+                    wx: 0,
+                    wy: 0,
+                    wz: 0,
+                    nx: 0,
+                    ny: 0,
+                    nz: 0,
+                  };
+                  this.scratchPairPool.push(pm);
+                  poolUsed++;
+                }
+                pairMap.set(key, pm);
+              }
+              const cPos = c.pos;
+              const cFrame = c.frame;
+              const fDm = DM_PER_M * fnN;
+              pm.fnSum += fnN;
+              pm.wx += cPos[0] * fDm;
+              pm.wy += cPos[1] * fDm;
+              pm.wz += cPos[2] * fDm;
+              pm.nx += cFrame[0] * fnN;
+              pm.ny += cFrame[1] * fnN;
+              pm.nz += cFrame[2] * fnN;
+            }
           }
         }
       }
@@ -2177,7 +2536,7 @@ export class MujocoPhysicsEngine {
 
     for (const pm of pairMap.values()) {
       const fnN = pm.fnSum;
-      if (fnN <= 0.05) continue;
+      if (fnN <= 0.005) continue;
       const invFn = 1.0 / fnN;
       const worldPtDm: Vec3 = [pm.wx * invFn, pm.wy * invFn, pm.wz * invFn];
       const nLen = Math.hypot(pm.nx, pm.ny, pm.nz) || 1.0;
@@ -2186,35 +2545,107 @@ export class MujocoPhysicsEngine {
       const jnSim = fnN * tauImpactSim;
 
       const { g1, g2, b1, b2 } = pm;
-      const blk1 = this.bodyToBlock.get(b1);
-      const blk2 = this.bodyToBlock.get(b2);
-      if (blk1) recordForBlock(blk1, b2, g2, worldPtDm, n1to2, fnN, jnSim);
-      if (blk2) recordForBlock(blk2, b1, g1, worldPtDm, n2to1, fnN, jnSim);
+      if (fnN > 0.025) {
+        const blk1 = b1 >= 2 ? this.bodyToBlock.get(b1) : undefined;
+        const blk2 = b2 >= 2 ? this.bodyToBlock.get(b2) : undefined;
+        if (blk1) recordForBlock(blk1, b2, g2, worldPtDm, n1to2, fnN, jnSim);
+        if (blk2) recordForBlock(blk2, b1, g1, worldPtDm, n2to1, fnN, jnSim);
+      }
 
-      const shd1 = this.bodyToShard.get(b1);
-      const shd2 = this.bodyToShard.get(b2);
+      const shd1 = b1 >= 2 ? this.bodyToShard.get(b1) : undefined;
+      const shd2 = b2 >= 2 ? this.bodyToShard.get(b2) : undefined;
       if (shd1 || shd2) {
-        const primaryShard = shd1 ?? shd2!;
-        const v1 = this.getPreStepPointVelSim(b1, worldPtDm);
-        const v2 = this.getPreStepPointVelSim(b2, worldPtDm);
-        const dvReal =
-          Math.hypot(v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2]) * SIM_TIME_SCALE;
-        if (dvReal > 2.2 && jnSim > 0.001) {
+        const ready1 =
+          shd1 !== undefined &&
+          this.shardAirborneSubsteps[shd1.slotIndex] >= 3 &&
+          this.simTime - this.shardLastImpactSimTime[shd1.slotIndex] >= 0.032;
+        const ready2 =
+          shd2 !== undefined &&
+          this.shardAirborneSubsteps[shd2.slotIndex] >= 3 &&
+          this.simTime - this.shardLastImpactSimTime[shd2.slotIndex] >= 0.032;
+        const primaryShard =
+          shd1 && shd2
+            ? ready1 && ready2
+              ? shd1.massKg >= shd2.massKg
+                ? shd1
+                : shd2
+              : ready1
+                ? shd1
+                : shd2
+            : (shd1 ?? shd2!);
+        const slotIdx = primaryShard.slotIndex;
+        const ageSec = this.simTime - (primaryShard.spawnSimTime ?? 0);
+
+        // Ignore initial 22 ms fracture sibling-separation window for both audio & secondary bounce telemetry!
+        if (ageSec >= 0.022) {
+          const v1 = this.getPreStepPointVelSim(b1, worldPtDm);
+          const v2 = this.getPreStepPointVelSim(b2, worldPtDm);
+          const relAlongN =
+            (v2[0] - v1[0]) * n1to2[0] +
+            (v2[1] - v1[1]) * n1to2[1] +
+            (v2[2] - v1[2]) * n1to2[2];
+          // Closing normal speed in SI m/s (`1 v_sim = 1/sqrt(10) m/s`)
+          const vCloseMps = Math.max(0.0, -relAlongN) / FROUDE_VEL_SCALE;
+          const dvReal =
+            Math.hypot(v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2]) * SIM_TIME_SCALE;
           const hitTable =
-            g1 === this.map.tableGeomId ||
-            g2 === this.map.tableGeomId ||
-            g1 === this.map.shardTableGeomId ||
-            g2 === this.map.shardTableGeomId;
-          const effMass =
-            shd1 && shd2 ? Math.min(shd1.massKg, shd2.massKg) : primaryShard.massKg;
-          shardAudioEvents.push({
-            energy: effMass * dvReal * dvReal,
-            intensity01: Math.min(1.0, (dvReal - 1.8) / 14.0),
-            volumeDm3: primaryShard.volume,
-            worldPos: [...primaryShard.prePos],
-            hitGlass: !hitTable,
-          });
+            g1 === tableGid ||
+            g2 === tableGid ||
+            g1 === shardTableGid ||
+            g2 === shardTableGid;
+
+          // Require genuine >= 1.0 mm airborne hop (`vCloseMps >= 0.14 m/s`, `>= 3` contact-free substeps) + 32 ms per-slot cooldown
+          // so each physical 3D shard bounce emits 1 discrete ShardImpactEvent without substep or sub-mm settle chatter!
+          if (
+            vCloseMps >= 0.14 &&
+            this.shardAirborneSubsteps[slotIdx] >= 3 &&
+            this.simTime - this.shardLastImpactSimTime[slotIdx] >= 0.032
+          ) {
+            this.shardLastImpactSimTime[slotIdx] = this.simTime;
+            this.shardAirborneSubsteps[slotIdx] = 0;
+            this.stepShardCandidates.push({
+              pos: [worldPtDm[0], worldPtDm[1], worldPtDm[2]],
+              speed: vCloseMps,
+              massKg: primaryShard.massKg,
+              surface: hitTable ? 'wood' : 'glass',
+              slotIndex: slotIdx,
+            });
+
+            if (
+              dvReal > 2.2 &&
+              jnSim > 0.001 &&
+              this.simTime - this.shardLastAudioSimTime[slotIdx] >= 0.028
+            ) {
+              this.shardLastAudioSimTime[slotIdx] = this.simTime;
+              const effMass =
+                shd1 && shd2 ? Math.min(shd1.massKg, shd2.massKg) : primaryShard.massKg;
+              shardAudioEvents.push({
+                energy: effMass * dvReal * dvReal,
+                intensity01: Math.min(1.0, (dvReal - 1.8) / 14.0),
+                volumeDm3: primaryShard.volume,
+                worldPos: [...primaryShard.prePos],
+                hitGlass: !hitTable,
+              });
+            }
+          }
         }
+      }
+    }
+
+    // Update airborne substep counters for all active shards after inspecting pair contacts
+    for (let i = 0; i < this.shards.length; i++) {
+      const s = this.shards[i];
+      const slot = s.slotIndex;
+      if (this.shardHadContactSubstep[slot] === 0) {
+        const treeId = bodyTreeId[s.bodyHandle];
+        if (treeId < 0 || treeAsleep[treeId] < 0) {
+          this.shardAirborneSubsteps[slot] = Math.min(
+            65535,
+            this.shardAirborneSubsteps[slot] + 1
+          );
+        }
+      } else {
+        this.shardAirborneSubsteps[slot] = 0;
       }
     }
 
@@ -2226,7 +2657,12 @@ export class MujocoPhysicsEngine {
       );
     }
 
-    if (blockImpacts.size === 0) return;
+    if (blockImpacts.size === 0) {
+      if (didAnyFractureSyncNeeded) {
+        this.worldCompat.syncKinematics();
+      }
+      return;
+    }
 
     const blocksToShatter: Array<{
       blk: GlassBlockState;
@@ -2239,8 +2675,130 @@ export class MujocoPhysicsEngine {
     }> = [];
 
     for (const acc of blockImpacts.values()) {
-      if (acc.maxVCloseReal <= 1.5 || acc.dynamicImpulseSim <= 0) continue;
       const blk = acc.blk;
+      let didEmitWobbleForBlock = false;
+
+      // 0. Housner Beveled-Prism Rocking Restitution & Discrete Opposite-Edge `WobbleRockEvent` Emission!
+      // When a tilted horizontal glass prism slaps flat across its bottom face, MuJoCo's overdamped
+      // `contactSolref = [0.0042, 1.12]` (`zeta = 1.12 > 1`) quenches angular velocity on the first slap.
+      // For unloaded blocks (`cachedClampingLoadN < 0.38 N`, not grabbed/extracted), transfer dissipative
+      // soda-lime glass Housner-Hertzian angular momentum onto the opposite bevel pivot (`v_y^+ = |w^+| * b_half`)
+      // and emit discrete `WobbleRockEvent`s on both squat horizontal bevel slaps and upright Housner pivot crossings!
+      if (
+        acc.upwardSupportFn > 0.06 &&
+        !blk.shattered &&
+        !blk.extracted &&
+        blk.id !== this.activeBlockId
+      ) {
+        const info = this.worldCompat.getMapping(blk.bodyHandle);
+        if (info && info.enabled) {
+          const preWxSi = blk.angVel[0] * FROUDE_VEL_SCALE;
+          const preWzSi = blk.angVel[2] * FROUDE_VEL_SCALE;
+          const preWhSi = Math.hypot(preWxSi, preWzSi);
+          const preVyMps = blk.linVel[1] / FROUDE_VEL_SCALE;
+          const preVhMps = Math.hypot(blk.linVel[0], blk.linVel[2]) / FROUDE_VEL_SCALE;
+
+          if (preWhSi >= 0.30 && preWhSi <= 22.0 && Math.abs(preVyMps) < 0.55 && preVhMps < 0.45) {
+            const adr = info.qposAdr;
+            const dof = info.dofAdr;
+            const postQuat: Quat = [qpos[adr + 4], qpos[adr + 5], qpos[adr + 6], qpos[adr + 3]];
+            const postWWorldSi = quatRotateVec3(postQuat, [
+              qvel[dof + 3],
+              qvel[dof + 4],
+              qvel[dof + 5],
+            ]);
+            const dotAlongPre =
+              (preWxSi * postWWorldSi[0] + preWzSi * postWWorldSi[2]) / preWhSi;
+            const clampLoadN =
+              blk.id < this.cachedClampingLoadN.length ? this.cachedClampingLoadN[blk.id] : 0;
+
+            const upVec = quatRotateVec3(postQuat, [0, 1, 0]);
+            const absUpY = Math.abs(upVec[1]);
+            const preUpVec = quatRotateVec3(blk.preQuat, [0, 1, 0]);
+            const tiltRad = Math.acos(
+              Math.max(-1, Math.min(1, Math.min(absUpY, Math.abs(preUpVec[1]))))
+            );
+
+            const isUnloadedSquatSlap =
+              this.turnPhase !== 'PULLING' &&
+              this.turnPhase !== 'COLLAPSED' &&
+              !this.sandboxCollapseActive &&
+              clampLoadN < 0.38 &&
+              acc.downwardTopFn < 0.28 &&
+              absUpY > 0.9984 &&
+              preWhSi >= 0.32 &&
+              dotAlongPre < 0.45 * preWhSi;
+
+            if (
+              isUnloadedSquatSlap &&
+              blk.id < this.blockRockTransferCount.length &&
+              this.simTime - this.blockLastRockTime[blk.id] >= 0.014
+            ) {
+              if (this.simTime - this.blockLastRockTime[blk.id] > 0.60) {
+                this.blockRockTransferCount[blk.id] = 0;
+              }
+              const kRock = this.blockRockTransferCount[blk.id];
+              if (kRock < 5) {
+                const ux = preWxSi / preWhSi;
+                const uz = preWzSi / preWhSi;
+                const uLocal = quatInverseRotateVec3(postQuat, [ux, 0, uz]);
+                const bHalfM = Math.max(
+                  0.008,
+                  Math.abs(uLocal[0]) * 0.01125 + Math.abs(uLocal[2]) * 0.03625
+                );
+                const eRock = (acc.rockHitTable ? 0.74 : 0.76) * Math.pow(0.88, kRock);
+                const newWhSi = Math.min(9.5, preWhSi * eRock);
+                if (newWhSi >= 0.25) {
+                  const targetWBody = quatInverseRotateVec3(postQuat, [
+                    ux * newWhSi,
+                    postWWorldSi[1] * 0.45,
+                    uz * newWhSi,
+                  ]);
+                  qvel[dof + 3] = targetWBody[0];
+                  qvel[dof + 4] = targetWBody[1];
+                  qvel[dof + 5] = targetWBody[2];
+                  if (acc.rockHitTable && qpos[adr + 1] < BLOCK_HALF_Y * M_PER_DM + 0.00008) {
+                    qpos[adr + 1] = BLOCK_HALF_Y * M_PER_DM + 0.00008;
+                  }
+                  const pivotVyMps = Math.min(0.20, newWhSi * bHalfM * 1.12 + 0.004);
+                  if (qvel[dof + 1] < pivotVyMps) {
+                    qvel[dof + 1] = pivotVyMps;
+                  }
+                  info.quietTicks = 0;
+                  info.settledAsleep = false;
+                  this.blockRockTransferCount[blk.id] = kRock + 1;
+                  this.blockLastRockTime[blk.id] = this.simTime;
+                  didEmitWobbleForBlock = true;
+                }
+              }
+            }
+
+            const isSlapImpulse =
+              didEmitWobbleForBlock ||
+              (dotAlongPre < 0.62 * preWhSi && acc.maxVCloseReal < CRAZE_IMPACT_SPEED * 0.68);
+            const lastWobble = this.blockLastWobbleTime.get(blk.id) ?? -10.0;
+            if (isSlapImpulse && this.simTime - lastWobble >= 0.024) {
+              this.blockLastWobbleTime.set(blk.id, this.simTime);
+              didEmitWobbleForBlock = true;
+              this.stepWobbleCandidates.push({
+                blockId: blk.id,
+                tiltAngleRad: Math.max(0.008, tiltRad),
+                angularSpeedRadPerSec: preWhSi,
+                clampingLoadN: clampLoadN,
+                worldPos: [
+                  acc.rockWorldPtDm[0],
+                  acc.rockWorldPtDm[1],
+                  acc.rockWorldPtDm[2],
+                ],
+                surface: acc.rockHitTable ? 'wood' : 'glass',
+                damage: blk.damage,
+              });
+            }
+          }
+        }
+      }
+
+      if (acc.maxVCloseReal <= 1.5 || acc.dynamicImpulseSim <= 0) continue;
       const massKg = Math.max(0.01, m.body_mass[blk.bodyHandle]);
       const lh = acc.bestLocalHitDm;
       const nLocal = quatInverseRotateVec3(blk.preQuat, acc.bestNormalAtoB);
@@ -2270,20 +2828,46 @@ export class MujocoPhysicsEngine {
         }
       }
 
+      const lastCrazeSec = this.blockLastCrazeTime.get(blk.id) ?? -10.0;
+      const dtSinceCraze = this.simTime - lastCrazeSec;
+      const inSameSlapWindow = dtSinceCraze < 0.24;
+      const cascadeGraceWeight =
+        inSameSlapWindow
+          ? 0.0
+          : (this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) && dtSinceCraze < 2.5
+            ? 0.12
+            : dtSinceCraze < 0.65
+              ? 0.30
+              : 1.0;
+      const effectivePriorDamage = blk.damage * cascadeGraceWeight;
+      const clampedPriorDamage = Math.max(0.0, Math.min(0.95, effectivePriorDamage));
+
+      // Progressive Griffith sub-critical flaw weakening: K_Ic(d) = K_Ic0 * (1 - 0.36 * d)
+      // Since drop shatter height h ~ v^2, (1 - 0.36 * 0.55)^2 = 0.643 (>= 35% lower drop height at d >= 0.55),
+      // while T2 (1.0 cm drop ~ 3.95 dm/s) incurs 0 false damage!
+      const griffithWeakening = 1.0 - 0.36 * clampedPriorDamage;
+
       // True opposing-wrench anvil crush: requires dynamic strike on one face PLUS opposing normal reaction impulse on the opposite face!
       const isAnvilCrush =
         acc.maxVCloseReal > CRAZE_IMPACT_SPEED &&
         acc.dynamicImpulseSim > 0.12 &&
         opposingJn > 0.25 * acc.dynamicImpulseSim;
 
-      // Three-point flexural bending stress: M_bend = F_mid * L / 4; sigma = 6 * M / (b * h^2)
+      // Three-point flexural bending stress: M_bend = F_mid * L / 4; sigma = 6 * M / (b * h^2),
+      // gated safely above static 18L stack weight (~12.5 N) and weakened by surface crazing flaws!
       let flexuralBoost = 1.0;
-      if (topMidForceN > 40.0 && bottomOuterSupportN > 25.0) {
+      const flexGateScale = 1.0 - 0.38 * clampedPriorDamage;
+      if (
+        acc.maxVCloseReal > 4.2 &&
+        topMidForceN > 38.0 * flexGateScale &&
+        bottomOuterSupportN > 24.0 * flexGateScale
+      ) {
         const fBend = Math.min(topMidForceN, bottomOuterSupportN);
         const mBendNm = (fBend * 0.06) / 4.0;
         const sigmaMpa = ((6.0 * mBendNm) / (0.025 * 0.015 * 0.015)) * 1e-6;
-        if (sigmaMpa > this.cfg.flexuralStrengthMpa * 0.5) {
-          flexuralBoost = 1.18;
+        const effFlexThresholdMpa = 0.75 * (1.0 - 0.48 * clampedPriorDamage);
+        if (sigmaMpa > effFlexThresholdMpa) {
+          flexuralBoost = 1.18 + 0.38 * clampedPriorDamage;
         }
       }
 
@@ -2315,7 +2899,21 @@ export class MujocoPhysicsEngine {
         blk.prePos[2] + rWorld[2],
       ];
 
-      if (vImpact > 1.75) {
+      const effCrazeSpeed = CRAZE_IMPACT_SPEED * 0.72 * (1.0 - 0.12 * clampedPriorDamage);
+      const freshShatterSpeed = isAnvilCrush ? SHATTER_IMPACT_SPEED : 14.3;
+      const shatterThreshold = freshShatterSpeed * griffithWeakening;
+
+      const inRockingSequence =
+        didEmitWobbleForBlock ||
+        (blk.id < this.blockLastRockTime.length &&
+          this.simTime - this.blockLastRockTime[blk.id] < 0.25);
+
+      if (
+        vImpact > 1.75 &&
+        (!inRockingSequence || vImpact >= effCrazeSpeed) &&
+        this.simTime - (this.blockLastImpactAudioTime.get(blk.id) ?? -10.0) >= 0.030
+      ) {
+        this.blockLastImpactAudioTime.set(blk.id, this.simTime);
         const clinkIntensity = Math.min(1.0, (vImpact - 1.5) / 14.0);
         this.audio.playGlassImpact(
           clinkIntensity,
@@ -2325,16 +2923,6 @@ export class MujocoPhysicsEngine {
           this.listenerCamRight
         );
       }
-
-      const lastCrazeSec = this.blockLastCrazeTime.get(blk.id) ?? -10.0;
-      const inSameSlapWindow = this.simTime - lastCrazeSec < 0.22;
-      const effectivePriorDamage = inSameSlapWindow ? 0.0 : blk.damage;
-      const effCrazeSpeed = CRAZE_IMPACT_SPEED * 0.72;
-      const baseShatterSpeed = isAnvilCrush ? SHATTER_IMPACT_SPEED : SHATTER_IMPACT_SPEED * 1.12;
-      const shatterThreshold = Math.max(
-        isAnvilCrush ? 11.4 : 14.3,
-        baseShatterSpeed * (1.0 - Math.min(0.85, effectivePriorDamage) * 0.16)
-      );
 
       if (vImpact >= shatterThreshold) {
         blocksToShatter.push({
@@ -2350,7 +2938,7 @@ export class MujocoPhysicsEngine {
         const prevDamage = blk.damage;
         const addedDamage =
           0.33 +
-          ((vImpact - effCrazeSpeed) / (SHATTER_IMPACT_SPEED - effCrazeSpeed)) * 0.48;
+          ((vImpact - effCrazeSpeed) / Math.max(2.0, SHATTER_IMPACT_SPEED - effCrazeSpeed)) * 0.48;
         if (inSameSlapWindow) {
           blk.damage = Math.min(0.92, Math.max(prevDamage, addedDamage));
         } else {
@@ -2374,11 +2962,55 @@ export class MujocoPhysicsEngine {
       }
     }
 
-    for (const item of blocksToShatter) {
-      this.shatterBlock(item.blk, item.localHit, item.impactSpeed, item.worldNormal, item.hitTable, {
-        closingSpeedReal: item.closingSpeedReal,
-        isAnvilCrush: item.isAnvilCrush,
-      });
+    if (blocksToShatter.length > 0) {
+      if (blocksToShatter.length > 1) {
+        blocksToShatter.sort((a, b) => b.impactSpeed - a.impactSpeed);
+      }
+      const immediateLimit = this.shards.length >= 160 ? 1 : 2;
+      let subShatters = 0;
+      for (let idx = 0; idx < blocksToShatter.length; idx++) {
+        const item = blocksToShatter[idx];
+        if (subShatters < immediateLimit && this.frameShatterCount < maxShattersPerFrame) {
+          this.shatterBlock(
+            item.blk,
+            item.localHit,
+            item.impactSpeed,
+            item.worldNormal,
+            item.hitTable,
+            {
+              closingSpeedReal: item.closingSpeedReal,
+              isAnvilCrush: item.isAnvilCrush,
+              skipSyncKinematics: true,
+            }
+          );
+          didAnyFractureSyncNeeded = true;
+          subShatters++;
+          this.frameShatterCount++;
+        } else {
+          const rb = this.worldCompat.getRigidBody(item.blk.bodyHandle);
+          const pos = rb ? rb.translation() : { x: item.blk.prePos[0], y: item.blk.prePos[1], z: item.blk.prePos[2] };
+          const rot = rb ? rb.rotation() : { x: item.blk.preQuat[0], y: item.blk.preQuat[1], z: item.blk.preQuat[2], w: item.blk.preQuat[3] };
+          const lv = rb ? rb.linvel() : { x: item.blk.linVel[0], y: item.blk.linVel[1], z: item.blk.linVel[2] };
+          const av = rb ? rb.angvel() : { x: item.blk.angVel[0], y: item.blk.angVel[1], z: item.blk.angVel[2] };
+          this.deferredFractures.push({
+            blk: item.blk,
+            localHit: item.localHit,
+            impactSpeed: item.impactSpeed,
+            worldNormal: item.worldNormal,
+            hitTable: item.hitTable,
+            closingSpeedReal: item.closingSpeedReal,
+            isAnvilCrush: item.isAnvilCrush,
+            savedPosDm: [pos.x, pos.y, pos.z],
+            savedQuat: [rot.x, rot.y, rot.z, rot.w],
+            savedLinVelSim: [lv.x, lv.y, lv.z],
+            savedAngVelSim: [av.x, av.y, av.z],
+          });
+        }
+      }
+    }
+
+    if (didAnyFractureSyncNeeded) {
+      this.worldCompat.syncKinematics();
     }
   }
 
@@ -2424,18 +3056,39 @@ export class MujocoPhysicsEngine {
     impactSpeed: number = 16.0,
     impactNormal: Vec3 = [0, 1, 0],
     hitTable: boolean = true,
-    collisionRebound?: { closingSpeedReal: number; isAnvilCrush: boolean }
+    collisionRebound?: {
+      closingSpeedReal: number;
+      isAnvilCrush: boolean;
+      skipSyncKinematics?: boolean;
+      savedPoseAndVel?: {
+        posDm: Vec3;
+        quat: Quat;
+        linVelSim: Vec3;
+        angVelSim: Vec3;
+      };
+    }
   ): void {
     if (block.shattered || !this.model || !this.data) return;
     const rb = this.worldCompat.getRigidBody(block.bodyHandle);
     const blkInfo = this.worldCompat.getMapping(block.bodyHandle);
     if (!rb || !blkInfo) return;
 
-    const pos = rb.translation();
-    const rot = rb.rotation();
-    const q: Quat = [rot.x, rot.y, rot.z, rot.w];
-    const lv = rb.linvel();
-    const av = rb.angvel();
+    const saved = collisionRebound?.savedPoseAndVel;
+    const pos = saved
+      ? { x: saved.posDm[0], y: saved.posDm[1], z: saved.posDm[2] }
+      : rb.translation();
+    const q: Quat = saved
+      ? [...saved.quat]
+      : (() => {
+          const rot = rb.rotation();
+          return [rot.x, rot.y, rot.z, rot.w] as Quat;
+        })();
+    const lv = saved
+      ? { x: saved.linVelSim[0], y: saved.linVelSim[1], z: saved.linVelSim[2] }
+      : rb.linvel();
+    const av = saved
+      ? { x: saved.angVelSim[0], y: saved.angVelSim[1], z: saved.angVelSim[2] }
+      : rb.angvel();
     const parentMass = Math.max(0.01, rb.mass());
 
     // When fracturing mid-contact inside `processWrenchCollisionsAndFractures`, MuJoCo's soft Kelvin-Voigt spring
@@ -2510,14 +3163,18 @@ export class MujocoPhysicsEngine {
     const impactEnergy01 = Math.max(0.0, Math.min(1.0, (impactSpeed - 12.5) / 15.0));
     const energyTargetShards = Math.round(21 + impactEnergy01 * 5);
     const headroom = MAX_ACTIVE_SHARDS - this.shards.length;
-    const budgetCap = headroom > 120 ? 25 : headroom > 65 ? 20 : 13;
+    const budgetCap = headroom > 110 ? 25 : headroom > 60 ? 21 : 14;
     const desiredShards = Math.min(energyTargetShards, budgetCap);
     const allowSecondaryCleavage = impactSpeed > 15.0;
+    const seedMix =
+      this.towerSeed !== 0
+        ? (Math.imul(this.towerSeed, 0x9e3779b1) + block.id * 977 + this.shatteredCount * 31) | 0
+        : block.id * 977 + Math.floor(this.simTime * 1000) + this.shatteredCount * 31;
 
     const shardGeoms = fractureBlockVoronoi(
       effectiveOrigin,
       desiredShards,
-      block.id * 977 + Math.floor(this.simTime * 1000) + this.shatteredCount * 31,
+      seedMix,
       BLOCK_HALF_X,
       BLOCK_HALF_Y,
       BLOCK_HALF_Z,
@@ -2538,6 +3195,8 @@ export class MujocoPhysicsEngine {
       }
       const retired = this.shards.splice(removeIdx, 1)[0];
       this.bodyToShard.delete(retired.bodyHandle);
+      this.slotRenderVertices[retired.slotIndex] = null;
+      this.shardAirborneSubsteps[retired.slotIndex] = 0;
       this.freeShardSlots.push(retired.slotIndex);
       this.parkBodyOnHiddenShelf(
         retired.bodyHandle,
@@ -2887,6 +3546,10 @@ export class MujocoPhysicsEngine {
 
         const firstVertex = s.slotIndex * SHARD_SLOT_STRIDE_VERTS;
         this.pendingSlotUploads.set(s.slotIndex, s.geom.renderVertices);
+        this.slotRenderVertices[s.slotIndex] = s.geom.renderVertices;
+        this.shardAirborneSubsteps[s.slotIndex] = 0;
+        this.shardLastImpactSimTime[s.slotIndex] = this.simTime;
+        this.shardLastAudioSimTime[s.slotIndex] = this.simTime;
 
         const shardState: GlassShardState = {
           id: this.nextShardId++,
@@ -2911,11 +3574,14 @@ export class MujocoPhysicsEngine {
           firstVertex,
           vertexCount: s.geom.vertexCount,
           quietSubsteps: 0,
+          spawnSimTime: this.simTime,
         };
         this.shards.push(shardState);
         this.bodyToShard.set(s.bodyId, shardState);
       }
-      this.worldCompat.syncKinematics();
+      if (!collisionRebound?.skipSyncKinematics) {
+        this.worldCompat.syncKinematics();
+      }
     }
 
     const chipCount = Math.round(12 + impactEnergy01 * 10);
@@ -3003,10 +3669,21 @@ export class MujocoPhysicsEngine {
     }
   }
 
-  public step(frameDt: number): void {
-    if (!this.model || !this.data) return;
+  public step(frameDt: number): PhysicsStepResult {
+    if (!this.model || !this.data) {
+      this.lastStepResult = {
+        substeps: 0,
+        simTime: this.simTime,
+        shardImpacts: [],
+        wobbleEvents: [],
+      };
+      return this.lastStepResult;
+    }
     const clampedDt = Math.min(0.085, Math.max(0.0, frameDt));
     this.simTime += clampedDt;
+    this.stepShardCandidates.length = 0;
+    this.stepWobbleCandidates.length = 0;
+    this.frameShatterCount = 0;
 
     if (this.turnPhase === 'EXTRACTED') {
       const decay = Math.exp(-clampedDt * 12.0);
@@ -3016,13 +3693,20 @@ export class MujocoPhysicsEngine {
 
     // Fast O(1) MuJoCo 4.0 Sleeping-Island early-out when 100% of dynamic trees are asleep!
     const anyPendingWake = this.hasNonZeroAppliedWakeForces();
-    if (this.data.ntree_awake === 0 && !anyPendingWake) {
+    if (this.data.ntree_awake === 0 && !anyPendingWake && this.deferredFractures.length === 0) {
+      this.sandboxCollapseActive = false;
       if (this.activeBlockId === null) {
         this.accumulatorSec = 0;
         this.wobbleSpeedDegPerSec = 0;
         this.updateMicroSplinters(clampedDt);
         this.updateTurnStateMachine(clampedDt);
-        return;
+        this.lastStepResult = {
+          substeps: 0,
+          simTime: this.simTime,
+          shardImpacts: [],
+          wobbleEvents: [],
+        };
+        return this.lastStepResult;
       }
       if (this.turnPhase === 'EXTRACTED') {
         this.accumulatorSec = 0;
@@ -3030,24 +3714,44 @@ export class MujocoPhysicsEngine {
         this.advanceCarriedBlockOnly(clampedDt);
         this.updateMicroSplinters(clampedDt);
         this.updateTurnStateMachine(clampedDt);
-        return;
+        this.lastStepResult = {
+          substeps: 0,
+          simTime: this.simTime,
+          shardImpacts: [],
+          wobbleEvents: [],
+        };
+        return this.lastStepResult;
       }
     }
 
-    // Preserve full 600 Hz / 26-iteration Newton precision across all standing, extraction, and sandbox regimes;
-    // once `turnPhase === 'COLLAPSED'`, step at 360 Hz (`6` substeps/frame) and scale Newton iterations (`26 -> 8`)
-    // during active toppling so full-stack collapses run at 1.00x real-time wall-clock speed with zero slow-motion lag!
-    const isCollapsed = this.turnPhase === 'COLLAPSED';
+    // Preserve full 600 Hz / 26-iteration Newton precision across all standing, extraction, and isolated sandbox tests;
+    // during full-stack collapse (`turnPhase === 'COLLAPSED'`, `sandboxCollapseActive`, or multi-shard cascade),
+    // step at 360 Hz (`6` substeps/frame) and scale Newton iterations (`26 -> 8`) so collapses run `< 16 ms` P95!
+    const isCollapseCascade =
+      this.turnPhase === 'COLLAPSED' ||
+      (this.sandboxCollapseActive && (this.leanAngleDeg >= 8.5 || this.shatteredCount >= 1)) ||
+      this.shards.length > 48 ||
+      (this.shatteredCount >= 2 && this.shards.length >= 32);
+    const isHeavyShardCascade =
+      this.gameMode === 'sandbox' && isCollapseCascade && this.shards.length >= 160;
     const isActivelyToppling =
-      isCollapsed ||
-      (this.gameMode !== 'sandbox' && (this.leanAngleDeg > 2.2 || this.wobbleSpeedDegPerSec > 12.0)) ||
-      this.shards.length > 48;
-    const subDt = isCollapsed ? 1.0 / 360.0 : this.cfg.timestepSec;
+      isCollapseCascade ||
+      (this.gameMode !== 'sandbox' &&
+        (this.leanAngleDeg > 2.2 || this.wobbleSpeedDegPerSec > 12.0));
+    const subDt = isHeavyShardCascade
+      ? 1.0 / 300.0
+      : isCollapseCascade
+        ? 1.0 / 360.0
+        : this.cfg.timestepSec;
     this.model.opt.timestep = subDt;
-    this.model.opt.iterations = isActivelyToppling ? 8 : this.cfg.solverIterations;
+    this.model.opt.iterations = isHeavyShardCascade
+      ? 6
+      : isActivelyToppling
+        ? 8
+        : this.cfg.solverIterations;
     this.model.opt.ls_iterations = isActivelyToppling ? 4 : this.cfg.lsIterations;
 
-    const maxSubsteps = isCollapsed ? 32 : 52;
+    const maxSubsteps = isCollapseCascade ? 32 : 52;
     this.accumulatorSec = Math.min(maxSubsteps * subDt, this.accumulatorSec + clampedDt);
 
     let substeps = 0;
@@ -3069,7 +3773,11 @@ export class MujocoPhysicsEngine {
         this.dampGroundedMicroJitterShardsSubstep();
       }
 
-      if (maxSpeedReal > 1.25 || this.extraPreStep.size > 0) {
+      if (
+        maxSpeedReal > 0.32 ||
+        this.extraPreStep.size > 0 ||
+        this.deferredFractures.length > 0
+      ) {
         this.processWrenchCollisionsAndFractures(subDt);
       }
 
@@ -3084,6 +3792,50 @@ export class MujocoPhysicsEngine {
     this.updateMicroSplinters(clampedDt);
     this.syncTransformsAndRules();
     this.updateTurnStateMachine(clampedDt);
+
+    let shardImpacts: ShardImpactEvent[] = [];
+    if (this.stepShardCandidates.length > 0) {
+      if (this.stepShardCandidates.length > 8) {
+        this.stepShardCandidates.sort(
+          (a, b) => b.massKg * b.speed * b.speed - a.massKg * a.speed * a.speed
+        );
+        shardImpacts = this.stepShardCandidates.slice(0, 8);
+      } else {
+        shardImpacts = this.stepShardCandidates.slice();
+      }
+      for (let i = 0; i < shardImpacts.length; i++) {
+        this.pendingShardImpacts.push(shardImpacts[i]);
+      }
+      if (this.pendingShardImpacts.length > 64) {
+        this.pendingShardImpacts.splice(0, this.pendingShardImpacts.length - 64);
+      }
+    }
+
+    let wobbleEvents: WobbleRockEvent[] = [];
+    if (this.stepWobbleCandidates.length > 0) {
+      if (this.stepWobbleCandidates.length > 4) {
+        this.stepWobbleCandidates.sort(
+          (a, b) => b.angularSpeedRadPerSec - a.angularSpeedRadPerSec
+        );
+        wobbleEvents = this.stepWobbleCandidates.slice(0, 4);
+      } else {
+        wobbleEvents = this.stepWobbleCandidates.slice();
+      }
+      for (let i = 0; i < wobbleEvents.length; i++) {
+        this.pendingWobbleEvents.push(wobbleEvents[i]);
+      }
+      if (this.pendingWobbleEvents.length > 32) {
+        this.pendingWobbleEvents.splice(0, this.pendingWobbleEvents.length - 32);
+      }
+    }
+
+    this.lastStepResult = {
+      substeps,
+      simTime: this.simTime,
+      shardImpacts,
+      wobbleEvents,
+    };
+    return this.lastStepResult;
   }
 
   /**
@@ -3094,7 +3846,16 @@ export class MujocoPhysicsEngine {
   private dampGroundedMicroJitterShardsSubstep(): void {
     const m = this.model;
     const d = this.data;
-    if (!m || !d || (this.shards.length === 0 && this.shatteredCount === 0 && this.turnPhase !== 'COLLAPSED')) return;
+    if (
+      !m ||
+      !d ||
+      (this.shards.length === 0 &&
+        this.shatteredCount === 0 &&
+        this.turnPhase !== 'COLLAPSED' &&
+        !this.sandboxCollapseActive)
+    ) {
+      return;
+    }
 
     const qpos = d.qpos;
     const qvel = d.qvel;
@@ -3105,8 +3866,9 @@ export class MujocoPhysicsEngine {
     const blockRimM2 = blockRimM * blockRimM;
     const shardRimM = (TABLE_RADIUS + 0.008) * M_PER_DM;
     const shardRimM2 = shardRimM * shardRimM;
-    const tickInc = this.turnPhase === 'COLLAPSED' ? 2 : 1;
-    const isPostCollapse = this.turnPhase === 'COLLAPSED' || this.shatteredCount > 0;
+    const tickInc = this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive ? 2 : 1;
+    const isPostCollapse =
+      this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive || this.shatteredCount > 0;
     if (isPostCollapse) {
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
@@ -3376,6 +4138,8 @@ export class MujocoPhysicsEngine {
       }
       if (ty < -3.2 || Math.hypot(tx, tz) > 8.5) {
         this.bodyToShard.delete(s.bodyHandle);
+        this.slotRenderVertices[s.slotIndex] = null;
+        this.shardAirborneSubsteps[s.slotIndex] = 0;
         this.freeShardSlots.push(s.slotIndex);
         this.parkBodyOnHiddenShelf(
           s.bodyHandle,
@@ -3387,8 +4151,23 @@ export class MujocoPhysicsEngine {
         this.shards.splice(i, 1);
         continue;
       }
+      const sRot: Quat = [qpos[adr + 4], qpos[adr + 5], qpos[adr + 6], qpos[adr + 3]];
       s.position[0] = tx; s.position[1] = ty; s.position[2] = tz;
-      s.rotation[0] = qpos[adr + 4]; s.rotation[1] = qpos[adr + 5]; s.rotation[2] = qpos[adr + 6]; s.rotation[3] = qpos[adr + 3];
+      s.rotation[0] = sRot[0]; s.rotation[1] = sRot[1]; s.rotation[2] = sRot[2]; s.rotation[3] = sRot[3];
+      const sTree = bodyTreeId[s.bodyHandle];
+      if (sTree >= 0 && treeAsleep[sTree] >= 0) {
+        s.preLinVel[0] = 0; s.preLinVel[1] = 0; s.preLinVel[2] = 0;
+        s.preAngVel[0] = 0; s.preAngVel[1] = 0; s.preAngVel[2] = 0;
+      } else {
+        const sDof = this.map.shardDofAdr[s.slotIndex];
+        s.preLinVel[0] = qvel[sDof + 0] * FROUDE_VEL_SCALE;
+        s.preLinVel[1] = qvel[sDof + 1] * FROUDE_VEL_SCALE;
+        s.preLinVel[2] = qvel[sDof + 2] * FROUDE_VEL_SCALE;
+        const sw = quatRotateVec3(sRot, [qvel[sDof + 3], qvel[sDof + 4], qvel[sDof + 5]]);
+        s.preAngVel[0] = sw[0] * INV_FROUDE_VEL_SCALE;
+        s.preAngVel[1] = sw[1] * INV_FROUDE_VEL_SCALE;
+        s.preAngVel[2] = sw[2] * INV_FROUDE_VEL_SCALE;
+      }
     }
 
     if (countInTower > 0) {
@@ -3847,6 +4626,473 @@ export class MujocoPhysicsEngine {
           : 0,
       collapseReason: this.collapseReason,
     };
+  }
+
+  public exportCompactSnapshot(options?: { includeShardGeometry?: boolean }): PhysicsNetworkSnapshot {
+    const blockCount = this.blocks.length;
+    const blockData = new Float32Array(blockCount * 19);
+    for (let i = 0; i < blockCount; i++) {
+      const b = this.blocks[i];
+      const base = i * 19;
+      blockData[base + 0] = b.position[0];
+      blockData[base + 1] = b.position[1];
+      blockData[base + 2] = b.position[2];
+      blockData[base + 3] = b.rotation[0];
+      blockData[base + 4] = b.rotation[1];
+      blockData[base + 5] = b.rotation[2];
+      blockData[base + 6] = b.rotation[3];
+      blockData[base + 7] = b.linVel[0];
+      blockData[base + 8] = b.linVel[1];
+      blockData[base + 9] = b.linVel[2];
+      blockData[base + 10] = b.angVel[0];
+      blockData[base + 11] = b.angVel[1];
+      blockData[base + 12] = b.angVel[2];
+      blockData[base + 13] = b.damage;
+      blockData[base + 14] = b.crackLocalOrigin[0];
+      blockData[base + 15] = b.crackLocalOrigin[1];
+      blockData[base + 16] = b.crackLocalOrigin[2];
+      blockData[base + 17] = b.rippleSeed;
+      const encLayer = Math.max(0, Math.min(63, b.assignedLayer + 1)) & 0x3f;
+      const encSlot = b.assignedSlot & 0x3;
+      const encSwatch = b.swatchId & 0xf;
+      const encMotif = b.motif & 0x3;
+      const bits =
+        (b.shattered ? 1 : 0) |
+        (b.extracted ? 2 : 0) |
+        (b.isLegalTarget ? 4 : 0) |
+        (b.isLooseSlot ? 8 : 0) |
+        (encLayer << 4) |
+        (encSlot << 10) |
+        (encSwatch << 12) |
+        (encMotif << 16);
+      blockData[base + 18] = bits;
+    }
+
+    const wrenchSlice = new Float32Array(blockCount * 4);
+    const copyLen = Math.min(wrenchSlice.length, this.blockPhotoelasticWrench.length);
+    for (let k = 0; k < copyLen; k++) {
+      wrenchSlice[k] = this.blockPhotoelasticWrench[k];
+    }
+
+    const shardCount = this.shards.length;
+    const shardData = new Float32Array(shardCount * 15);
+    const shardMetas: PhysicsShardSnapshotMeta[] = [];
+    const activeIds = new Set<number>();
+
+    for (let i = 0; i < shardCount; i++) {
+      const s = this.shards[i];
+      activeIds.add(s.id);
+      const base = i * 15;
+      shardData[base + 0] = s.id;
+      shardData[base + 1] = s.slotIndex;
+      shardData[base + 2] = s.position[0];
+      shardData[base + 3] = s.position[1];
+      shardData[base + 4] = s.position[2];
+      shardData[base + 5] = s.rotation[0];
+      shardData[base + 6] = s.rotation[1];
+      shardData[base + 7] = s.rotation[2];
+      shardData[base + 8] = s.rotation[3];
+      shardData[base + 9] = s.preLinVel[0];
+      shardData[base + 10] = s.preLinVel[1];
+      shardData[base + 11] = s.preLinVel[2];
+      shardData[base + 12] = s.preAngVel[0];
+      shardData[base + 13] = s.preAngVel[1];
+      shardData[base + 14] = s.preAngVel[2];
+
+      const isNewShard = !this.exportedShardIds.has(s.id);
+      if (isNewShard) {
+        this.exportedShardIds.add(s.id);
+      }
+      const includeGeo =
+        options?.includeShardGeometry === true ||
+        (options?.includeShardGeometry === undefined && isNewShard);
+      const cachedVerts = this.slotRenderVertices[s.slotIndex];
+      shardMetas.push({
+        id: s.id,
+        slotIndex: s.slotIndex,
+        swatchId: s.swatchId,
+        motif: s.motif,
+        rippleSeed: s.rippleSeed,
+        volume: s.volume,
+        massKg: s.massKg,
+        impactLocalPos: [...s.impactLocalPos],
+        planeCount: s.planeCount,
+        planes: new Float32Array(s.planes),
+        vertexCount: s.vertexCount,
+        renderVertices:
+          includeGeo && cachedVerts ? new Float32Array(cachedVerts) : undefined,
+      });
+    }
+
+    for (const prevId of this.exportedShardIds) {
+      if (!activeIds.has(prevId)) {
+        this.exportedShardIds.delete(prevId);
+      }
+    }
+
+    const initialLayers =
+      this.compiledTowerLayers > 0 ? this.compiledTowerLayers : INITIAL_LAYERS;
+
+    return {
+      version: 1,
+      simTime: this.simTime,
+      towerSeed: this.towerSeed,
+      initialLayers,
+      gameMode: this.gameMode,
+      turnPhase: this.turnPhase,
+      currentPlayer: this.currentPlayer,
+      playerCount: this.playerCount,
+      blocksStacked: this.blocksStacked,
+      shatteredCount: this.shatteredCount,
+      collapseReason: this.collapseReason,
+      activeBlockId: this.activeBlockId,
+      hoveredSlotIndex: this.hoveredSlotIndex,
+      isPointerDraggingBlock: this.isPointerDraggingBlock,
+      grabLocalPoint: [...this.grabLocalPoint],
+      grabWorldAnchor: [...this.grabWorldAnchor],
+      grabCurrentWorldOnBlock: [...this.grabCurrentWorldOnBlock],
+      grabResistance01: this.grabResistance01,
+      carriedTargetPos: [...this.carriedTargetPos],
+      carriedTargetQuat: [...this.carriedTargetQuat],
+      carriedLandingPos: [...this.carriedLandingPos],
+      carriedYawOffsetRad: this.carriedYawOffsetRad,
+      blockStride: 19,
+      blockCount,
+      blockData,
+      blockPhotoelasticWrench: wrenchSlice,
+      shardStride: 15,
+      shardCount,
+      shardData,
+      shardMetas,
+    };
+  }
+
+  public applyCompactSnapshot(snap: PhysicsNetworkSnapshot): void {
+    if (!this.model || !this.data) return;
+    if (
+      snap.initialLayers !== this.compiledTowerLayers ||
+      this.blocks.length < snap.blockCount
+    ) {
+      this.rebuildTower(snap.gameMode, snap.playerCount, snap.initialLayers, snap.towerSeed);
+    }
+    if (!this.model || !this.data) return;
+
+    const m = this.model;
+    const d = this.data;
+    this.simTime = snap.simTime;
+    this.towerSeed = snap.towerSeed >>> 0;
+    this.gameMode = snap.gameMode;
+    this.turnPhase = snap.turnPhase;
+    this.currentPlayer = snap.currentPlayer;
+    this.playerCount = snap.playerCount;
+    this.blocksStacked = snap.blocksStacked;
+    this.shatteredCount = snap.shatteredCount;
+    this.collapseReason = snap.collapseReason;
+    this.activeBlockId = snap.activeBlockId;
+    this.hoveredSlotIndex = snap.hoveredSlotIndex;
+    this.isPointerDraggingBlock = snap.isPointerDraggingBlock;
+    this.grabLocalPoint = [...snap.grabLocalPoint];
+    this.grabWorldAnchor = [...snap.grabWorldAnchor];
+    this.grabCurrentWorldOnBlock = [...snap.grabCurrentWorldOnBlock];
+    this.grabResistance01 = snap.grabResistance01;
+    this.carriedTargetPos = [...snap.carriedTargetPos];
+    this.carriedTargetQuat = [...snap.carriedTargetQuat];
+    this.carriedLandingPos = [...snap.carriedLandingPos];
+    this.carriedYawOffsetRad = snap.carriedYawOffsetRad;
+    this.deferredFractures.length = 0;
+    this.sandboxCollapseActive = false;
+    if (!this.isPointerDraggingBlock) {
+      d.eq_active[this.map.grabEqualityId] = 0;
+    }
+
+    const count = Math.min(this.blocks.length, snap.blockCount);
+    const bd = snap.blockData;
+    for (let i = 0; i < count; i++) {
+      const b = this.blocks[i];
+      const base = i * 19;
+      const px = bd[base + 0];
+      const py = bd[base + 1];
+      const pz = bd[base + 2];
+      const qx = bd[base + 3];
+      const qy = bd[base + 4];
+      const qz = bd[base + 5];
+      const qw = bd[base + 6];
+      const lvx = bd[base + 7];
+      const lvy = bd[base + 8];
+      const lvz = bd[base + 9];
+      const avx = bd[base + 10];
+      const avy = bd[base + 11];
+      const avz = bd[base + 12];
+      const damage = bd[base + 13];
+      const cx = bd[base + 14];
+      const cy = bd[base + 15];
+      const cz = bd[base + 16];
+      const rippleSeed = bd[base + 17];
+      const bits = bd[base + 18] | 0;
+
+      b.position[0] = px; b.position[1] = py; b.position[2] = pz;
+      b.rotation[0] = qx; b.rotation[1] = qy; b.rotation[2] = qz; b.rotation[3] = qw;
+      b.prePos[0] = px; b.prePos[1] = py; b.prePos[2] = pz;
+      b.preQuat[0] = qx; b.preQuat[1] = qy; b.preQuat[2] = qz; b.preQuat[3] = qw;
+      b.linVel[0] = lvx; b.linVel[1] = lvy; b.linVel[2] = lvz;
+      b.angVel[0] = avx; b.angVel[1] = avy; b.angVel[2] = avz;
+      b.damage = damage;
+      b.crackLocalOrigin[0] = cx; b.crackLocalOrigin[1] = cy; b.crackLocalOrigin[2] = cz;
+      b.rippleSeed = rippleSeed;
+      b.shattered = (bits & 1) !== 0;
+      b.extracted = (bits & 2) !== 0;
+      b.isLegalTarget = (bits & 4) !== 0;
+      b.isLooseSlot = (bits & 8) !== 0;
+      b.assignedLayer = ((bits >>> 4) & 0x3f) - 1;
+      b.assignedSlot = (bits >>> 10) & 0x3;
+      b.swatchId = (bits >>> 12) & 0xf;
+      b.motif = ((bits >>> 16) & 0x3) as TraceryMotif;
+
+      const info = this.worldCompat.getMapping(b.bodyHandle);
+      if (!info) continue;
+      if (b.shattered) {
+        this.bodyToBlock.delete(b.bodyHandle);
+        this.parkBodyOnHiddenShelf(
+          b.bodyHandle,
+          b.colliderHandle,
+          info.qposAdr,
+          info.dofAdr,
+          520 + (b.id % 64)
+        );
+      } else {
+        this.bodyToBlock.set(b.bodyHandle, b);
+        const caff =
+          Math.hypot(px, pz) > TABLE_RADIUS + 0.06
+            ? MJ_CONAFFINITY_BLOCK_OFF_RIM
+            : MJ_CONAFFINITY_BLOCK_ON_TABLE;
+        setBodyGeomCollisionMask(m, b.bodyHandle, b.colliderHandle, MJ_CONTYPE_BLOCK, caff);
+        this.worldCompat.markShardActive(b.bodyHandle, true, MJ_CONTYPE_BLOCK, caff);
+        const adr = info.qposAdr;
+        const dof = info.dofAdr;
+        d.qpos[adr + 0] = px * M_PER_DM;
+        d.qpos[adr + 1] = py * M_PER_DM;
+        d.qpos[adr + 2] = pz * M_PER_DM;
+        d.qpos[adr + 3] = qw;
+        d.qpos[adr + 4] = qx;
+        d.qpos[adr + 5] = qy;
+        d.qpos[adr + 6] = qz;
+        d.qvel[dof + 0] = lvx / FROUDE_VEL_SCALE;
+        d.qvel[dof + 1] = lvy / FROUDE_VEL_SCALE;
+        d.qvel[dof + 2] = lvz / FROUDE_VEL_SCALE;
+        const wBody = quatInverseRotateVec3(
+          [qx, qy, qz, qw],
+          [avx * FROUDE_VEL_SCALE, avy * FROUDE_VEL_SCALE, avz * FROUDE_VEL_SCALE]
+        );
+        d.qvel[dof + 3] = wBody[0];
+        d.qvel[dof + 4] = wBody[1];
+        d.qvel[dof + 5] = wBody[2];
+        if (
+          Math.hypot(lvx, lvy, lvz) + Math.hypot(avx, avy, avz) > 1e-5 ||
+          py > BLOCK_HALF_Y + 0.02
+        ) {
+          this.worldCompat.wakeBody(b.bodyHandle);
+        }
+      }
+    }
+
+    const metaById = new Map<number, PhysicsShardSnapshotMeta>();
+    if (snap.shardMetas) {
+      for (const meta of snap.shardMetas) {
+        metaById.set(meta.id, meta);
+      }
+    }
+    const existingShardById = new Map<number, GlassShardState>();
+    for (const s of this.shards) {
+      existingShardById.set(s.id, s);
+    }
+
+    // Reset shard pool first, then activate exact snapshot slots
+    for (const oldS of this.shards) {
+      this.bodyToShard.delete(oldS.bodyHandle);
+      this.parkBodyOnHiddenShelf(
+        oldS.bodyHandle,
+        oldS.colliderHandle,
+        this.map.shardQposAdr[oldS.slotIndex],
+        this.map.shardDofAdr[oldS.slotIndex],
+        oldS.slotIndex
+      );
+    }
+    this.shards = [];
+    const usedSlots = new Uint8Array(MAX_ACTIVE_SHARDS);
+    const sd = snap.shardData;
+    let maxSeenShardId = this.nextShardId;
+
+    for (let i = 0; i < snap.shardCount; i++) {
+      const base = i * 15;
+      const id = sd[base + 0] | 0;
+      const slotIndex = sd[base + 1] | 0;
+      if (slotIndex < 0 || slotIndex >= MAX_ACTIVE_SHARDS) continue;
+      usedSlots[slotIndex] = 1;
+      if (id >= maxSeenShardId) maxSeenShardId = id + 1;
+
+      const px = sd[base + 2];
+      const py = sd[base + 3];
+      const pz = sd[base + 4];
+      const qx = sd[base + 5];
+      const qy = sd[base + 6];
+      const qz = sd[base + 7];
+      const qw = sd[base + 8];
+      const lvx = sd[base + 9];
+      const lvy = sd[base + 10];
+      const lvz = sd[base + 11];
+      const avx = sd[base + 12];
+      const avy = sd[base + 13];
+      const avz = sd[base + 14];
+
+      const meta = metaById.get(id);
+      const prev = existingShardById.get(id);
+      const swatchId = meta?.swatchId ?? prev?.swatchId ?? 0;
+      const motif = meta?.motif ?? prev?.motif ?? 0;
+      const rippleSeed = meta?.rippleSeed ?? prev?.rippleSeed ?? 1.0;
+      const volume = meta?.volume ?? prev?.volume ?? 0.002;
+      const massKg = meta?.massKg ?? prev?.massKg ?? Math.max(0.0002, TARGET_BLOCK_MASS_KG * 0.04);
+      const impactLocalPos: Vec3 = meta
+        ? [...meta.impactLocalPos]
+        : prev
+          ? [...prev.impactLocalPos]
+          : [0, 0, 0];
+      const planeCount = meta?.planeCount ?? prev?.planeCount ?? 0;
+      const planes = meta
+        ? new Float32Array(meta.planes)
+        : prev
+          ? new Float32Array(prev.planes)
+          : new Float32Array(48);
+      const vertexCount = meta?.vertexCount ?? prev?.vertexCount ?? 0;
+      const firstVertex = slotIndex * SHARD_SLOT_STRIDE_VERTS;
+
+      if (meta?.renderVertices) {
+        const vCopy = new Float32Array(meta.renderVertices);
+        this.slotRenderVertices[slotIndex] = vCopy;
+        this.pendingSlotUploads.set(slotIndex, vCopy);
+      }
+
+      const bodyId = this.map.shardBodyIds[slotIndex];
+      const geomId = this.map.shardGeomIds[slotIndex];
+      const adr = this.map.shardQposAdr[slotIndex];
+      const dof = this.map.shardDofAdr[slotIndex];
+      const isHero = volume >= 0.0022;
+      const offRim = Math.hypot(px, pz) > TABLE_RADIUS + 0.01;
+      const ctype = isHero ? MJ_CONTYPE_HERO_SHARD : MJ_CONTYPE_CULLET_SHARD;
+      const caff = isHero
+        ? (offRim ? MJ_CONAFFINITY_HERO_SHARD_OFF_RIM : MJ_CONAFFINITY_HERO_SHARD_ON_TABLE)
+        : (offRim ? MJ_CONAFFINITY_CULLET_OFF_RIM : MJ_CONAFFINITY_CULLET_ON_TABLE);
+
+      const hSideM = Math.max(0.0015, Math.cbrt(Math.max(1e-6, volume)) * 0.5 * M_PER_DM);
+      m.geom_type[geomId] = 6;
+      m.geom_dataid[geomId] = -1;
+      m.geom_pos[geomId * 3 + 0] = 0;
+      m.geom_pos[geomId * 3 + 1] = 0;
+      m.geom_pos[geomId * 3 + 2] = 0;
+      m.geom_quat[geomId * 4 + 0] = 1;
+      m.geom_quat[geomId * 4 + 1] = 0;
+      m.geom_quat[geomId * 4 + 2] = 0;
+      m.geom_quat[geomId * 4 + 3] = 0;
+      m.geom_size[geomId * 3 + 0] = hSideM;
+      m.geom_size[geomId * 3 + 1] = hSideM;
+      m.geom_size[geomId * 3 + 2] = hSideM;
+      m.geom_rbound[geomId] = Math.hypot(hSideM, hSideM, hSideM);
+      setBodyGeomCollisionMask(m, bodyId, geomId, ctype, caff);
+      this.worldCompat.markShardActive(bodyId, true, ctype, caff);
+
+      const inertiaIso = (massKg / 6.0) * (2 * hSideM) * (2 * hSideM);
+      updateFreeBodyMassAndInertiaO1(m, bodyId, dof, massKg, inertiaIso, inertiaIso, inertiaIso);
+
+      d.qpos[adr + 0] = px * M_PER_DM;
+      d.qpos[adr + 1] = py * M_PER_DM;
+      d.qpos[adr + 2] = pz * M_PER_DM;
+      d.qpos[adr + 3] = qw;
+      d.qpos[adr + 4] = qx;
+      d.qpos[adr + 5] = qy;
+      d.qpos[adr + 6] = qz;
+      d.qvel[dof + 0] = lvx / FROUDE_VEL_SCALE;
+      d.qvel[dof + 1] = lvy / FROUDE_VEL_SCALE;
+      d.qvel[dof + 2] = lvz / FROUDE_VEL_SCALE;
+      const swBody = quatInverseRotateVec3(
+        [qx, qy, qz, qw],
+        [avx * FROUDE_VEL_SCALE, avy * FROUDE_VEL_SCALE, avz * FROUDE_VEL_SCALE]
+      );
+      d.qvel[dof + 3] = swBody[0];
+      d.qvel[dof + 4] = swBody[1];
+      d.qvel[dof + 5] = swBody[2];
+      if (
+        Math.hypot(lvx, lvy, lvz) + Math.hypot(avx, avy, avz) > 1e-5 ||
+        py > 0.08
+      ) {
+        this.worldCompat.wakeBody(bodyId);
+      }
+
+      const shardState: GlassShardState = {
+        id,
+        slotIndex,
+        bodyHandle: bodyId,
+        colliderHandle: geomId,
+        swatchId,
+        motif,
+        rippleSeed,
+        position: [px, py, pz],
+        rotation: [qx, qy, qz, qw],
+        prePos: [px, py, pz],
+        preQuat: [qx, qy, qz, qw],
+        preLinVel: [lvx, lvy, lvz],
+        preAngVel: [avx, avy, avz],
+        volume,
+        massKg,
+        preVy: lvy,
+        impactLocalPos,
+        planes,
+        planeCount,
+        firstVertex,
+        vertexCount,
+        quietSubsteps: 0,
+        spawnSimTime: this.simTime - 0.05,
+      };
+      this.shards.push(shardState);
+      this.bodyToShard.set(bodyId, shardState);
+    }
+
+    this.nextShardId = maxSeenShardId;
+    this.freeShardSlots = [];
+    for (let slot = MAX_ACTIVE_SHARDS - 1; slot >= 0; slot--) {
+      if (usedSlots[slot] === 0) {
+        this.freeShardSlots.push(slot);
+      }
+    }
+
+    this.mj.mj_forward(m, d);
+    this.syncTransformsAndRules();
+
+    // Restore exact snapshot turn/wrench fields after syncTransformsAndRules
+    this.turnPhase = snap.turnPhase;
+    this.shatteredCount = snap.shatteredCount;
+    this.collapseReason = snap.collapseReason;
+    for (let i = 0; i < count; i++) {
+      this.blocks[i].isLegalTarget = ((bd[i * 19 + 18] | 0) & 4) !== 0;
+    }
+    this.lastStepResult = {
+      substeps: 0,
+      simTime: this.simTime,
+      shardImpacts: [],
+      wobbleEvents: [],
+    };
+
+    const wLen = Math.min(this.blockPhotoelasticWrench.length, snap.blockPhotoelasticWrench.length);
+    for (let k = 0; k < wLen; k++) {
+      this.blockPhotoelasticWrench[k] = snap.blockPhotoelasticWrench[k];
+    }
+    for (let i = 0; i < count && i < this.blockPhotoelasticStress01.length; i++) {
+      const wb = i * 4;
+      this.blockPhotoelasticStress01[i] = Math.max(
+        this.blockPhotoelasticWrench[wb + 0] ?? 0,
+        this.blockPhotoelasticWrench[wb + 1] ?? 0,
+        this.blockPhotoelasticWrench[wb + 2] ?? 0,
+        this.blockPhotoelasticWrench[wb + 3] ?? 0
+      );
+    }
   }
 
   public dispose(): void {
