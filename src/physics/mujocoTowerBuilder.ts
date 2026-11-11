@@ -26,18 +26,22 @@ import { quatFromAxisAngle, Quat, Vec3 } from '../math/vecMat';
  * - Bit 16 (`0x10`): Hidden Underground Parking Shelf (`y = -50 m`) for rapid `sleep="init"` pool parking
  */
 export const MJ_CONTYPE_TABLE = 0x01;
-export const MJ_CONAFFINITY_TABLE = 0x0f;
+// Must be 0x00 because MuJoCo tests `(contype1 & conaffinity2) || (contype2 & conaffinity1)`:
+// keeping table.conaffinity === 0x00 ensures clearing table bits on off-rim blocks/shards immediately disables table support!
+export const MJ_CONAFFINITY_TABLE = 0x00;
+export const MJ_CONTYPE_SHARD_TABLE = 0x20;
 
 export const MJ_CONTYPE_BLOCK = 0x02;
-export const MJ_CONAFFINITY_BLOCK_ON_TABLE = 0x0f; // Table (1) + Blocks (2) + Hero Shards (4) + Cullet (8)
-export const MJ_CONAFFINITY_BLOCK_OFF_RIM = 0x0e;  // Excludes Table (1) once past circular oak rim!
+export const MJ_CONAFFINITY_BLOCK_ON_TABLE = 0x07; // Oak Table (1) + Blocks (2) + Hero Shards (4)
+export const MJ_CONAFFINITY_BLOCK_OFF_RIM = 0x06;  // Excludes Oak Table (1) once past circular oak rim!
 
 export const MJ_CONTYPE_HERO_SHARD = 0x04;
-export const MJ_CONAFFINITY_HERO_SHARD_ON_TABLE = 0x07; // Table (1) + Blocks (2) + Hero Shards (4)
-export const MJ_CONAFFINITY_HERO_SHARD_OFF_RIM = 0x06;  // Excludes Table (1)
+export const MJ_CONAFFINITY_HERO_SHARD_ON_TABLE = 0x26; // Shard Table (0x20) + Blocks (2) + Hero Shards (4)
+export const MJ_CONAFFINITY_HERO_SHARD_OFF_RIM = 0x06;  // Excludes Shard Table (0x20) once past circular rim!
 
 export const MJ_CONTYPE_CULLET_SHARD = 0x08;
-export const MJ_CONAFFINITY_CULLET_ON_TABLE = 0x03;     // Table (1) + Blocks (2)
+export const MJ_CONAFFINITY_CULLET_ON_TABLE = 0x20;     // Shard Table (0x20): bounces on oak table without carpeting falling bricks
+export const MJ_CONAFFINITY_CULLET_OFF_RIM = 0x00;      // Excludes Shard Table (0x20) once past circular rim!
 
 export const MJ_CONTYPE_PARKING = 0x10;
 export const MJ_CONAFFINITY_PARKING = 0x10;
@@ -55,6 +59,8 @@ export interface InitialBlockSpec {
 export interface MujocoTowerIndexMap {
   /** Geom ID of the oak tabletop (`worldbody` static geom) */
   tableGeomId: number;
+  /** Geom ID of the shard-restitution tabletop (`worldbody` static geom) */
+  shardTableGeomId: number;
   /** Geom ID of the hidden parking shelf at `y = -50 m` */
   parkingShelfGeomId: number;
   /** Body ID of the `mocap="true"` hand anchor (`mocapId = 0`) */
@@ -206,6 +212,7 @@ export function buildMujocoTowerXml(
   const fTable = `${cfg.tableFriction[0]} ${cfg.tableFriction[1]} ${cfg.tableFriction[2]}`;
   const fShard = `${cfg.shardFriction[0]} ${cfg.shardFriction[1]} ${cfg.shardFriction[2]}`;
   const solref = `${cfg.contactSolref[0]} ${cfg.contactSolref[1]}`;
+  const shardSolref = `${cfg.shardSolref[0]} ${cfg.shardSolref[1]}`;
   const solimp = `${cfg.contactSolimp[0]} ${cfg.contactSolimp[1]} ${cfg.contactSolimp[2]} ${cfg.contactSolimp[3]} ${cfg.contactSolimp[4]}`;
   const grabSolref = `${cfg.grabConnectSolref[0]} ${cfg.grabConnectSolref[1]}`;
   const grabSolimp = `${cfg.grabConnectSolimp[0]} ${cfg.grabConnectSolimp[1]} ${cfg.grabConnectSolimp[2]} ${cfg.grabConnectSolimp[3]} ${cfg.grabConnectSolimp[4]}`;
@@ -237,9 +244,9 @@ export function buildMujocoTowerXml(
   }
 
   // Body 0 = world, Body 1 = hand_anchor (mocap, 0 DOFs, 0 geoms)
-  // Geom 0 = oak_table, Geom 1 = parking_shelf
+  // Geom 0 = oak_table, Geom 1 = parking_shelf, Geom 2 = oak_table_shard
   let nextBodyId = 2;
-  let nextGeomId = 2;
+  let nextGeomId = 3;
   let nextFreeJointIdx = 0;
 
   const initialBlocks: InitialBlockSpec[] = [];
@@ -313,7 +320,7 @@ export function buildMujocoTowerXml(
       `    <body name="shd_${s}" pos="${parkXM.toFixed(4)} ${parkYM.toFixed(4)} ${parkZM.toFixed(4)}" sleep="init">` +
         `<inertial pos="0 0 0" quat="1 0 0 0" mass="0.0045" diaginertia="1e-6 1e-6 1e-6"/>` +
         `<freejoint/>` +
-        `<geom name="g_shd_${s}" type="mesh" mesh="voronoi_arch_${archIdx}" condim="3" friction="${fShard}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
+        `<geom name="g_shd_${s}" type="mesh" mesh="voronoi_arch_${archIdx}" condim="3" friction="${fShard}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
         `</body>`
     );
   }
@@ -336,7 +343,7 @@ export function buildMujocoTowerXml(
       `    <body name="ext_${e}" pos="${parkXM.toFixed(4)} ${parkYM.toFixed(4)} ${parkZM.toFixed(4)}" sleep="init">` +
         `<inertial pos="0 0 0" quat="1 0 0 0" mass="0.01" diaginertia="1e-5 1e-5 1e-5"/>` +
         `<freejoint/>` +
-        `<geom name="g_ext_${e}" type="box" size="0.50 0.50 0.50" condim="4" friction="${fGlass}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
+        `<geom name="g_ext_${e}" type="box" size="0.50 0.50 0.50" condim="4" friction="${fGlass}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
         `</body>`
     );
   }
@@ -356,7 +363,8 @@ export function buildMujocoTowerXml(
 ${voronoiBank.xmlAssets}  </asset>
   <worldbody>
     <geom name="oak_table" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="6" friction="${fTable}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_TABLE}" conaffinity="${MJ_CONAFFINITY_TABLE}"/>
-    <geom name="parking_shelf" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="3" contype="${MJ_CONTYPE_PARKING}" conaffinity="${MJ_CONAFFINITY_PARKING}"/>
+    <geom name="parking_shelf" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="1" priority="10" solref="0.012 1.25" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
+    <geom name="oak_table_shard" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${solimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
     <body name="hand_anchor" mocap="true" pos="0 2.0 0"/>
 ${bodyXmlChunks.join('\n')}
   </worldbody>
@@ -370,6 +378,7 @@ ${bodyXmlChunks.join('\n')}
     map: {
       tableGeomId: 0,
       parkingShelfGeomId: 1,
+      shardTableGeomId: 2,
       handMocapBodyId: 1,
       grabEqualityId: 0,
       blockBodyIds,

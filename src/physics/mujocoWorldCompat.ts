@@ -370,26 +370,45 @@ export function updateFreeBodyMassAndInertiaO1(
   const safeIy = Math.max(1e-10, iySi);
   const safeIz = Math.max(1e-10, izSi);
 
+  const minRotM0 = safeM * 2.5e-5;
+  const effIx = Math.max(minRotM0, safeIx);
+  const effIy = Math.max(minRotM0, safeIy);
+  const effIz = Math.max(minRotM0, safeIz);
+
   model.body_mass[bodyId] = safeM;
   model.body_subtreemass[bodyId] = safeM;
-  model.body_inertia[bodyId * 3 + 0] = safeIx;
-  model.body_inertia[bodyId * 3 + 1] = safeIy;
-  model.body_inertia[bodyId * 3 + 2] = safeIz;
+  model.body_inertia[bodyId * 3 + 0] = effIx;
+  model.body_inertia[bodyId * 3 + 1] = effIy;
+  model.body_inertia[bodyId * 3 + 2] = effIz;
   model.body_iquat[bodyId * 4 + 0] = 1;
   model.body_iquat[bodyId * 4 + 1] = 0;
   model.body_iquat[bodyId * 4 + 2] = 0;
   model.body_iquat[bodyId * 4 + 3] = 0;
 
+  // Critical for `body_simple == 1` free joints in MuJoCo 4.0: `mj_crb` / `mj_factorM` populates `qM`
+  // directly from `model.dof_M0[dofAdr + 0..5]`, while `mj_rne` gyroscopic `ω × (I ω)` reads `body_inertia`.
+  // Keeping both synchronized with `r_gyr >= 5 mm` (`2.5e-5 * m`) preserves exact 1.000g free-fall and
+  // prevents explicit-Euler gyroscopic divergence on 0.2 g splinters at 360 Hz!
+  model.dof_M0[dofAdr + 0] = safeM;
+  model.dof_M0[dofAdr + 1] = safeM;
+  model.dof_M0[dofAdr + 2] = safeM;
+  model.dof_M0[dofAdr + 3] = effIx;
+  model.dof_M0[dofAdr + 4] = effIy;
+  model.dof_M0[dofAdr + 5] = effIz;
+
   const invM = 1.0 / safeM;
-  const avgInvI = (1.0 / safeIx + 1.0 / safeIy + 1.0 / safeIz) / 3.0;
+  const invIx = 1.0 / effIx;
+  const invIy = 1.0 / effIy;
+  const invIz = 1.0 / effIz;
+  const avgInvI = (invIx + invIy + invIz) / 3.0;
   model.body_invweight0[bodyId * 2 + 0] = invM;
   model.body_invweight0[bodyId * 2 + 1] = avgInvI;
   model.dof_invweight0[dofAdr + 0] = invM;
   model.dof_invweight0[dofAdr + 1] = invM;
   model.dof_invweight0[dofAdr + 2] = invM;
-  model.dof_invweight0[dofAdr + 3] = avgInvI;
-  model.dof_invweight0[dofAdr + 4] = avgInvI;
-  model.dof_invweight0[dofAdr + 5] = avgInvI;
+  model.dof_invweight0[dofAdr + 3] = invIx;
+  model.dof_invweight0[dofAdr + 4] = invIy;
+  model.dof_invweight0[dofAdr + 5] = invIz;
 }
 
 export class MujocoRigidBodyCompat {

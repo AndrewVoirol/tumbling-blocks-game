@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { fractureBlockVoronoi } from '../src/physics/voronoiFracture';
 import {
+  BLOCK_HALF_Y,
   BLOCK_HEIGHT,
   BLOCK_LENGTH,
   BLOCK_WIDTH,
   INITIAL_BLOCK_COUNT,
   SIM_TIME_SCALE,
+  TABLE_RADIUS,
 } from '../src/physics/constants';
 import { ensureRapierInitialized, PhysicsWorld } from '../src/physics/PhysicsWorld';
 import { GlassAudioEngine } from '../src/audio/GlassAudioEngine';
@@ -1382,10 +1384,10 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
         world.rebuildTower('sandbox', 2, 2);
         const rw = world.getWorld();
         const m = rw.getModel();
-        // Keep only block 0 resting on the oak table under downward preload, pull eccentrically at +X tip in +Z
+        // Keep only block 0 resting at the center under downward preload; park unused blocks safely inside the 4.30 dm round table
         for (let i = 1; i < world.blocks.length; i++) {
           const rbOut = rw.getRigidBody(world.blocks[i].bodyHandle)!;
-          rbOut.setTranslation({ x: 3.0 + i * 0.4, y: BLOCK_HEIGHT * 0.5, z: 3.0 }, true);
+          rbOut.setTranslation({ x: 1.6 + i * 0.35, y: BLOCK_HEIGHT * 0.5, z: 1.5 }, true);
         }
         const blk0 = world.blocks[0];
         const rb0 = rw.getRigidBody(blk0.bodyHandle)!;
@@ -1519,6 +1521,178 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
       expect(world.turnPhase).toBe('COLLAPSED');
 
       world.dispose();
+    },
+    30000
+  );
+
+  it(
+    'T9: (a) flat tabletop shatter rebounds shards in 3D, (b) mid-air shards bounce & sleep on oak table, and (c) off-rim shards/blocks drop past 43cm circular rim with 0 solver resets',
+    async () => {
+      await ensureRapierInitialized();
+      const audio = new GlassAudioEngine();
+      audio.setMuted(true);
+
+      const percentile = (arr: number[], p: number): number => {
+        if (arr.length === 0) return 0;
+        const sorted = [...arr].sort((a, b) => a - b);
+        const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+        return sorted[idx];
+      };
+
+      // (a) Flat 26 cm tabletop drop: must complete impact rebound (`avgInitVySim > 0.8`) and hop in 3D rather than gluing to y = 0
+      {
+        const world = new PhysicsWorld(audio, 1);
+        world.rebuildTower('sandbox', 2, 1);
+        const rw = world.getWorld();
+        for (let i = 1; i < world.blocks.length; i++) {
+          rw.getRigidBody(world.blocks[i].bodyHandle)!.setTranslation(
+            { x: 1.6 + i * 0.35, y: BLOCK_HALF_Y, z: 1.5 },
+            true
+          );
+        }
+        const b0 = world.blocks[0];
+        const rb0 = rw.getRigidBody(b0.bodyHandle)!;
+        rb0.setTranslation({ x: 0, y: 2.6 + BLOCK_HALF_Y, z: 0 }, true);
+        rb0.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+        rb0.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        rb0.setAngvel({ x: 0, y: 0, z: 0 }, true);
+
+        const shardStats = new Map<number, { initY: number; peakY: number }>();
+        let loggedShatter = false;
+        let avgInitVySim = 0;
+
+        for (let f = 0; f < 150; f++) {
+          world.step(1 / 60);
+          if (b0.shattered && !loggedShatter) {
+            loggedShatter = true;
+            let sumVy = 0;
+            for (const s of world.shards) {
+              sumVy += rw.getRigidBody(s.bodyHandle)!.linvel().y;
+              shardStats.set(s.id, { initY: s.position[1], peakY: s.position[1] });
+            }
+            avgInitVySim = sumVy / Math.max(1, world.shards.length);
+          }
+          for (const s of world.shards) {
+            const st = shardStats.get(s.id);
+            if (st && s.position[1] > st.peakY) st.peakY = s.position[1];
+          }
+        }
+
+        const hopsMm = [...shardStats.values()].map((st) => Math.max(0, st.peakY - st.initY) * 100.0);
+        expect(b0.shattered).toBe(true);
+        expect(shardStats.size).toBeGreaterThanOrEqual(18);
+        expect(avgInitVySim).toBeGreaterThan(0.8);
+        expect(percentile(hopsMm, 0.5)).toBeGreaterThanOrEqual(6.0);
+        expect(percentile(hopsMm, 0.9)).toBeGreaterThanOrEqual(11.0);
+        expect(percentile(hopsMm, 1.0)).toBeLessThan(60.0);
+        expect(world.shards.length).toBeGreaterThanOrEqual(16);
+        for (const s of world.shards) {
+          expect(rw.getRigidBody(s.bodyHandle)!.isSleeping()).toBe(true);
+        }
+        world.dispose();
+      }
+
+      // (b) 15 cm mid-air shard drop onto oak_table: underdamped `shardSolref` at `priority=1` produces physical rebound & 100% sleep
+      {
+        const world = new PhysicsWorld(audio, 1);
+        world.rebuildTower('sandbox', 2, 1);
+        const rw = world.getWorld();
+        for (let i = 1; i < world.blocks.length; i++) {
+          rw.getRigidBody(world.blocks[i].bodyHandle)!.setTranslation(
+            { x: 1.6 + i * 0.35, y: BLOCK_HALF_Y, z: 1.5 },
+            true
+          );
+        }
+        const b0 = world.blocks[0];
+        const rb0 = rw.getRigidBody(b0.bodyHandle)!;
+        rb0.setTranslation({ x: 0, y: 1.5, z: 0 }, true);
+        rb0.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        world.shatterBlock(b0, [0, -BLOCK_HALF_Y, 0], 15.0, [0, 1, 0], false);
+
+        const stateMap = new Map<number, { touched: boolean; minY: number; peakY: number }>();
+        for (const s of world.shards) {
+          stateMap.set(s.id, { touched: false, minY: Infinity, peakY: -Infinity });
+        }
+        for (let f = 0; f < 150; f++) {
+          world.step(1 / 60);
+          for (const s of world.shards) {
+            const st = stateMap.get(s.id);
+            if (!st) continue;
+            const y = s.position[1];
+            const vy = rw.getRigidBody(s.bodyHandle)!.linvel().y;
+            if (!st.touched && f >= 6 && y < 0.11 && vy >= -0.02) {
+              st.touched = true;
+              st.minY = y;
+              st.peakY = y;
+            } else if (st.touched && y > st.peakY) {
+              st.peakY = y;
+            }
+          }
+        }
+        const reboundsMm: number[] = [];
+        for (const st of stateMap.values()) {
+          if (st.touched) reboundsMm.push(Math.max(0, st.peakY - st.minY) * 100.0);
+        }
+        expect(reboundsMm.length).toBeGreaterThanOrEqual(16);
+        expect(percentile(reboundsMm, 0.5)).toBeGreaterThanOrEqual(2.0);
+        expect(percentile(reboundsMm, 0.9)).toBeGreaterThanOrEqual(7.0);
+        expect(percentile(reboundsMm, 1.0)).toBeLessThan(80.0);
+        for (const s of world.shards) {
+          expect(rw.getRigidBody(s.bodyHandle)!.isSleeping()).toBe(true);
+        }
+        world.dispose();
+      }
+
+      // (c) Off-rim circular table boundary (`TABLE_RADIUS = 4.30 dm`, inside `±4.80 dm` MJCF box) & monotonic collapse solver stability
+      {
+        const world = new PhysicsWorld(audio, 18);
+        for (let i = 0; i < 45; i++) world.step(1 / 60);
+        const rw = world.getWorld();
+        const d = rw.getData();
+
+        for (const id of [0, 1, 3, 4]) {
+          const rb = rw.getRigidBody(world.blocks[id].bodyHandle)!;
+          // Place at r = 4.50 dm (past circular 4.30 dm walnut rim, inside ±4.80 dm MJCF box extent)
+          rb.setTranslation({ x: 3.3, y: BLOCK_HALF_Y + id * 0.18, z: 3.05 }, true);
+          rb.setLinvel({ x: 1.4, y: 0, z: 1.2 }, true);
+        }
+        rw.wakeActiveTowerBlocks?.();
+
+        let prevTime = d.time;
+        let solverResets = 0;
+        for (let f = 0; f < 240; f++) {
+          world.step(1 / 60);
+          if (d.time < prevTime) solverResets++;
+          prevTime = d.time;
+        }
+        expect(solverResets).toBe(0);
+
+        let floatingOffRimShards = 0;
+        for (const s of world.shards) {
+          const r = Math.hypot(s.position[0], s.position[2]);
+          if (r > TABLE_RADIUS + 0.03 && s.position[1] > -0.05) {
+            floatingOffRimShards++;
+          }
+          if (r <= TABLE_RADIUS + 0.01 && s.position[1] > -0.02) {
+            expect(rw.getRigidBody(s.bodyHandle)!.isSleeping()).toBe(true);
+          }
+        }
+        let floatingOffRimBlocks = 0;
+        for (const b of world.blocks) {
+          if (b.shattered) continue;
+          const r = Math.hypot(b.position[0], b.position[2]);
+          if (r > TABLE_RADIUS + 0.08 && b.position[1] > -0.05) {
+            floatingOffRimBlocks++;
+          }
+          if (r <= TABLE_RADIUS + 0.06 && b.position[1] > -0.02) {
+            expect(rw.getRigidBody(b.bodyHandle)!.isSleeping()).toBe(true);
+          }
+        }
+        expect(floatingOffRimShards).toBe(0);
+        expect(floatingOffRimBlocks).toBe(0);
+
+        world.dispose();
+      }
     },
     30000
   );

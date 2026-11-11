@@ -37,6 +37,8 @@ export interface MujocoCalibratedConfig {
 
   /** Contact normal `solref = [timeconst_sec, dampratio]` (`>= 2 * timestepSec` for exact zero-bounce equilibrium) */
   readonly contactSolref: readonly [number, number];
+  /** Underdamped Voronoi glass-shard contact `solref = [timeconst_sec, dampratio]` (`>= 2/360 s` for 3D chatter & bounce) */
+  readonly shardSolref: readonly [number, number];
   /** Contact normal/frictional `solimp = [d0, dwidth, width_m, midpoint, power]` */
   readonly contactSolimp: readonly [number, number, number, number, number];
   /** Independent tangential friction `solreffriction = [timeconst_sec, dampratio]` */
@@ -80,11 +82,13 @@ export const MUJOCO_CALIBRATED_CONFIG: MujocoCalibratedConfig = {
   glassFriction: [0.275, 0.0036, 0.00018],
   glassKineticFriction: [0.125, 0.0016, 0.00012],
   tableFriction: [0.46, 0.0052, 0.00035],
-  shardFriction: [0.34, 0.0022, 0.00025],
+  shardFriction: [0.54, 0.0032, 0.00035],
 
   // Empirically verified: 18L sag = 0.044 mm (< 0.15 mm), 24L sag = 0.103 mm (< 0.50 mm),
   // 17/17 loose-vs-bearing row contrast, 100% native island sleep in <= 0.32 s!
   contactSolref: [0.0042, 1.12],
+  // Underdamped glass shard bounce (`timeconst = 6.0 ms > 2 * 1/360 s`, `zeta = 0.48` -> e ≈ 0.18 glass restitution)
+  shardSolref: [0.0060, 0.48],
   contactSolimp: [0.9945, 0.9995, 0.00022, 0.5, 2.0],
   contactSolrefFriction: [0.0045, 1.18],
 

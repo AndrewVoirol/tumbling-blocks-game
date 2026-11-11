@@ -6,3 +6,5 @@ coverage
 .DS_Store
 *.local
 .vercel
+.agents/*
+!.agents/skills/
