@@ -112,10 +112,21 @@ function buildRelayRoomSocketUrl(
   role: MultiplayerRole,
   clientId: string
 ): string {
-  const sep = baseUrl.includes('?') ? '&' : '?';
-  return `${baseUrl}${sep}room=${encodeURIComponent(roomCode)}&role=${encodeURIComponent(
-    role
-  )}&clientId=${encodeURIComponent(clientId)}`;
+  try {
+    const u = new URL(baseUrl);
+    if (u.pathname === '' || u.pathname === '/') {
+      u.pathname = '/__vitrail_mp';
+    }
+    u.searchParams.set('room', roomCode);
+    u.searchParams.set('role', role);
+    u.searchParams.set('clientId', clientId);
+    return u.toString();
+  } catch {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    return `${baseUrl}${sep}room=${encodeURIComponent(roomCode)}&role=${encodeURIComponent(
+      role
+    )}&clientId=${encodeURIComponent(clientId)}`;
+  }
 }
 
 function buildPeerJsSocketUrl(baseUrl: string, peerId: string, token: string): string {
@@ -179,6 +190,9 @@ export class VitrailMultiplayerClient {
   private stateChannel: RTCDataChannel | null = null;
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private activeConnectionId: string = '';
+  private remoteClientId: string | null = null;
+  private pcRemoteClientId: string | null = null;
+  private unloadListenersAttached: boolean = false;
 
   // Ping / RTT measurement
   private pingIntervalTimer: ReturnType<typeof setInterval> | null = null;
@@ -233,6 +247,48 @@ export class VitrailMultiplayerClient {
     }
 
     this.startPingLoop();
+    this.attachUnloadListeners();
+  }
+
+  private readonly onWindowUnload = (): void => {
+    this.sendBestEffortPeerBye();
+    this.dispose();
+  };
+
+  private attachUnloadListeners(): void {
+    if (this.unloadListenersAttached) return;
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('pagehide', this.onWindowUnload);
+      window.addEventListener('beforeunload', this.onWindowUnload);
+      this.unloadListenersAttached = true;
+    }
+  }
+
+  private detachUnloadListeners(): void {
+    if (!this.unloadListenersAttached) return;
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('pagehide', this.onWindowUnload);
+      window.removeEventListener('beforeunload', this.onWindowUnload);
+    }
+    this.unloadListenersAttached = false;
+  }
+
+  private sendBestEffortPeerBye(): void {
+    const raw = JSON.stringify({ type: 'peer_bye', clientId: this.clientId });
+    if (this.ctrlChannel?.readyState === 'open') {
+      try {
+        this.ctrlChannel.send(raw);
+      } catch {
+        // Ignore
+      }
+    }
+    if (this.relayWs?.readyState === WebSocket.OPEN) {
+      try {
+        this.relayWs.send(raw);
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   private updateStatus(nextState?: MultiplayerConnectionState): void {
@@ -373,13 +429,15 @@ export class VitrailMultiplayerClient {
     }
     if (meta.__relay === 'peer_joined') {
       if (meta.role && meta.role !== this.role) {
+        // Tear down any orphaned WebRTC DataChannel from a previous peer tab session before resyncing
+        this.closePeerConnection();
+        this.remoteClientId = null;
         this.relayPeerPresent = true;
         this.updateStatus();
         if (
           this.role === 'guest' &&
           (this.options.enableWebRtcUpgrade ?? true) &&
-          typeof RTCPeerConnection !== 'undefined' &&
-          this.ctrlChannel?.readyState !== 'open'
+          typeof RTCPeerConnection !== 'undefined'
         ) {
           void this.initiateWebRtcOffer('relay');
         }
@@ -388,6 +446,8 @@ export class VitrailMultiplayerClient {
     }
     if (meta.__relay === 'peer_left') {
       if (meta.role && meta.role !== this.role) {
+        this.closePeerConnection();
+        this.remoteClientId = null;
         this.relayPeerPresent = false;
         this.updateStatus();
       }
@@ -546,6 +606,7 @@ export class VitrailMultiplayerClient {
   ): RTCPeerConnection {
     this.closePeerConnection();
     this.pendingIceCandidates = [];
+    this.pcRemoteClientId = this.remoteClientId;
 
     const pc = new RTCPeerConnection({
       iceServers: this.options.iceServers ?? DEFAULT_PUBLIC_ICE_SERVERS,
@@ -632,6 +693,19 @@ export class VitrailMultiplayerClient {
         pc.connectionState === 'disconnected' ||
         pc.connectionState === 'closed'
       ) {
+        this.closePeerConnection();
+        this.updateStatus();
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (this.disposed || this.pc !== pc) return;
+      if (
+        pc.iceConnectionState === 'failed' ||
+        pc.iceConnectionState === 'disconnected' ||
+        pc.iceConnectionState === 'closed'
+      ) {
+        this.closePeerConnection();
         this.updateStatus();
       }
     };
@@ -839,10 +913,43 @@ export class VitrailMultiplayerClient {
       return;
     }
 
-    if (parsed.type === 'hello') {
-      if (source === 'relay' && parsed.role !== this.role && !this.relayPeerPresent) {
-        this.relayPeerPresent = true;
+    if (parsed.type === 'peer_bye') {
+      if (this.remoteClientId === null || this.remoteClientId === parsed.clientId) {
+        this.closePeerConnection();
+        this.remoteClientId = null;
+        if (source === 'relay') {
+          this.relayPeerPresent = false;
+        }
         this.updateStatus();
+      } else if (this.pcRemoteClientId === parsed.clientId) {
+        this.closePeerConnection();
+        this.updateStatus();
+      }
+      return;
+    }
+
+    if (parsed.type === 'hello') {
+      if (parsed.role !== this.role) {
+        const prevClientId = this.remoteClientId;
+        this.remoteClientId = parsed.clientId;
+        if (source === 'webrtc') {
+          this.pcRemoteClientId = parsed.clientId;
+        } else if (source === 'relay') {
+          if (
+            this.ctrlChannel?.readyState === 'open' &&
+            (this.pcRemoteClientId !== parsed.clientId ||
+              (prevClientId !== null && prevClientId !== parsed.clientId))
+          ) {
+            // Reconnecting tab sent `hello` over relay with a new `clientId`: tear down zombie DataChannel!
+            this.closePeerConnection();
+          } else if (this.pc && this.pcRemoteClientId === null) {
+            this.pcRemoteClientId = parsed.clientId;
+          }
+          if (!this.relayPeerPresent) {
+            this.relayPeerPresent = true;
+          }
+          this.updateStatus();
+        }
       }
       this.options.onControlMessage?.(parsed);
       return;
@@ -962,12 +1069,14 @@ export class VitrailMultiplayerClient {
       try {
         this.pc.onicecandidate = null;
         this.pc.onconnectionstatechange = null;
+        this.pc.oniceconnectionstatechange = null;
         this.pc.close();
       } catch {
         // Ignore
       }
       this.pc = null;
     }
+    this.pcRemoteClientId = null;
   }
 
   private cleanupRelaySocket(): void {
@@ -1023,6 +1132,8 @@ export class VitrailMultiplayerClient {
 
   public dispose(): void {
     if (this.disposed) return;
+    this.detachUnloadListeners();
+    this.sendBestEffortPeerBye();
     this.disposed = true;
     if (this.pingIntervalTimer !== null) {
       clearInterval(this.pingIntervalTimer);
