@@ -9,13 +9,13 @@ description: >-
 
 # Vitrail Simulation Mastery & Swarm Audit Playbook
 
-Use this playbook and its executable 6-probe dynamical harness (`scripts/audit-dynamics.mjs`) to verify physical accuracy across continuous trajectories—catching defects that endpoint unit tests miss—and to partition multi-agent `swarm` work cleanly without file collisions.
+Use this playbook and its executable 7-probe dynamical harness (`scripts/audit-dynamics.mjs`) to verify physical accuracy across continuous AND multi-stage stateful trajectories—catching defects that single-shot endpoint unit tests miss—and to partition multi-agent `swarm` work cleanly without file collisions.
 
 ---
 
 ## 1. Fast Verification Pipeline (Run Before & After Any Simulation Change)
 
-1. **6-Probe Continuous Dynamics Harness (`~6 s`, exits `1` on any regression)**:
+1. **7-Probe Continuous & Multi-Stage Dynamics Harness (`~6 s`, exits `1` on any regression)**:
    ```bash
    node .agents/skills/vitrail-simulation-audit/scripts/audit-dynamics.mjs
    ```
@@ -26,6 +26,7 @@ Use this playbook and its executable 6-probe dynamical harness (`scripts/audit-d
    - `marginalOverhangTopple`: `+3.9 cm` (`5.8°`) cantilevered 6-course upper sub-tower dynamically topples rather than freezing asleep under `sleepTolerance`.
    - `polariscopeSpatialAccuracy`: Unloaded top course `[0,0,0,0]`, loose Row-0 slot `[0,0,0,0]`, cantilevered half `< 0.02` vs. `+X` bearing fulcrum `> 0.28`.
    - `grazingPullIsolation`: Full-row grazing extraction keeps upper-course lateral drift `< 2.0 mm` and cleanly clears Layer-0 tabletop prisms.
+   - `multiStageSupportLossAndTelemetry`: Multi-stage Sandbox play (shatter upper courses so Voronoi shards sleep perched at `y ~ 20–22 cm` + rest 1 crooked `22°` top-notch outlier block -> verify consensus `leanAngleDeg < 2.0°` -> buckle/shatter supporting tower underneath -> verify `0` unsupported elevated shards freeze in mid-air and HUD telemetry transitions cleanly to `currentLayers = 0` / `Toppled`).
 2. **MuJoCo 4.0 Calibration Scorecard (`8/8` Gates, `~5 s`)**:
    ```bash
    npm run calibrate:physics
@@ -38,7 +39,7 @@ Use this playbook and its executable 6-probe dynamical harness (`scripts/audit-d
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `12/12` Vitest Suite (`T1–T9`, `~44 s`)**:
+5. **Complete `34/34` Vitest Suite (`4` suites: `T1–T9`, `C1–C6`, Acoustics & Multiplayer, `~44 s`)**:
    ```bash
    npx vitest run
    ```

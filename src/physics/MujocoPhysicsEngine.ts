@@ -217,6 +217,7 @@ export class MujocoPhysicsEngine {
   public carriedYawOffsetRad: number = 0;
 
   public leanAngleDeg: number = 0;
+  private solverLeanAngleDeg: number = 0;
   public wobbleSpeedDegPerSec: number = 0;
   public centerOfMassXZCm: [number, number] = [0, 0];
   public currentLayers: number = INITIAL_LAYERS;
@@ -287,10 +288,13 @@ export class MujocoPhysicsEngine {
   private blockLastRockTime: Float64Array = new Float64Array(128);
   private freeShardSlots: number[] = [];
   private shardQuietSubsteps = new Uint16Array(MAX_ACTIVE_SHARDS);
+  private shardNoSupportSubsteps = new Uint8Array(MAX_ACTIVE_SHARDS);
   private shardAirborneSubsteps = new Uint16Array(MAX_ACTIVE_SHARDS);
   private shardHadContactSubstep = new Uint8Array(MAX_ACTIVE_SHARDS);
   private shardLastImpactSimTime = new Float64Array(MAX_ACTIVE_SHARDS);
   private shardLastAudioSimTime = new Float64Array(MAX_ACTIVE_SHARDS);
+  private standingTiltsScratch = new Float32Array(128);
+  private courseUprightScratch = new Uint8Array(64);
   private slotRenderVertices: Array<Float32Array | null> = new Array(MAX_ACTIVE_SHARDS).fill(null);
   private exportedShardIds = new Set<number>();
   private archGeomPos: Float64Array = new Float64Array(0);
@@ -542,6 +546,7 @@ export class MujocoPhysicsEngine {
 
     this.worldCompat = new MujocoWorldCompat(this.mj, this.model, this.data, this.map);
     this.shardQuietSubsteps.fill(0);
+    this.shardNoSupportSubsteps.fill(0);
     this.shardAirborneSubsteps.fill(0);
     this.shardHadContactSubstep.fill(0);
     this.shardLastImpactSimTime.fill(-10);
@@ -599,6 +604,7 @@ export class MujocoPhysicsEngine {
     this.accumulatorSec = 0;
     this.simTime = 0;
     this.leanAngleDeg = 0;
+    this.solverLeanAngleDeg = 0;
     this.wobbleSpeedDegPerSec = 0;
     this.currentLayers = towerLayers;
     this.peakLayers = towerLayers;
@@ -1089,6 +1095,14 @@ export class MujocoPhysicsEngine {
           }
         }
         this.worldCompat.wakeBody(b.bodyHandle);
+      }
+    }
+    for (let i = 0; i < this.shards.length; i++) {
+      const s = this.shards[i];
+      if (s.position[1] > 0.18) {
+        this.shardQuietSubsteps[s.slotIndex] = 0;
+        this.shardNoSupportSubsteps[s.slotIndex] = 0;
+        this.worldCompat.wakeBody(s.bodyHandle);
       }
     }
   }
@@ -1718,6 +1732,15 @@ export class MujocoPhysicsEngine {
     if (!this.model || !this.data) return;
     this.sandboxCollapseActive = true;
     this.wakeTowerForInteraction();
+    this.worldCompat.wakeAllActiveShards();
+    let maxIntactLayer = 0;
+    for (const b of this.blocks) {
+      if (!b.shattered && !b.extracted && b.assignedLayer > maxIntactLayer) {
+        maxIntactLayer = b.assignedLayer;
+      }
+    }
+    const isShortenedStack = maxIntactLayer > 0 && maxIntactLayer < 16;
+    const shortBaseCut = Math.max(1, Math.floor(maxIntactLayer * 0.24));
     for (const b of this.blocks) {
       if (b.shattered) continue;
       const info = this.worldCompat.getMapping(b.bodyHandle);
@@ -1726,7 +1749,16 @@ export class MujocoPhysicsEngine {
       const invMassFroude = INV_FROUDE_VEL_SCALE / massKg;
 
       for (let k = 0; k < 6; k++) this.data.qvel[info.dofAdr + k] = 0;
-      if (b.assignedLayer <= 2) {
+      if (isShortenedStack) {
+        if (b.assignedLayer <= shortBaseCut) {
+          this.data.qvel[info.dofAdr + 0] = -0.44 * invMassFroude;
+          this.data.qvel[info.dofAdr + 2] = -0.06 * invMassFroude;
+        } else {
+          const rel = b.assignedLayer / Math.max(1, maxIntactLayer);
+          this.data.qvel[info.dofAdr + 0] = (0.15 + rel * 0.12) * invMassFroude;
+          this.data.qvel[info.dofAdr + 2] = (b.assignedSlot - 1) * 0.055 * invMassFroude;
+        }
+      } else if (b.assignedLayer <= 2) {
         this.data.qvel[info.dofAdr + 0] = -0.32 * invMassFroude;
         this.data.qvel[info.dofAdr + 2] = -0.05 * invMassFroude;
       } else if (b.assignedLayer <= 9) {
@@ -3159,6 +3191,53 @@ export class MujocoPhysicsEngine {
       blkInfo.dofAdr,
       520 + (block.id % 64)
     );
+    // Wake ONLY sleeping blocks/shards resting ON TOP OF this shattered block (`y > bPosY + 0.06 dm`),
+    // never waking settled tabletop blocks/shards underneath (`y <= bPosY`) during a collapse!
+    const bPosX = pos.x;
+    const bPosY = pos.y;
+    const bPosZ = pos.z;
+    const bodyTreeId = this.model.body_treeid;
+    const treeAsleep = this.data.tree_asleep;
+    const qfrcApplied = this.data.qfrc_applied;
+    for (let k = 0; k < this.blocks.length; k++) {
+      const ob = this.blocks[k];
+      if (ob.shattered || ob.extracted) continue;
+      if (
+        ob.position[1] > bPosY + 0.08 &&
+        Math.abs(ob.position[0] - bPosX) < 0.78 &&
+        Math.abs(ob.position[2] - bPosZ) < 0.78
+      ) {
+        const tid = bodyTreeId[ob.bodyHandle];
+        if (tid >= 0 && treeAsleep[tid] >= 0) {
+          const info = this.worldCompat.getMapping(ob.bodyHandle);
+          if (info) {
+            info.settledAsleep = false;
+            info.quietTicks = 0;
+            qfrcApplied[info.dofAdr + 1] += 1e-9;
+          }
+        }
+      }
+    }
+    for (let k = 0; k < this.shards.length; k++) {
+      const os = this.shards[k];
+      if (
+        os.position[1] > Math.max(0.28, bPosY + 0.05) &&
+        Math.abs(os.position[0] - bPosX) < 0.65 &&
+        Math.abs(os.position[2] - bPosZ) < 0.65
+      ) {
+        const tid = bodyTreeId[os.bodyHandle];
+        if (tid >= 0 && treeAsleep[tid] >= 0) {
+          this.shardQuietSubsteps[os.slotIndex] = 0;
+          this.shardNoSupportSubsteps[os.slotIndex] = 0;
+          qfrcApplied[this.map.shardDofAdr[os.slotIndex] + 1] += 1e-9;
+          const info = this.worldCompat.getMapping(os.bodyHandle);
+          if (info) {
+            info.settledAsleep = false;
+            info.quietTicks = 0;
+          }
+        }
+      }
+    }
 
     const impactEnergy01 = Math.max(0.0, Math.min(1.0, (impactSpeed - 12.5) / 15.0));
     const energyTargetShards = Math.round(21 + impactEnergy01 * 5);
@@ -3729,7 +3808,7 @@ export class MujocoPhysicsEngine {
     // step at 360 Hz (`6` substeps/frame) and scale Newton iterations (`26 -> 8`) so collapses run `< 16 ms` P95!
     const isCollapseCascade =
       this.turnPhase === 'COLLAPSED' ||
-      (this.sandboxCollapseActive && (this.leanAngleDeg >= 8.5 || this.shatteredCount >= 1)) ||
+      (this.sandboxCollapseActive && (this.solverLeanAngleDeg >= 8.5 || this.shatteredCount >= 1)) ||
       this.shards.length > 48 ||
       (this.shatteredCount >= 2 && this.shards.length >= 32);
     const isHeavyShardCascade =
@@ -3737,7 +3816,7 @@ export class MujocoPhysicsEngine {
     const isActivelyToppling =
       isCollapseCascade ||
       (this.gameMode !== 'sandbox' &&
-        (this.leanAngleDeg > 2.2 || this.wobbleSpeedDegPerSec > 12.0));
+        (this.solverLeanAngleDeg > 2.2 || this.wobbleSpeedDegPerSec > 12.0));
     const subDt = isHeavyShardCascade
       ? 1.0 / 300.0
       : isCollapseCascade
@@ -3859,6 +3938,9 @@ export class MujocoPhysicsEngine {
 
     const qpos = d.qpos;
     const qvel = d.qvel;
+    const qfrcConstraint = d.qfrc_constraint;
+    const bodyMass = m.body_mass;
+    const geomContype = m.geom_contype;
     const bodyTreeId = m.body_treeid;
     const treeAsleep = d.tree_asleep;
 
@@ -3899,9 +3981,9 @@ export class MujocoPhysicsEngine {
         const wz = qvel[dof + 5];
         const vSi = Math.hypot(vx, vy, vz);
         const wSi = Math.hypot(wx, wy, wz);
-        // Strictly restrict intact-block micro-jitter damping to blocks already resting on the tabletop (`yM < 0.028 m`),
-        // or after >95 quiet substeps of ultra-slow residual creep (`vSi < 0.014 m/s && Math.abs(vy) < 0.006 m/s`)
-        // on post-collapse rubble piles—NEVER braking blocks starting to tip, fall, or roll past the circular rim!
+        // Strictly require verified upward contact constraint force (`hasUpwardSupport`) before damping
+        // grounded tabletop blocks (`yM < 0.028 m`) or supported post-collapse rubble (`settledPileCreep`)—
+        // NEVER braking unsupported airborne blocks!
         const groundedOnTable = yM > -0.012 && yM < 0.028 && Math.abs(vy) < 0.014 && vSi < 0.032 && wSi < 0.65;
         const settledPileCreep = yM > -0.012 && yM < 0.28 && Math.abs(vy) < 0.006 && vSi < 0.014 && wSi < 0.22;
         if (groundedOnTable || settledPileCreep) {
@@ -3980,23 +4062,55 @@ export class MujocoPhysicsEngine {
         qvel[dofAdr + 5] = wz;
       }
 
-      // Never damp shards past the circular walnut rim or mid-air bounce arcs (`yM >= 0.026 m`)!
+      // Hard physical invariant: above the static oak tabletop (`yM >= 0.026 m`), track consecutive zero-support
+      // substeps via `d.qfrc_constraint`. Allowing `<= 4` chatter substeps (`<= 6.7 ms`) lets facet-buzzing pile
+      // shards sleep cleanly, while airborne bounce apexes (`vy ~ 0`) and shards losing support stay 100% free-falling!
+      const fCy = qfrcConstraint[dofAdr + 1];
+      let noSup = 0;
+      if (yM >= 0.026) {
+        if (fCy > bodyMass[s.bodyHandle] * 1.5) {
+          this.shardNoSupportSubsteps[s.slotIndex] = 0;
+        } else {
+          noSup = Math.min(255, this.shardNoSupportSubsteps[s.slotIndex] + 1);
+          this.shardNoSupportSubsteps[s.slotIndex] = noSup;
+        }
+      } else {
+        this.shardNoSupportSubsteps[s.slotIndex] = 0;
+      }
+      const hasUpwardSupport = yM < 0.026 || noSup <= 4;
       const onTableRim = xM * xM + zM * zM <= shardRimM2;
       if (!onTableRim || yM < -0.012 || (Math.abs(vy) > 0.09 && s.quietSubsteps < 360)) {
         this.shardQuietSubsteps[s.slotIndex] = 0;
         if (info) info.settledAsleep = false;
         continue;
       }
+      // Relieve tabletop hero shards (`yM < 2.4 cm`, age > 0.7 s) pinched at > 2.5 N (`> 25x` shard weight)
+      // beneath heavy collapsed intact blocks so `zeroSnap` never turns a thin splinter into a `20 N` buzzing wedge.
+      if (
+        yM < 0.024 &&
+        s.quietSubsteps > 260 &&
+        Math.abs(fCy) > 2.5 &&
+        geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD
+      ) {
+        setBodyGeomCollisionMask(
+          m,
+          s.bodyHandle,
+          s.colliderHandle,
+          MJ_CONTYPE_CULLET_SHARD,
+          MJ_CONAFFINITY_CULLET_ON_TABLE
+        );
+      }
       const vSi = Math.hypot(vx, vy, vz);
       const wSi = Math.hypot(wx, wy, wz);
       const groundedShard = yM < 0.026 && vSi < 0.11 && Math.abs(vy) < 0.05 && wSi < 3.6;
-      const longLivedLowEnergy = yM < 0.22 && s.quietSubsteps > 280 && vSi < 0.32 && Math.abs(vy) < 0.16;
-      if (groundedShard || longLivedLowEnergy) {
+      const supportedPileBuzz =
+        hasUpwardSupport && yM < 0.22 && s.quietSubsteps > 280 && vSi < 0.32 && Math.abs(vy) < 0.16;
+      if (groundedShard || supportedPileBuzz) {
         const qCount = Math.min(65535, this.shardQuietSubsteps[s.slotIndex] + tickInc);
         this.shardQuietSubsteps[s.slotIndex] = qCount;
-        if (qCount > 14 || longLivedLowEnergy) {
-          const damp = qCount > 40 || s.quietSubsteps > 440 ? 0.25 : 0.72;
-          const zeroSnap = qCount > 75 || s.quietSubsteps > 580;
+        if (qCount > 14 || supportedPileBuzz) {
+          const damp = qCount > 40 || (supportedPileBuzz && s.quietSubsteps > 440) ? 0.25 : 0.72;
+          const zeroSnap = qCount > 75 || (supportedPileBuzz && s.quietSubsteps > 580);
           qvel[dofAdr + 0] = zeroSnap || Math.abs(vx * damp) < 5e-3 ? 0 : vx * damp;
           qvel[dofAdr + 1] = zeroSnap || Math.abs(vy * damp) < 5e-3 ? 0 : vy * damp;
           qvel[dofAdr + 2] = zeroSnap || Math.abs(vz * damp) < 5e-3 ? 0 : vz * damp;
@@ -4034,13 +4148,25 @@ export class MujocoPhysicsEngine {
     const geomConaffinity = m.geom_conaffinity;
 
     let maxTowerY = 0;
+    let maxStructuralY = 0;
     let maxActiveLayer = 0;
     let sumX = 0;
     let sumZ = 0;
     let countInTower = 0;
-    let maxTiltRad = 0;
+    let standingCount = 0;
+    let tumbledOrDroppedCount = 0;
+    let maxDynamicTipTiltRad = 0;
+    let rawMaxTiltRad = 0;
+    let rawSumTiltRad = 0;
+    let rawSumX = 0;
+    let rawSumZ = 0;
+    let maxBlockLinSpeed = 0;
     let sumTiltRad = 0;
     let sumWobbleOmega = 0;
+    const standingTilts = this.standingTiltsScratch;
+    const courseUpright = this.courseUprightScratch;
+    courseUpright.fill(0);
+    const uprightMaxTiltRad = (30.0 * Math.PI) / 180.0;
 
     for (let i = 0; i < this.blocks.length; i++) {
       const b = this.blocks[i];
@@ -4099,22 +4225,54 @@ export class MujocoPhysicsEngine {
 
       if (!b.extracted && b.id !== this.activeBlockId) {
         const horizR = Math.hypot(tx, tz);
+        const upVec = quatRotateVec3(b.rotation, [0, 1, 0]);
+        const tilt = Math.acos(Math.max(-1, Math.min(1, upVec[1])));
+        const omegaHoriz = Math.hypot(avx, avz);
+        const linSpeed = Math.hypot(lvx, lvy, lvz);
+        const nominalY = (b.assignedLayer + 0.5) * BLOCK_HEIGHT;
+        const isPancaked = b.assignedLayer >= 2 && nominalY - ty > BLOCK_HEIGHT * 1.45;
+
         if (horizR < 0.85 && ty > 0.04) {
           countInTower++;
-          sumX += tx;
-          sumZ += tz;
+          rawSumX += tx;
+          rawSumZ += tz;
+          rawSumTiltRad += tilt;
+          if (tilt > rawMaxTiltRad) rawMaxTiltRad = tilt;
           if (ty + BLOCK_HALF_Y > maxTowerY) maxTowerY = ty + BLOCK_HALF_Y;
+          sumWobbleOmega += omegaHoriz;
+          if (linSpeed > maxBlockLinSpeed) maxBlockLinSpeed = linSpeed;
+
+          // Track instantaneous dynamic tipping during active collapse/overhang turnover (`omega > 0.30` or `v > 0.22`)
           if (
-            ty >= Math.max(0.03, (b.assignedLayer - 0.85) * BLOCK_HEIGHT) &&
-            b.assignedLayer > maxActiveLayer
+            (omegaHoriz >= 0.30 || linSpeed >= 0.22) &&
+            ty >= Math.max(0.04, (b.assignedLayer - 1.6) * BLOCK_HEIGHT) &&
+            tilt > maxDynamicTipTiltRad
           ) {
-            maxActiveLayer = b.assignedLayer;
+            maxDynamicTipTiltRad = tilt;
           }
-          const upVec = quatRotateVec3(b.rotation, [0, 1, 0]);
-          const tilt = Math.acos(Math.max(-1, Math.min(1, upVec[1])));
-          if (tilt > maxTiltRad) maxTiltRad = tilt;
-          sumTiltRad += tilt;
-          sumWobbleOmega += Math.hypot(avx, avz);
+
+          if (horizR < 0.78 && tilt <= uprightMaxTiltRad && !isPancaked) {
+            sumX += tx;
+            sumZ += tz;
+            sumTiltRad += tilt;
+            if (standingCount < standingTilts.length) {
+              standingTilts[standingCount] = tilt;
+            }
+            standingCount++;
+            if (ty + BLOCK_HALF_Y > maxStructuralY) maxStructuralY = ty + BLOCK_HALF_Y;
+            if (
+              ty >= Math.max(0.03, (b.assignedLayer - 0.85) * BLOCK_HEIGHT) &&
+              b.assignedLayer > maxActiveLayer
+            ) {
+              maxActiveLayer = b.assignedLayer;
+            }
+            const physCourse = Math.max(0, Math.min(63, Math.floor(ty / BLOCK_HEIGHT)));
+            courseUpright[physCourse]++;
+          } else {
+            tumbledOrDroppedCount++;
+          }
+        } else {
+          tumbledOrDroppedCount++;
         }
       }
     }
@@ -4155,6 +4313,51 @@ export class MujocoPhysicsEngine {
       s.position[0] = tx; s.position[1] = ty; s.position[2] = tz;
       s.rotation[0] = sRot[0]; s.rotation[1] = sRot[1]; s.rotation[2] = sRot[2]; s.rotation[3] = sRot[3];
       const sTree = bodyTreeId[s.bodyHandle];
+      const sInfo = this.worldCompat.getMapping(s.bodyHandle);
+      const shardAsleep = (sInfo?.settledAsleep ?? false) || (sTree >= 0 && treeAsleep[sTree] >= 0);
+
+      // Continuous Unsupported-Sleep Invariant on elevated hero shards (`ty > 4.5 cm`, above any tabletop pile):
+      // Cullet shards only collide with `oak_table_shard` (`y = 0`) and cannot freeze mid-air under `hasUpwardSupport`.
+      // Hero shards sleeping above `4.5 cm` must have an active intact block or strictly lower (`dy > 0.06 dm`,
+      // forming an acyclic support DAG) hero shard beneath them; otherwise wake immediately!
+      if (shardAsleep && ty > 0.45 && geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD) {
+        let hasSupportBeneath = false;
+        for (let j = 0; j < this.blocks.length; j++) {
+          const sb = this.blocks[j];
+          if (sb.shattered || sb.extracted) continue;
+          const dy = ty - sb.position[1];
+          if (
+            dy > -0.45 &&
+            dy < 0.72 &&
+            Math.abs(tx - sb.position[0]) < 0.82 &&
+            Math.abs(tz - sb.position[2]) < 0.82
+          ) {
+            hasSupportBeneath = true;
+            break;
+          }
+        }
+        if (!hasSupportBeneath) {
+          for (let j = 0; j < this.shards.length; j++) {
+            const os = this.shards[j];
+            if (os.id === s.id || geomContype[os.colliderHandle] !== MJ_CONTYPE_HERO_SHARD) continue;
+            const osAdr = this.map.shardQposAdr[os.slotIndex];
+            const ox = qpos[osAdr + 0] * DM_PER_M;
+            const oy = qpos[osAdr + 1] * DM_PER_M;
+            const oz = qpos[osAdr + 2] * DM_PER_M;
+            const dy = ty - oy;
+            if (dy > 0.06 && dy < 0.56 && Math.abs(tx - ox) < 0.62 && Math.abs(tz - oz) < 0.62) {
+              hasSupportBeneath = true;
+              break;
+            }
+          }
+        }
+        if (!hasSupportBeneath) {
+          this.shardQuietSubsteps[s.slotIndex] = 0;
+          this.shardNoSupportSubsteps[s.slotIndex] = 0;
+          this.worldCompat.wakeBody(s.bodyHandle);
+        }
+      }
+
       if (sTree >= 0 && treeAsleep[sTree] >= 0) {
         s.preLinVel[0] = 0; s.preLinVel[1] = 0; s.preLinVel[2] = 0;
         s.preAngVel[0] = 0; s.preAngVel[1] = 0; s.preAngVel[2] = 0;
@@ -4170,31 +4373,103 @@ export class MujocoPhysicsEngine {
       }
     }
 
+    let contiguousCourses = 0;
+    let emptyGap = 0;
+    for (let c = 0; c < 64; c++) {
+      if (courseUpright[c] > 0) {
+        contiguousCourses = c + 1;
+        emptyGap = 0;
+      } else {
+        emptyGap++;
+        if (emptyGap >= 2) break;
+      }
+    }
+
     if (countInTower > 0) {
-      this.centerOfMassXZCm = [(sumX / countInTower) * 10, (sumZ / countInTower) * 10];
-      const maxTiltDeg = (maxTiltRad * 180) / Math.PI;
-      const meanTiltDeg = ((sumTiltRad / countInTower) * 180) / Math.PI;
-      // Below 3.5 deg, weight global CoM column lean (`atan2(r_com, h)`) + trimmed row tilt so a single upper brick
-      // settling 0.135 mm across a loose-slot gap does not misreport a > 0.5 deg global tower lean;
-      // above 2.0 deg, transition smoothly to peak tipping row tilt (`maxTiltDeg`)!
-      const comLeanDeg =
+      const rawMaxTiltDeg = (rawMaxTiltRad * 180) / Math.PI;
+      const rawMeanTiltDeg = ((rawSumTiltRad / countInTower) * 180) / Math.PI;
+      const rawComLeanDeg =
         maxTowerY > 0.25
-          ? (Math.atan2(Math.hypot(sumX / countInTower, sumZ / countInTower), maxTowerY * 0.55) * 180) / Math.PI
+          ? (Math.atan2(Math.hypot(rawSumX / countInTower, rawSumZ / countInTower), maxTowerY * 0.55) * 180) / Math.PI
+          : rawMeanTiltDeg;
+      const rawSmallLean = Math.min(rawMeanTiltDeg, rawComLeanDeg * 0.65 + rawMeanTiltDeg * 0.35);
+      const rawTipBlend = Math.max(0.0, Math.min(1.0, (rawMaxTiltDeg - 2.35) / 3.0));
+      const rawInstantLean = rawSmallLean * (1.0 - rawTipBlend) + rawMaxTiltDeg * rawTipBlend;
+      this.solverLeanAngleDeg = this.solverLeanAngleDeg * 0.75 + Math.min(45, rawInstantLean) * 0.25;
+    } else {
+      this.solverLeanAngleDeg = 0;
+    }
+
+    const isSandboxCollapsedHeap =
+      this.gameMode === 'sandbox' &&
+      this.shatteredCount + tumbledOrDroppedCount >= Math.max(8, Math.floor(this.blocks.length * 0.45)) &&
+      standingCount <= Math.max(9, Math.floor(this.blocks.length * 0.32)) &&
+      contiguousCourses <= 4;
+
+    if (isSandboxCollapsedHeap) {
+      this.centerOfMassXZCm = [0, 0];
+      // Keep physical toppled state (`leanAngleDeg = 45 deg`, matching Solo `COLLAPSED` trajectory invariants)
+      // while setting `currentLayers = 0` so the HUD Plumb & Elevation cards render `— Toppled`!
+      this.leanAngleDeg = Math.max(this.leanAngleDeg, 45.0);
+      const avgOmegaDeg =
+        countInTower > 0 ? (((sumWobbleOmega * SIM_TIME_SCALE) / countInTower) * 180) / Math.PI : 0;
+      this.wobbleSpeedDegPerSec = this.wobbleSpeedDegPerSec * 0.7 + avgOmegaDeg * 0.3;
+      this.currentLayers = 0;
+      this.liveHeightCm = maxTowerY * 10.0;
+    } else if (standingCount > 0 || countInTower > 0) {
+      const denom = Math.max(1, standingCount);
+      if (standingCount > 0) {
+        this.centerOfMassXZCm = [(sumX / denom) * 10, (sumZ / denom) * 10];
+      }
+      // Sort `standingTilts[0..standingCount-1]` in-place (<= 96 floats, insertion sort) to ignore isolated
+      // crooked loose top-notch blocks while keeping full sensitivity to >= 3-block course leans & active tipping!
+      const tiltLen = Math.min(standingCount, standingTilts.length);
+      for (let i = 1; i < tiltLen; i++) {
+        const v = standingTilts[i];
+        let j = i - 1;
+        while (j >= 0 && standingTilts[j] > v) {
+          standingTilts[j + 1] = standingTilts[j];
+          j--;
+        }
+        standingTilts[j + 1] = v;
+      }
+      const restingConsensusTiltRad =
+        tiltLen >= 12
+          ? standingTilts[tiltLen - 5]
+          : tiltLen >= 6
+            ? standingTilts[tiltLen - 3]
+            : tiltLen > 0
+              ? standingTilts[tiltLen - 1]
+              : 0;
+      const effectiveMaxTiltRad = Math.max(restingConsensusTiltRad, maxDynamicTipTiltRad);
+      const maxTiltDeg = (effectiveMaxTiltRad * 180) / Math.PI;
+      const meanTiltDeg = standingCount > 0 ? ((sumTiltRad / denom) * 180) / Math.PI : maxTiltDeg;
+      const effHeightDm = maxStructuralY > 0.25 ? maxStructuralY : maxTowerY;
+      const comLeanDeg =
+        standingCount > 0 && effHeightDm > 0.25
+          ? (Math.atan2(Math.hypot(sumX / denom, sumZ / denom), effHeightDm * 0.55) * 180) / Math.PI
           : meanTiltDeg;
       const smallAngleLean = Math.min(meanTiltDeg, comLeanDeg * 0.65 + meanTiltDeg * 0.35);
       const tipBlend = Math.max(0.0, Math.min(1.0, (maxTiltDeg - 2.35) / 3.0));
       const instantLean = smallAngleLean * (1.0 - tipBlend) + maxTiltDeg * tipBlend;
       this.leanAngleDeg = this.leanAngleDeg * 0.75 + Math.min(45, instantLean) * 0.25;
-      const avgOmegaDeg = (((sumWobbleOmega * SIM_TIME_SCALE) / countInTower) * 180) / Math.PI;
+      const avgOmegaDeg =
+        countInTower > 0 ? (((sumWobbleOmega * SIM_TIME_SCALE) / countInTower) * 180) / Math.PI : 0;
       this.wobbleSpeedDegPerSec = this.wobbleSpeedDegPerSec * 0.7 + avgOmegaDeg * 0.3;
-    }
 
-    this.currentLayers = countInTower > 0 ? maxActiveLayer + 1 : 0;
-    const heightCm = maxTowerY * 10.0;
-    this.liveHeightCm = heightCm;
-    if (this.turnPhase !== 'COLLAPSED') {
-      if (heightCm > this.peakHeightCm) this.peakHeightCm = heightCm;
-      if (this.currentLayers > this.peakLayers) this.peakLayers = this.currentLayers;
+      this.currentLayers = standingCount > 0 ? maxActiveLayer + 1 : 0;
+      const heightCm = (standingCount > 0 ? maxStructuralY : maxTowerY) * 10.0;
+      this.liveHeightCm = heightCm;
+      if (this.turnPhase !== 'COLLAPSED') {
+        if (heightCm > this.peakHeightCm) this.peakHeightCm = heightCm;
+        if (this.currentLayers > this.peakLayers) this.peakLayers = this.currentLayers;
+      }
+    } else {
+      this.currentLayers = 0;
+      this.liveHeightCm = 0;
+      this.leanAngleDeg = 0;
+    this.solverLeanAngleDeg = 0;
+      this.wobbleSpeedDegPerSec = 0;
     }
 
     this.computeOpenTopSlots();

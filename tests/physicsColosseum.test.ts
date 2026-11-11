@@ -464,4 +464,86 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
     host.dispose();
     guest.dispose();
   }, 30000);
+
+  it('C6: multi-stage Sandbox support-loss leaves 0 mid-air floating shards, ignores isolated crooked top-notch outlier lean, and reports Toppled rubble telemetry', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    const world = new PhysicsWorld(audio, 18);
+    world.rebuildTower('sandbox', 2, 18);
+    for (let f = 0; f < 45; f++) world.step(1 / 60);
+
+    // Stage 1: Shatter top courses (41..53) so shards sleep perched atop Course 13 (~20-22 cm),
+    // and place 1 crooked resting block tilted at 22 deg on top
+    for (const id of [53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41]) {
+      world.shatterBlock(world.blocks[id], [0, 0, 0], 16.5, [0, 1, 0]);
+    }
+    const crookedTop = world.blocks[40];
+    const rw = world.getWorld();
+    const halfTilt = (22.0 * Math.PI) / 360.0;
+    rw.getRigidBody(crookedTop.bodyHandle)!.setRotation(
+      { x: 0, y: 0, z: Math.sin(halfTilt), w: Math.cos(halfTilt) },
+      true
+    );
+    rw.getRigidBody(crookedTop.bodyHandle)!.setTranslation(
+      { x: crookedTop.position[0], y: crookedTop.position[1] + 0.04, z: crookedTop.position[2] },
+      true
+    );
+    for (let f = 0; f < 240; f++) world.step(1 / 60);
+
+    expect(world.leanAngleDeg).toBeLessThan(2.0);
+    expect(world.currentLayers).toBeGreaterThanOrEqual(13);
+
+    // Stage 2: Buckle & shatter the supporting column underneath perched sleeping shards
+    world.triggerSandboxCollapseImpulse();
+    for (let f = 0; f < 360; f++) world.step(1 / 60);
+
+    const mjModel = rw.getModel()!;
+    let unsupportedElevatedShards = 0;
+    for (const s of world.shards) {
+      const [sx, sy, sz] = s.position;
+      const speed = Math.hypot(s.preLinVel[0], s.preLinVel[1], s.preLinVel[2]);
+      const isAsleep = rw.getRigidBody(s.bodyHandle)?.isSleeping() ?? false;
+      if (sy <= 0.26 || (!isAsleep && speed > 0.12)) continue;
+      let supported = false;
+      if (mjModel.geom_contype[s.colliderHandle] === 4) {
+        for (const b of world.blocks) {
+          if (b.shattered || b.extracted) continue;
+          const dy = sy - b.position[1];
+          if (
+            dy > -0.10 &&
+            dy < 0.54 &&
+            Math.abs(sx - b.position[0]) < 0.54 &&
+            Math.abs(sz - b.position[2]) < 0.54
+          ) {
+            supported = true;
+            break;
+          }
+        }
+        if (!supported) {
+          for (const os of world.shards) {
+            if (os.id === s.id || mjModel.geom_contype[os.colliderHandle] !== 4) continue;
+            const dy = sy - os.position[1];
+            if (
+              dy > 0.01 &&
+              dy < 0.30 &&
+              Math.abs(sx - os.position[0]) < 0.30 &&
+              Math.abs(sz - os.position[2]) < 0.30
+            ) {
+              supported = true;
+              break;
+            }
+          }
+        }
+      }
+      if (!supported) unsupportedElevatedShards++;
+    }
+
+    expect(unsupportedElevatedShards).toBe(0);
+    expect(world.currentLayers).toBe(0);
+    expect(world.shatteredCount).toBeGreaterThan(15);
+
+    world.dispose();
+  }, 35000);
 });

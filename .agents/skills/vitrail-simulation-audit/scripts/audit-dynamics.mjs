@@ -372,11 +372,97 @@ async function runAudit() {
       world.dispose();
     }
 
+    // 7. Multi-stage Sandbox support-loss: 0 mid-air frozen shards after secondary collapse + outlier-resistant Plumb/Elevation
+    {
+      const world = new PhysicsWorld(audio, 21);
+      world.rebuildTower('sandbox', 2, 18);
+      for (let f = 0; f < 45; f++) world.step(1 / 60);
+
+      // Stage A: Shatter upper courses (41..53) so shards sleep perched atop Course 13 (~20-22 cm),
+      // and rest 1 crooked top block at 22 deg tilt to verify Plumb ignores single-brick top-notch outliers
+      for (const id of [53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41]) {
+        world.shatterBlock(world.blocks[id], [0, 0, 0], 16.5, [0, 1, 0]);
+      }
+      const crookedTop = world.blocks[40];
+      const rw = world.getWorld();
+      const halfTilt = (22.0 * Math.PI) / 360.0;
+      rw.getRigidBody(crookedTop.bodyHandle).setRotation(
+        { x: 0, y: 0, z: Math.sin(halfTilt), w: Math.cos(halfTilt) },
+        true
+      );
+      rw.getRigidBody(crookedTop.bodyHandle).setTranslation(
+        { x: crookedTop.position[0], y: crookedTop.position[1] + 0.04, z: crookedTop.position[2] },
+        true
+      );
+      for (let f = 0; f < 240; f++) world.step(1 / 60);
+
+      const stageALeanDeg = +world.leanAngleDeg.toFixed(2);
+      const stageALayers = world.currentLayers;
+
+      // Stage B: Buckle & shatter the supporting tower underneath the perched sleeping shards!
+      world.triggerSandboxCollapseImpulse();
+      for (let f = 0; f < 360; f++) world.step(1 / 60);
+
+      let unsupportedElevatedShards = 0;
+      for (const s of world.shards) {
+        const [sx, sy, sz] = s.position;
+        const speed = Math.hypot(s.preLinVel[0], s.preLinVel[1], s.preLinVel[2]);
+        const isAsleep = rw.getRigidBody(s.bodyHandle)?.isSleeping() ?? false;
+        if (sy <= 0.26 || (!isAsleep && speed > 0.12)) continue;
+        let supported = false;
+        const ctype = world.model.geom_contype[s.colliderHandle];
+        if (ctype === 4) {
+          for (const b of world.blocks) {
+            if (b.shattered || b.extracted) continue;
+            const dy = sy - b.position[1];
+            if (dy > -0.10 && dy < 0.54 && Math.abs(sx - b.position[0]) < 0.54 && Math.abs(sz - b.position[2]) < 0.54) {
+              supported = true;
+              break;
+            }
+          }
+          if (!supported) {
+            for (const os of world.shards) {
+              if (os.id === s.id || world.model.geom_contype[os.colliderHandle] !== 4) continue;
+              const dy = sy - os.position[1];
+              if (dy > 0.01 && dy < 0.30 && Math.abs(sx - os.position[0]) < 0.30 && Math.abs(sz - os.position[2]) < 0.30) {
+                supported = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!supported) unsupportedElevatedShards++;
+      }
+
+      const stageBLayers = world.currentLayers;
+      const isToppledHud = stageBLayers === 0 && world.shatteredCount > 0;
+      const pass =
+        stageALeanDeg < 2.0 &&
+        stageALayers >= 13 &&
+        unsupportedElevatedShards === 0 &&
+        isToppledHud;
+
+      report.multiStageSupportLossAndTelemetry = {
+        pass,
+        stageALeanDeg,
+        stageALayers,
+        unsupportedElevatedShards,
+        stageBLayers,
+        isToppledHud,
+      };
+      if (!pass) {
+        failures.push(
+          `multiStageSupportLossAndTelemetry failed: ${JSON.stringify(report.multiStageSupportLossAndTelemetry)}`
+        );
+      }
+      world.dispose();
+    }
+
     console.log(
       JSON.stringify(
         {
           overallPass: failures.length === 0,
-          passedProbes: `${6 - failures.length}/6`,
+          passedProbes: `${7 - failures.length}/7`,
           probes: report,
           failures,
         },

@@ -181,21 +181,72 @@ export class MujocoWorldCompat {
   }
 
   /**
-   * Wakes all active intact tower blocks (`blk_0..N-1`) whenever a block's support pose or collision state
-   * is mutated externally (e.g. removing support blocks, releasing an aborted pull, or sliding a sole support block).
+   * Wakes all active intact tower blocks (`blk_0..N-1`) AND any elevated or near-column Voronoi shards
+   * whenever a block's support pose or collision state is mutated externally (e.g. shattering or removing
+   * support blocks, releasing an aborted pull, or sliding a sole support block).
    */
   public wakeActiveTowerBlocks(): void {
     const blockIds = this.map.blockBodyIds;
+    const blockGeoms = this.map.blockGeomIds;
+    const geomContype = this.model.geom_contype;
     const bodyTreeId = this.model.body_treeid;
     const treeAsleep = this.data.tree_asleep;
     const qfrc = this.data.qfrc_applied;
+    const qpos = this.data.qpos;
     for (let i = 0; i < blockIds.length; i++) {
+      if (geomContype[blockGeoms[i]] === 0) continue; // Never wake parked unused/shattered blocks (`contype === 0`)!
       const bid = blockIds[i];
       const info = this.bodyLookup.get(bid);
       if (info && info.enabled && !info.sensor) {
         info.settledAsleep = false;
         info.quietTicks = 0;
         const treeId = bodyTreeId[bid];
+        if (treeId >= 0 && treeAsleep[treeId] >= 0) {
+          qfrc[info.dofAdr + 1] += 1e-9;
+        }
+      }
+    }
+    const shardIds = this.map.shardBodyIds;
+    const shardGeoms = this.map.shardGeomIds;
+    for (let i = 0; i < shardIds.length; i++) {
+      if (geomContype[shardGeoms[i]] === 0) continue; // Never wake parked pool shards (`contype === 0`)!
+      const sid = shardIds[i];
+      const info = this.bodyLookup.get(sid);
+      if (info && info.enabled && !info.sensor) {
+        const xM = qpos[info.qposAdr + 0];
+        const yM = qpos[info.qposAdr + 1];
+        const zM = qpos[info.qposAdr + 2];
+        // Wake any active sleeping shard perched above the tabletop (> 1.8 cm) or inside the column footprint (< 14 cm)
+        if (yM > -0.05 && (yM > 0.018 || xM * xM + zM * zM < 0.0196)) {
+          info.settledAsleep = false;
+          info.quietTicks = 0;
+          const treeId = bodyTreeId[sid];
+          if (treeId >= 0 && treeAsleep[treeId] >= 0) {
+            qfrc[info.dofAdr + 1] += 1e-9;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Wakes every active (non-parked) Voronoi shard in the 512-slot pool (used on full Sandbox collapse impulses).
+   */
+  public wakeAllActiveShards(): void {
+    const shardIds = this.map.shardBodyIds;
+    const shardGeoms = this.map.shardGeomIds;
+    const geomContype = this.model.geom_contype;
+    const bodyTreeId = this.model.body_treeid;
+    const treeAsleep = this.data.tree_asleep;
+    const qfrc = this.data.qfrc_applied;
+    for (let i = 0; i < shardIds.length; i++) {
+      if (geomContype[shardGeoms[i]] === 0) continue; // Never wake parked pool shards (`contype === 0`)!
+      const sid = shardIds[i];
+      const info = this.bodyLookup.get(sid);
+      if (info && info.enabled && !info.sensor) {
+        info.settledAsleep = false;
+        info.quietTicks = 0;
+        const treeId = bodyTreeId[sid];
         if (treeId >= 0 && treeAsleep[treeId] >= 0) {
           qfrc[info.dofAdr + 1] += 1e-9;
         }

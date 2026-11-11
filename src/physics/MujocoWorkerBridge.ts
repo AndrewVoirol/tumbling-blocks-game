@@ -353,6 +353,13 @@ export class MujocoWorkerBridge {
       });
     }
     this.shards = nextShards;
+    if (this.shardMetaById.size > 1024) {
+      const liveIds = new Set<number>();
+      for (let i = 0; i < nextShards.length; i++) liveIds.add(nextShards[i].id);
+      for (const id of this.shardMetaById.keys()) {
+        if (!liveIds.has(id)) this.shardMetaById.delete(id);
+      }
+    }
 
     this.splinters = snap.splinters;
     this.openTopSlots = snap.openTopSlots;
@@ -923,6 +930,13 @@ export class MujocoWorkerBridge {
       });
     }
     this.shards = nextShards;
+    if (this.shardMetaById.size > 1024) {
+      const liveIds = new Set<number>();
+      for (let i = 0; i < nextShards.length; i++) liveIds.add(nextShards[i].id);
+      for (const id of this.shardMetaById.keys()) {
+        if (!liveIds.has(id)) this.shardMetaById.delete(id);
+      }
+    }
     this.lastStepResult = {
       substeps: 0,
       simTime: this.simTime,

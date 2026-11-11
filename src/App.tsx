@@ -377,8 +377,11 @@ export const App: React.FC = () => {
   // Plumb compass jewel coordinates
   const comXClamp = Math.max(-15, Math.min(15, telemetry.centerOfMassXZ[0] * 7.2));
   const comZClamp = Math.max(-15, Math.min(15, telemetry.centerOfMassXZ[1] * 7.2));
-  const leanSeverity =
+  const isToppled =
     telemetry.turnPhase === 'COLLAPSED' ||
+    (telemetry.currentLayers === 0 && telemetry.shatteredCount > 0);
+  const leanSeverity =
+    isToppled ||
     telemetry.leanAngleDeg > 3.2 ||
     telemetry.wobbleSpeedDegPerSec > 12
       ? 'danger'
@@ -957,10 +960,10 @@ export const App: React.FC = () => {
               <div className="etched-plumb-copy">
                 <span className="etched-plumb-title">Plumb</span>
                 <span className="etched-plumb-deg" style={{ color: plumbColor }}>
-                  {telemetry.leanAngleDeg.toFixed(1)}°
+                  {isToppled ? '—' : `${telemetry.leanAngleDeg.toFixed(1)}°`}
                 </span>
                 <span className="etched-plumb-status">
-                  {telemetry.turnPhase === 'COLLAPSED'
+                  {isToppled
                     ? 'Toppled'
                     : telemetry.wobbleSpeedDegPerSec > 3.0
                     ? `${telemetry.wobbleSpeedDegPerSec.toFixed(0)}°/s sway`

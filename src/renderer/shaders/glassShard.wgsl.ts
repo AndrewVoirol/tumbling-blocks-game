@@ -361,27 +361,37 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   }
 
   // Cross-Polarized Dark-Field Polariscope Mode:
-  // Unstressed Voronoi shard interiors extinguish darkly (meanLuma < 0.08), while snapped cleavage edges,
-  // impact-origin Hertzian/Wallner shock wakes, and oblique Brewster rims exhibit frozen sin^2(pi*delta/lambda) fringes!
+  // Unstressed Voronoi shards transmit refracted scene light as smoked neutral-density crystal (~30% crystal refraction
+  // + s-polarized Brewster bevel/facet speculars, NEVER opaque matte-black silhouettes!), while snapped cleavage edges,
+  // impact-origin Hertzian/Wallner shock wakes, and hackle ridges exhibit frozen sin^2(pi*delta/lambda) fringes!
   if (polariscope > 0.5) {
-    let cleavageEdgeStrain = exp(-minCleavageEdgeDist / 0.0125) * (1.0 - 0.54 * input.isOuter);
-    let impactWakeStrain = exp(-rWallner / 0.048) * (0.46 + 0.54 * abs(sin(rWallner * 88.0 - planeSeed * 3.0)));
+    let cleavageEdgeStrain = exp(-minCleavageEdgeDist / 0.014) * (1.0 - 0.50 * input.isOuter);
+    let impactWakeStrain = exp(-rWallner / 0.052) * (0.46 + 0.54 * abs(sin(rWallner * 88.0 - planeSeed * 3.0)));
     let hackleStrain = abs(twistHackle) * 2.6;
-    let residualStress = clamp(cleavageEdgeStrain * 0.66 + impactWakeStrain * 0.50 + hackleStrain, 0.0, 1.0);
+    let residualStress = clamp(cleavageEdgeStrain * 0.70 + impactWakeStrain * 0.52 + hackleStrain, 0.0, 1.0);
 
-    let shardRetardNm = residualStress * (115.0 + 545.0 * clamp(totalGlassPath / 0.15, 0.22, 1.45));
+    let shardRetardNm = residualStress * (125.0 + 545.0 * clamp(totalGlassPath / 0.15, 0.22, 1.45));
     let shardPhaseRGB = shardRetardNm * vec3<f32>(PI / 635.0, PI / 546.0, PI / 455.0);
     let sinSP = sin(shardPhaseRGB);
     let shardIsochromatic = sinSP * sinSP;
 
+    // Smoked neutral-density crystal refraction: preserves refracted oak grain & sunlit caustics through unstressed shards
+    let bgLuma = dot(bgRGB, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let smokedCrystalBg = mix(
+      vec3<f32>(bgLuma) * vec3<f32>(0.86, 0.91, 0.98),
+      bgRGB * mix(vec3<f32>(1.0), transmittance, 0.42),
+      0.26
+    );
+    let chordExtinction = exp(-totalGlassPath * 1.25);
     // Brewster s-polarized oblique rim glint (peaks near theta_B = 56.7 deg -> cosTheta ~ 0.55)
-    let brewsterBell = exp(-pow((cosTheta - 0.549) / 0.28, 2.0));
-    let darkFieldBase = bgRGB * transmittance * 0.042 * meniscusAO
-                      + reflTerm * (0.06 + 0.11 * brewsterBell)
-                      + sunSpec * 0.15 + edgeSpecGlint * 0.05;
-    let fringeEnergy = max(0.16, dot(bgRGB * transmittance + transmittedSunGlow, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.40 + 0.13 * skyScale);
-    let fringeGate = smoothstep(0.14, 0.50, residualStress);
-    shardRGB = (darkFieldBase + shardIsochromatic * fringeEnergy * fringeGate * (1.0 - fresnel * 0.45)) * (1.0 - cameWeight * 0.88)
+    let dBrewster = (cosTheta - 0.549) / 0.28;
+    let brewsterBell = exp(-dBrewster * dBrewster);
+    let darkFieldBase = smokedCrystalBg * (0.31 * chordExtinction) * edgeRefractionDepth * dihedralEdgeDarken * meniscusAO * transmitWeight
+                      + reflTerm * (0.48 + 0.24 * brewsterBell)
+                      + sunSpec * 0.48 + edgeSpecGlint * 0.55;
+    let fringeEnergy = max(0.18, bgLuma * 1.35 + dot(transmittedSunGlow, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.15 + 0.13 * skyScale);
+    let fringeGate = smoothstep(0.11, 0.46, residualStress);
+    shardRGB = (darkFieldBase + shardIsochromatic * fringeEnergy * fringeGate * (1.0 - fresnel * 0.42)) * (1.0 - cameWeight * 0.84)
              + vec3<f32>(_keepDepth + _keepOpt + _keepCenters);
   }
 

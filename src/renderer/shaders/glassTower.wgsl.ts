@@ -938,10 +938,20 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let isochromaticRGB = sinP * sinP;
 
   if (polariscope > 0.5) {
-    let darkFieldRGB = (refractedRGB * 0.14 + reflContrib * 0.42 + sunMicroSpec * 0.45) * (1.0 - vitrail.cameMask * 0.85);
-    let stressLum = max(0.24, dot(refractedRGB, vec3<f32>(0.2126, 0.7152, 0.0722)) * 2.15 + 0.22);
+    // Recover passband multi-bounce refracted scene radiance so unloaded prisms (stressGate ~ 0) render as
+    // translucent smoked neutral-density crystal (~30% clear refracted background + Brewster bevel speculars)
+    // rather than opaque matte-black coal, while deepening dark-field extinction (0.11) inside stressed courses
+    // so spectral sin^2(pi*delta/lambda) fringes retain crisp jewel-like trough contrast without chalky washout!
+    let passbandRad = max(refractedRGB.r, max(refractedRGB.g, refractedRGB.b));
+    let smokedRefr = mix(vec3<f32>(passbandRad) * vec3<f32>(0.85, 0.90, 0.98), refractedRGB, 0.28);
+    let dBrewster = (cosTheta - 0.549) / 0.30;
+    let brewsterTower = exp(-dBrewster * dBrewster);
     let stressGate = smoothstep(0.035, 0.42, localPhotoStress);
-    finalRGB = darkFieldRGB + isochromaticRGB * stressLum * stressGate * (1.0 - fresnel * 0.55) * (1.0 - vitrail.cameMask * 0.90)
+    let baseTransWeight = mix(0.30, 0.11, stressGate);
+    let darkFieldRGB = (smokedRefr * baseTransWeight * (1.0 - fresnel) + reflContrib * (0.50 + 0.20 * brewsterTower) + sunMicroSpec * 0.52) * (1.0 - vitrail.cameMask * 0.84);
+    let smokedLuma = dot(smokedRefr, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let stressLum = max(0.24, smokedLuma * 1.55 + 0.18);
+    finalRGB = darkFieldRGB + isochromaticRGB * stressLum * stressGate * (1.0 - fresnel * 0.54) * (1.0 - vitrail.cameMask * 0.89)
              + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
   } else if (localPhotoStress > 0.46 && grabbed < 0.5) {
     let subtleBiref = smoothstep(0.46, 0.98, localPhotoStress) * 0.055;
