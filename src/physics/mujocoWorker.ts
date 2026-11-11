@@ -11,11 +11,14 @@ import {
   GameMode,
   GlassBlockState,
   MicroSplinter,
+  PhysicsNetworkSnapshot,
+  ShardImpactEvent,
   ShardMeshAppendEvent,
   TopPlacementSlot,
   TopSupportFrame,
   TowerTelemetry,
   TurnPhase,
+  WobbleRockEvent,
 } from './PhysicsWorld';
 
 export type WorkerAudioEvent =
@@ -69,6 +72,8 @@ export interface WorkerShardStaticMeta {
   swatchId: number;
   motif: 0 | 1 | 2 | 3;
   rippleSeed: number;
+  volume: number;
+  massKg: number;
   firstVertex: number;
   vertexCount: number;
   planeCount: number;
@@ -81,15 +86,20 @@ export interface WorkerSnapshotPayload {
   isFullRebuild: boolean;
   threadingMode: 'mt' | 'single';
   threadCount: number;
+  simTime: number;
+  towerSeed: number;
+  initialLayers: number;
   initialBlocks?: GlassBlockState[];
-  /** Packed stride = 12 floats per block: pos(3), quat(4), crackOrigin(3), damage(1), flagsBits(1) */
+  /** Packed stride = 18 floats per block: pos(3), quat(4), crackOrigin(3), damage(1), packedIntBits(1), linVel(3), angVel(3) */
   blockTransforms: Float32Array;
   blockPhotoelasticStress01: Float32Array;
   blockPhotoelasticWrench: Float32Array;
-  /** Packed stride = 8 floats per active shard: id(1), pos(3), quat(4) */
+  /** Packed stride = 14 floats per active shard: id(1), pos(3), quat(4), linVel(3), angVel(3) */
   shardTransforms: Float32Array;
   newShardMetas: WorkerShardStaticMeta[];
   shardUploads: ShardMeshAppendEvent[];
+  shardImpacts: ShardImpactEvent[];
+  wobbleEvents: WobbleRockEvent[];
   splinters: MicroSplinter[];
   openTopSlots: TopPlacementSlot[];
   topSupportFrame: TopSupportFrame;
@@ -127,7 +137,7 @@ export interface WorkerSnapshotPayload {
 }
 
 export type WorkerInboundMessage =
-  | { type: 'init'; initialLayers?: number }
+  | { type: 'init'; initialLayers?: number; seed?: number }
   | {
       type: 'step';
       dt: number;
@@ -135,7 +145,9 @@ export type WorkerInboundMessage =
       camRight: Vec3;
       hoveredBlockId: number | null;
     }
-  | { type: 'rebuildTower'; mode?: GameMode; players?: number; layers?: number }
+  | { type: 'rebuildTower'; mode?: GameMode; players?: number; layers?: number; seed?: number }
+  | { type: 'resetTower'; layers?: number; seed?: number }
+  | { type: 'applyCompactSnapshot'; snapshot: PhysicsNetworkSnapshot }
   | { type: 'tapNudgeBlock'; blockId: number; localNormal: Vec3; localPoint: Vec3 }
   | { type: 'startGrabBlock'; reqId: number; blockId: number; localPoint: Vec3; worldPoint: Vec3 }
   | { type: 'updateGrabTarget'; worldTargetOnPlane: Vec3 }
@@ -279,10 +291,10 @@ function buildSnapshot(isFullRebuild: boolean): {
   }
 
   const blockCount = eng.blocks.length;
-  const blockTransforms = new Float32Array(blockCount * 12);
+  const blockTransforms = new Float32Array(blockCount * 18);
   for (let i = 0; i < blockCount; i++) {
     const b = eng.blocks[i];
-    const base = i * 12;
+    const base = i * 18;
     blockTransforms[base + 0] = b.position[0];
     blockTransforms[base + 1] = b.position[1];
     blockTransforms[base + 2] = b.position[2];
@@ -294,26 +306,40 @@ function buildSnapshot(isFullRebuild: boolean): {
     blockTransforms[base + 8] = b.crackLocalOrigin[1];
     blockTransforms[base + 9] = b.crackLocalOrigin[2];
     blockTransforms[base + 10] = b.damage;
+    const encLayer = Math.max(0, Math.min(63, b.assignedLayer + 1)) & 0x3f;
+    const encSlot = b.assignedSlot & 0x3;
+    const encSwatch = b.swatchId & 0xf;
+    const encMotif = b.motif & 0x3;
     const bits =
       (b.shattered ? 1 : 0) |
       (b.extracted ? 2 : 0) |
       (b.isLegalTarget ? 4 : 0) |
-      (b.isLooseSlot ? 8 : 0);
+      (b.isLooseSlot ? 8 : 0) |
+      (encLayer << 4) |
+      (encSlot << 10) |
+      (encSwatch << 12) |
+      (encMotif << 16);
     blockTransforms[base + 11] = bits;
+    blockTransforms[base + 12] = b.linVel[0];
+    blockTransforms[base + 13] = b.linVel[1];
+    blockTransforms[base + 14] = b.linVel[2];
+    blockTransforms[base + 15] = b.angVel[0];
+    blockTransforms[base + 16] = b.angVel[1];
+    blockTransforms[base + 17] = b.angVel[2];
   }
 
   const stressCopy = new Float32Array(eng.blockPhotoelasticStress01);
   const wrenchCopy = new Float32Array(eng.blockPhotoelasticWrench);
 
   const shardCount = eng.shards.length;
-  const shardTransforms = new Float32Array(shardCount * 8);
+  const shardTransforms = new Float32Array(shardCount * 14);
   const newShardMetas: WorkerShardStaticMeta[] = [];
   const activeIdsNow = new Set<number>();
 
   for (let i = 0; i < shardCount; i++) {
     const s = eng.shards[i];
     activeIdsNow.add(s.id);
-    const base = i * 8;
+    const base = i * 14;
     shardTransforms[base + 0] = s.id;
     shardTransforms[base + 1] = s.position[0];
     shardTransforms[base + 2] = s.position[1];
@@ -322,6 +348,12 @@ function buildSnapshot(isFullRebuild: boolean): {
     shardTransforms[base + 5] = s.rotation[1];
     shardTransforms[base + 6] = s.rotation[2];
     shardTransforms[base + 7] = s.rotation[3];
+    shardTransforms[base + 8] = s.preLinVel[0];
+    shardTransforms[base + 9] = s.preLinVel[1];
+    shardTransforms[base + 10] = s.preLinVel[2];
+    shardTransforms[base + 11] = s.preAngVel[0];
+    shardTransforms[base + 12] = s.preAngVel[1];
+    shardTransforms[base + 13] = s.preAngVel[2];
 
     if (!knownShardIds.has(s.id)) {
       knownShardIds.add(s.id);
@@ -331,6 +363,8 @@ function buildSnapshot(isFullRebuild: boolean): {
         swatchId: s.swatchId,
         motif: s.motif,
         rippleSeed: s.rippleSeed,
+        volume: s.volume,
+        massKg: s.massKg,
         firstVertex: s.firstVertex,
         vertexCount: s.vertexCount,
         planeCount: s.planeCount,
@@ -347,7 +381,19 @@ function buildSnapshot(isFullRebuild: boolean): {
     }
   }
 
-  const shardUploads = eng.consumePendingShardUploads();
+  // Clone vertexData buffers so Transferable ownership never detaches engine.slotRenderVertices inside the worker
+  const rawShardUploads = eng.consumePendingShardUploads();
+  const shardUploads: ShardMeshAppendEvent[] = new Array(rawShardUploads.length);
+  for (let i = 0; i < rawShardUploads.length; i++) {
+    const up = rawShardUploads[i];
+    shardUploads[i] = {
+      firstVertex: up.firstVertex,
+      vertexData: new Float32Array(up.vertexData),
+    };
+  }
+  const shardImpacts = eng.consumeShardImpacts();
+  const wobbleEvents = eng.consumeWobbleEvents();
+
   const transfer: Transferable[] = [
     blockTransforms.buffer,
     stressCopy.buffer,
@@ -366,6 +412,9 @@ function buildSnapshot(isFullRebuild: boolean): {
     isFullRebuild,
     threadingMode,
     threadCount,
+    simTime: eng.getSimTime(),
+    towerSeed: eng.towerSeed,
+    initialLayers: eng.getInitialLayers(),
     initialBlocks: isFullRebuild ? eng.blocks.map((b) => ({ ...b })) : undefined,
     blockTransforms,
     blockPhotoelasticStress01: stressCopy,
@@ -373,6 +422,8 @@ function buildSnapshot(isFullRebuild: boolean): {
     shardTransforms,
     newShardMetas,
     shardUploads,
+    shardImpacts,
+    wobbleEvents,
     splinters: eng.splinters.map((sp) => ({ ...sp, pos: [...sp.pos], vel: [...sp.vel] })),
     openTopSlots: eng.openTopSlots.map((sl) => ({
       ...sl,
@@ -439,7 +490,12 @@ self.onmessage = async (ev: MessageEvent<WorkerInboundMessage>) => {
     threadingMode = rt.mode;
     threadCount = rt.threadCount;
     audioProxy = new WorkerAudioProxy();
-    engine = new MujocoPhysicsEngine(audioProxy, msg.initialLayers ?? INITIAL_LAYERS);
+    engine = new MujocoPhysicsEngine(
+      audioProxy,
+      msg.initialLayers ?? INITIAL_LAYERS,
+      undefined,
+      msg.seed
+    );
     const { snapshot, transfer } = buildSnapshot(true);
     self.postMessage(
       {
@@ -466,7 +522,18 @@ self.onmessage = async (ev: MessageEvent<WorkerInboundMessage>) => {
       break;
     }
     case 'rebuildTower': {
-      engine.rebuildTower(msg.mode, msg.players, msg.layers);
+      engine.rebuildTower(msg.mode, msg.players, msg.layers, msg.seed);
+      postSnapshot(true);
+      break;
+    }
+    case 'resetTower': {
+      engine.resetTower(msg.layers, msg.seed);
+      postSnapshot(true);
+      break;
+    }
+    case 'applyCompactSnapshot': {
+      knownShardIds.clear();
+      engine.applyCompactSnapshot(msg.snapshot);
       postSnapshot(true);
       break;
     }
