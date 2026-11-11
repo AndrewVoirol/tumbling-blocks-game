@@ -166,25 +166,38 @@ fn intersectLocalBlockBox(ro: vec3<f32>, rd: vec3<f32>) -> BoxHit {
 }
 
 /**
- * Evaluates sparse, tiny trapped 3D seed air bubbles suspended inside antique cathedral glass.
+ * Evaluates sparse, tiny trapped 3D seed air bubbles suspended inside antique cathedral glass:
+ * Uses exact ray-sphere impact parameter u = b / R and inverse Maxwell-Fresnel (n_glass = 1.522 -> n_air = 1.0)
+ * so the outer annulus u in [0.657, 1.0] (theta_i > 41.07 deg) exhibits a physical hollow-sphere TIR bright ring!
  */
 fn evaluateSeedBubbles(roLocal: vec3<f32>, rdLocal: vec3<f32>, segLen: f32, seed: f32) -> f32 {
   var glint: f32 = 0.0;
+  let rayScale: f32 = 36.0;
   for (var s: i32 = 0; s < 3; s = s + 1) {
     let t = segLen * (0.22 + f32(s) * 0.28);
-    let p = (roLocal + rdLocal * t) * 36.0 + vec3<f32>(seed * 5.1, seed * 2.7, seed * 8.3);
+    let p = (roLocal + rdLocal * t) * rayScale + vec3<f32>(seed * 5.1, seed * 2.7, seed * 8.3);
     let cell = floor(p);
     let f = fract(p) - vec3<f32>(0.5);
     let h = hash31(cell);
     if (h > 0.90) {
       let offset = vec3<f32>(fract(h * 13.7) - 0.5, fract(h * 29.3) - 0.5, fract(h * 47.1) - 0.5) * 0.45;
-      let d = length(f - offset);
-      let bubbleRadius = 0.048 + fract(h * 91.7) * 0.052;
-      let rim = smoothstep(bubbleRadius, bubbleRadius * 0.45, d) * smoothstep(0.0, bubbleRadius * 0.85, d);
-      glint += rim * 0.38;
+      let toCenter = offset - f;
+      let projAlong = dot(toCenter, rdLocal);
+      let perpVec = toCenter - rdLocal * projAlong;
+      let bImpact = length(perpVec);
+      let bubbleRadius = 0.052 + fract(h * 91.7) * 0.056;
+      if (bImpact < bubbleRadius && abs(projAlong) < bubbleRadius * 1.45) {
+        let u = clamp(bImpact / bubbleRadius, 0.0, 0.999);
+        let cosInc = sqrt(max(0.0, 1.0 - u * u));
+        // Inverse dielectric Fresnel 1.522 -> 1.0: transparent core (0.043) + bright TIR ring for u >= 0.657!
+        let fInv = dielectricFresnel(cosInc, GLASS_IOR_G, 1.0);
+        let edgeAA = 1.0 - smoothstep(0.86, 1.0, u);
+        let axialFade = 1.0 - smoothstep(bubbleRadius * 0.75, bubbleRadius * 1.45, abs(projAlong));
+        glint += fInv * edgeAA * axialFade * 0.52;
+      }
     }
   }
-  return clamp(glint, 0.0, 0.55);
+  return clamp(glint, 0.0, 0.68);
 }
 
 fn projectTableSunUV(hitPos: vec3<f32>) -> vec2<f32> {
@@ -399,13 +412,13 @@ fn traceTowerGlassRayDispersed(
 
   let pPrim = &uBlocks[primaryIdx];
   let absMotif0 = (*pPrim).absorptionAndMotif;
+  let motif0 = i32(round(absMotif0.w));
   let accSeed0 = (*pPrim).accentAndSeed;
   let crack0 = (*pPrim).crackAndDamage;
   let seed0 = accSeed0.w;
-  let iorR: f32 = 1.514;
-  let iorG: f32 = 1.522;
-  let iorB: f32 = 1.533;
-  let f0: f32 = 0.0428;
+  let iorR: f32 = GLASS_IOR_R;
+  let iorG: f32 = GLASS_IOR_G;
+  let iorB: f32 = GLASS_IOR_B;
   let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
 
   // 1. Refract Green carrier ray + R/B Abbe dispersion into primary block
@@ -424,7 +437,7 @@ fn traceTowerGlassRayDispersed(
   let exitPosLocal = roLocal + rdLocal * pathLen0;
   let exitNormalWorld = mulBlockL2WDir(primaryIdx, box0.exitNormalLocal);
 
-  let vitrailExit = evaluateVitrailPattern(exitPosLocal, 0, seed0);
+  let vitrailExit = evaluateVitrailPattern(exitPosLocal, motif0, seed0);
   let exit0RippleWorld = mulBlockL2WDir(primaryIdx, vitrailExit.rippleGrad) * 1.35;
   let exitPerturbedN = safeNormalize(exitNormalWorld + exit0RippleWorld, exitNormalWorld);
 
@@ -433,25 +446,29 @@ fn traceTowerGlassRayDispersed(
   var internalMirrorContrib = vec3<f32>(0.0);
 
   let internalCosExit = clamp(abs(dot(internalDirWorld, exitPerturbedN)), 0.0, 1.0);
-  let internalReflF = f0 + (1.0 - f0) * pow(1.0 - internalCosExit, 5.0);
+  let exactExitF0 = dielectricFresnel(internalCosExit, iorG, 1.0);
+  var exitTransmission0: f32 = 1.0 - exactExitF0;
 
   if (length(worldRayDir) < 1e-4) {
+    // Total Internal Reflection (theta_i >= 41.07 deg -> exactExitF0 == 1.0): 100% internal reflection to next face!
     let bouncedLocalDir = reflect(rdLocal, -box0.exitNormalLocal);
     let boxBounce = intersectLocalExitBox(exitPosLocal + bouncedLocalDir * 0.001, bouncedLocalDir);
     pathLen0 += boxBounce.tFar * 0.90;
     let finalLocalPos = exitPosLocal + bouncedLocalDir * boxBounce.tFar;
     let finalExitNWorld = mulBlockL2WDir(primaryIdx, boxBounce.exitNormalLocal);
     let bouncedWorldDir = mulBlockL2WDir(primaryIdx, bouncedLocalDir);
+    let cosBounceExit = clamp(abs(dot(bouncedWorldDir, finalExitNWorld)), 0.0, 1.0);
+    exitTransmission0 = max(0.20, 1.0 - dielectricFresnel(cosBounceExit, iorG, 1.0));
 
     worldRayPos = mulBlockL2WPoint(primaryIdx, finalLocalPos);
     worldRayDir = refract(bouncedWorldDir, -finalExitNWorld, iorG);
     if (length(worldRayDir) < 1e-4) {
       worldRayDir = reflect(bouncedWorldDir, -finalExitNWorld);
     }
-    internalMirrorContrib = sampleCathedralEnvironment(bouncedWorldDir, L, sunColor, skyTint, atelierMix) * 0.14;
+    internalMirrorContrib = sampleCathedralEnvironment(bouncedWorldDir, L, sunColor, skyTint, atelierMix) * 0.16;
   } else {
     let partialBounce = reflect(internalDirWorld, -exitPerturbedN);
-    internalMirrorContrib = sampleCathedralEnvironment(partialBounce, L, sunColor, skyTint, atelierMix) * internalReflF * 0.22;
+    internalMirrorContrib = sampleCathedralEnvironment(partialBounce, L, sunColor, skyTint, atelierMix) * exactExitF0 * 0.28;
   }
   worldRayDir = safeNormalize(worldRayDir, incidentDir);
 
@@ -471,34 +488,60 @@ fn traceTowerGlassRayDispersed(
   ) + SODA_LIME_IRON_SIGMA;
   let throughput0 = exp(-sigma0 * pathLen0);
 
-  let bubbleSparkle = select(evaluateSeedBubbles(roLocal, rdLocal, box0.tFar, seed0), 0.0, isRefCard);
-  var crackMask: f32 = 0.0;
-  var crackSpecAlign: f32 = 0.0;
-  if (crack0.w > 0.01) {
-    let midLocal = roLocal + rdLocal * (box0.tFar * 0.38);
-    let farLocal = roLocal + rdLocal * (box0.tFar * 0.74);
-    crackMask = max(
-      evaluateInternalCracks(roLocal, crack0.xyz, crack0.w, seed0),
-      max(
-        evaluateInternalCracks(midLocal, crack0.xyz, crack0.w, seed0),
-        evaluateInternalCracks(farLocal, crack0.xyz, crack0.w, seed0)
-      )
-    );
-    let H = safeNormalize(L - incidentDir, frontWorldNormal);
-    let crackRelLocal = safeNormalize(roLocal - crack0.xyz, vec3<f32>(1.0, 0.0, 0.0));
-    let crackPlaneN = mulBlockL2WDir(primaryIdx, crackRelLocal);
-    crackSpecAlign = pow(clamp(abs(dot(crackPlaneN, H)), 0.0, 1.0), 14.0);
-  }
-  let crackAtten0 = 1.0 - crackMask * 0.45;
-  var throughput = throughput0 * (1.0 - internalReflF) * mix(0.76, 1.0, smoothstep(0.02, 0.30, internalCosExit)) * crackAtten0;
-
   let transmittedSun = sunColor * sunTransRGB;
   let lightEnergy = transmittedSun * 0.42 + skyTint * 0.20;
   let scatterGate = select(1.0, 0.0, isRefCard);
+
+  let bubbleSparkle = select(evaluateSeedBubbles(roLocal, rdLocal, box0.tFar, seed0), 0.0, isRefCard);
+  var crackMask: f32 = 0.0;
+  var crackInternalRGB = vec3<f32>(0.0);
+  if (crack0.w > 0.01) {
+    let midLocal = roLocal + rdLocal * (box0.tFar * 0.38);
+    let farLocal = roLocal + rdLocal * (box0.tFar * 0.74);
+    let cSample0 = evaluateInternalCrackField(roLocal, crack0.xyz, crack0.w, seed0);
+    let cSample1 = evaluateInternalCrackField(midLocal, crack0.xyz, crack0.w, seed0);
+    let cSample2 = evaluateInternalCrackField(farLocal, crack0.xyz, crack0.w, seed0);
+    var bestCrack = cSample0;
+    if (cSample1.mask > bestCrack.mask) {
+      bestCrack = cSample1;
+    }
+    if (cSample2.mask > bestCrack.mask) {
+      bestCrack = cSample2;
+    }
+    crackMask = bestCrack.mask;
+    if (crackMask > 0.005) {
+      // True block-local cleavage plane normal rotated to world space (flashes silver-mirror TIR as block wobbles!)
+      let crackPlaneN = safeNormalize(mulBlockL2WDir(primaryIdx, bestCrack.normalLocal), frontWorldNormal);
+      let cosCrackInc = clamp(abs(dot(internalDirWorld, crackPlaneN)), 0.0, 1.0);
+      let fCrackWall = dielectricFresnel(cosCrackInc, iorG, 1.0);
+
+      // Thin-air-film Newton/Airy two-beam interference (n_glass -> n_air = 1.0 -> n_glass) below critical angle
+      let sin2Air = (iorG * iorG) * max(0.0, 1.0 - cosCrackInc * cosCrackInc);
+      let cosAir = sqrt(max(0.03, 1.0 - min(1.0, sin2Air)));
+      let airPhase = (2.0 * PI * bestCrack.gapNm * cosAir) * vec3<f32>(1.0 / 635.0, 1.0 / 546.0, 1.0 / 455.0);
+      let sinAir = sin(airPhase);
+      let newtonFringes = sinAir * sinAir;
+
+      let crackReflDir = reflect(internalDirWorld, crackPlaneN);
+      let silverMirrorEnv = sampleCathedralEnvironment(crackReflDir, L, sunColor, skyTint, atelierMix);
+      let H = safeNormalize(L - internalDirWorld, crackPlaneN);
+      let crackSunGlint = pow(clamp(abs(dot(crackPlaneN, H)), 0.0, 1.0), 18.0);
+      let filmColor = mix(newtonFringes * min(1.0, 4.0 * fCrackWall), vec3<f32>(1.0), smoothstep(0.65, 0.98, fCrackWall));
+
+      crackInternalRGB = crackMask * (
+        silverMirrorEnv * filmColor * (0.16 + 0.58 * fCrackWall) +
+        lightEnergy * (0.06 + 0.85 * crackSunGlint) * mix(vec3<f32>(1.0), newtonFringes, 0.38)
+      );
+    }
+  }
+  let crackAtten0 = 1.0 - crackMask * 0.45;
+  let cameExitAtten0 = (1.0 - vitrailExit.cameMask * 0.85) * vitrailFront.paneMeniscusAO * vitrailExit.paneMeniscusAO;
+  var throughput = throughput0 * exitTransmission0 * mix(0.76, 1.0, smoothstep(0.02, 0.30, internalCosExit)) * crackAtten0 * cameExitAtten0;
+
   var internalScatter = (
-    bubbleSparkle * 0.22 * lightEnergy * throughput +
-    crackMask * (0.04 + 0.85 * crackSpecAlign) * lightEnergy * mix(vec3<f32>(1.0), throughput, 0.65) +
-    internalMirrorContrib * throughput
+    bubbleSparkle * 0.24 * lightEnergy * throughput +
+    crackInternalRGB * mix(vec3<f32>(1.0), throughput0, 0.65) +
+    internalMirrorContrib * throughput0
   ) * scatterGate;
 
   // 2. Continue across up to 2 secondary blocks via global intact-AABB clip + Y-sorted uniform binary search
@@ -592,6 +635,7 @@ fn traceTowerGlassRayDispersed(
 
     let pHit = &uBlocks[nearestIdx];
     let hitAbsMotif = (*pHit).absorptionAndMotif;
+    let hitMotif = i32(round(hitAbsMotif.w));
     let hitAccSeed = (*pHit).accentAndSeed;
     let hitCrack = (*pHit).crackAndDamage;
     let hitSeed = hitAccSeed.w;
@@ -605,11 +649,11 @@ fn traceTowerGlassRayDispersed(
     }
     nearestT = max(0.0, nearestBox.tNear);
     let localEntryPos = cRo + cRd * nearestT;
-    let vHit = evaluateVitrailPattern(localEntryPos, 0, hitSeed);
+    let vHit = evaluateVitrailPattern(localEntryPos, hitMotif, hitSeed);
 
     let entryNWorld = mulBlockL2WDir(nearestIdx, nearestBox.entryNormalLocal);
     let cosEntry = clamp(abs(dot(worldRayDir, entryNWorld)), 0.0, 1.0);
-    let seamFresnel = f0 + (1.0 - f0) * pow(1.0 - cosEntry, 5.0);
+    let seamFresnel = dielectricFresnel(cosEntry, 1.0, iorG);
     let isTightContact = 1.0 - smoothstep(0.001, 0.022, nearestT);
     let seamReflDir = reflect(worldRayDir, entryNWorld);
     var seamEnv = skyTint * 0.22 + sunColor * pow(max(0.0, dot(seamReflDir, L)), 6.0) * 0.55;
@@ -628,13 +672,16 @@ fn traceTowerGlassRayDispersed(
     let insideBox = intersectLocalExitBox(localEntryPos + insideLocal * 0.001, insideLocal);
     var segLen = clamp(insideBox.tFar, 0.008, 0.76);
     var localExitPos = localEntryPos + insideLocal * segLen;
-    let vExit2 = evaluateVitrailPattern(localExitPos, 0, hitSeed);
+    let vExit2 = evaluateVitrailPattern(localExitPos, hitMotif, hitSeed);
     let exit2RippleWorld = mulBlockL2WDir(nearestIdx, vExit2.rippleGrad) * 1.15;
 
     var exitN2World = safeNormalize(
       mulBlockL2WDir(nearestIdx, insideBox.exitNormalLocal) + exit2RippleWorld,
       entryNWorld
     );
+    let cosExit2 = clamp(abs(dot(insideSecondary, exitN2World)), 0.0, 1.0);
+    let exactExitF2 = dielectricFresnel(cosExit2, iorG, 1.0);
+    var exitTrans2: f32 = 1.0 - exactExitF2;
     var exitedDir = refract(insideSecondary, -exitN2World, iorG);
     if (length(exitedDir) < 1e-4) {
       let tirLocalDir = reflect(insideLocal, -insideBox.exitNormalLocal);
@@ -643,30 +690,40 @@ fn traceTowerGlassRayDispersed(
       localExitPos = localExitPos + tirLocalDir * tirBox.tFar;
       let tirWorldDir = mulBlockL2WDir(nearestIdx, tirLocalDir);
       exitN2World = mulBlockL2WDir(nearestIdx, tirBox.exitNormalLocal);
+      let cosTirExit2 = clamp(abs(dot(tirWorldDir, exitN2World)), 0.0, 1.0);
+      exitTrans2 = max(0.20, 1.0 - dielectricFresnel(cosTirExit2, iorG, 1.0));
       exitedDir = refract(tirWorldDir, -exitN2World, iorG);
       if (length(exitedDir) < 1e-4) {
         exitedDir = reflect(tirWorldDir, -exitN2World);
       }
-      internalScatter += sampleCathedralEnvironment(tirWorldDir, L, sunColor, skyTint, atelierMix) * throughput * 0.12 * scatterGate;
+      internalScatter += sampleCathedralEnvironment(tirWorldDir, L, sunColor, skyTint, atelierMix) * throughput * 0.14 * scatterGate;
+    } else if (exactExitF2 > 0.06) {
+      let partialBounce2 = reflect(insideSecondary, -exitN2World);
+      internalScatter += sampleCathedralEnvironment(partialBounce2, L, sunColor, skyTint, atelierMix) * throughput * exactExitF2 * 0.22 * scatterGate;
     }
 
-    let cosExit2 = clamp(abs(dot(insideSecondary, exitN2World)), 0.0, 1.0);
-    let exitFresnel2 = f0 + (1.0 - f0) * pow(1.0 - cosExit2, 5.0);
     let avgAccent = 0.5 * (vHit.accentMix + vExit2.accentMix);
     let sigmaHit = mix(hitAbsMotif.xyz, hitAccSeed.xyz, avgAccent) + SODA_LIME_IRON_SIGMA;
 
     var crackAtten: f32 = 1.0;
     if (hitCrack.w > 0.01) {
       let midLocal2 = 0.5 * (localEntryPos + localExitPos);
-      let cMask2 = max(
-        evaluateInternalCracks(localEntryPos, hitCrack.xyz, hitCrack.w, hitSeed),
-        evaluateInternalCracks(midLocal2, hitCrack.xyz, hitCrack.w, hitSeed)
-      );
-      crackAtten = 1.0 - cMask2 * 0.42;
-      internalScatter += cMask2 * 0.12 * lightEnergy * throughput * crackAtten * scatterGate;
+      let cS2a = evaluateInternalCrackField(localEntryPos, hitCrack.xyz, hitCrack.w, hitSeed);
+      let cS2b = evaluateInternalCrackField(midLocal2, hitCrack.xyz, hitCrack.w, hitSeed);
+      var bestC2 = cS2a;
+      if (cS2b.mask > bestC2.mask) {
+        bestC2 = cS2b;
+      }
+      crackAtten = 1.0 - bestC2.mask * 0.42;
+      if (bestC2.mask > 0.01) {
+        let cN2World = safeNormalize(mulBlockL2WDir(nearestIdx, bestC2.normalLocal), entryNWorld);
+        let fC2 = dielectricFresnel(clamp(abs(dot(insideSecondary, cN2World)), 0.0, 1.0), iorG, 1.0);
+        internalScatter += bestC2.mask * (0.10 + 0.34 * fC2) * lightEnergy * throughput * crackAtten * scatterGate;
+      }
     }
 
-    throughput *= exp(-sigmaHit * segLen) * (1.0 - seamFresnel) * (1.0 - exitFresnel2) * crackAtten;
+    let cameAtten2 = (1.0 - max(vHit.cameMask, vExit2.cameMask) * 0.85) * vHit.paneMeniscusAO * vExit2.paneMeniscusAO;
+    throughput *= exp(-sigmaHit * segLen) * (1.0 - seamFresnel) * exitTrans2 * crackAtten * cameAtten2;
 
     let prevPosG = worldRayPos;
     let prevDirG = worldRayDir;
@@ -756,13 +813,14 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let _keepCenters = uBlockCenters[0].x * 0.0;
 
   let pBlk = &uBlocks[input.blockIdx];
+  let motifId = i32(round((*pBlk).absorptionAndMotif.w));
   let seed = (*pBlk).accentAndSeed.w;
 
   let V = safeNormalize(uScene.cameraPosAndTime.xyz - input.worldPos, vec3<f32>(0.0, 0.0, 1.0));
   let incidentDir = -V;
   let L = safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0));
 
-  let vitrail = evaluateVitrailPattern(input.localPos, 0, seed);
+  let vitrail = evaluateVitrailPattern(input.localPos, motifId, seed);
 
   // Analytical smooth 1.25 mm rounded-box normal across 1-segment bevels & corners
   let smoothLocalN = evalBeveledBoxNormalLocal(input.localPos, input.localNormal);
@@ -795,12 +853,11 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
 
   let refractedRGB = traceTowerGlassRayDispersed(input.worldPos, incidentDir, glassNormal, input.blockIdx, vitrail, sunTransRGB);
 
-  // Exact Schlick Dielectric Fresnel + outer reflections evaluated AFTER multi-bounce raytracer to minimize register pressure
+  // Exact Maxwell-Fresnel dielectric reflectance + outer reflections evaluated AFTER multi-bounce raytracer
   let sunColor = uScene.sunColorAndAspect.xyz;
   let skyTint = uScene.skyTintAndMode.xyz;
   let cosTheta = clamp(dot(glassNormal, V), 0.0, 1.0);
-  let f0: f32 = 0.0428;
-  let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+  let fresnel = dielectricFresnel(cosTheta, 1.0, GLASS_IOR_G);
 
   let reflDir = reflect(incidentDir, glassNormal);
   let reflSunColor = sunColor * mix(0.20 + 0.80 * sunTransRGB, vec3<f32>(1.0), directSunVis);
@@ -811,12 +868,25 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
     1.15
   ) * sunColor * mix(sunTransRGB * 0.45, vec3<f32>(1.0), directSunVis) * 0.65;
 
-  // Preserve exact Schlick Fresnel up to 70 deg incidence (fresnel <= 0.32), and body-tint extreme grazing reflections so tumbled end-caps never white-out
+  // Preserve exact dielectric Fresnel up to 70 deg incidence (fresnel <= 0.32), and body-tint extreme grazing reflections
   let untintedF = min(fresnel, 0.32);
   let grazingExcess = max(0.0, fresnel - 0.32);
   let bodySwatchTint = exp(-sigmaSelf * 0.11);
   let reflContrib = envReflection * (vec3<f32>(untintedF) + bodySwatchTint * (grazingExcess * 0.72));
   var finalRGB = refractedRGB * (1.0 - fresnel) + reflContrib + sunMicroSpec + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
+
+  // Recessed 60/40 tin-lead / copper-foil came conductor shading + patinated flux seam darkening when motifId > 0
+  if (vitrail.cameMask > 0.001) {
+    let cameWorldN = safeNormalize(macroWorldN + ((*pBlk).localToWorld * vec4<f32>(vitrail.cameNormalLocal, 0.0)).xyz, glassNormal);
+    let metalF0 = select(vec3<f32>(0.34, 0.35, 0.37), vec3<f32>(0.68, 0.41, 0.24), motifId == 3);
+    let metalRough = select(0.28, 0.23, motifId == 3);
+    let cosCame = clamp(dot(cameWorldN, V), 0.0, 1.0);
+    let fMetal = metalF0 + (vec3<f32>(1.0) - metalF0) * pow(1.0 - cosCame, 5.0);
+    let cameSpec = evalGGXSpecular(cameWorldN, V, L, metalRough) * fMetal * sunColor * mix(sunTransRGB * 0.45, vec3<f32>(1.0), directSunVis) * 0.95;
+    let cameEnv = sampleCathedralEnvironment(reflect(incidentDir, cameWorldN), L, reflSunColor, skyTint, atelierMix) * fMetal * 0.40;
+    let cameLit = metalF0 * (skyTint * 0.08 + sunColor * sunTransRGB * max(0.0, dot(cameWorldN, L)) * 0.18) + cameSpec + cameEnv;
+    finalRGB = mix(finalRGB, cameLit, vitrail.cameMask);
+  }
 
   let flags = (*pBlk).stateFlags;
   let hover = flags.x;
@@ -825,12 +895,20 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let resistance = flags.w;
   let polariscope = uBlockCenters[97].w;
   let pe = clamp((*pBlk).photoelastic, vec4<f32>(0.0), vec4<f32>(1.0));
+  let blkCrack = (*pBlk).crackAndDamage;
+  var surfCrackSample: InternalCrackSample;
+  surfCrackSample.mask = 0.0;
+  surfCrackSample.normalLocal = vec3<f32>(0.0, 1.0, 0.0);
+  surfCrackSample.gapNm = 0.0;
+  surfCrackSample.tipStress = 0.0;
+  if (blkCrack.w > 0.01) {
+    surfCrackSample = evaluateInternalCrackField(input.localPos, blkCrack.xyz, blkCrack.w, seed);
+  }
 
   // Spatially-Resolved Brewster Stress-Optic Birefringence & Cross-Polarized Polariscope Lens:
-  // Integrates MuJoCo's local 3-zone contact manifold (pe.xyz at local X = -2.5 cm, 0, +2.5 cm) plus
-  // Euler-Bernoulli flexural bending (|uY|) & Jourawski parabolic shear (1 - uY^2) (pe.w) across 3 quadrature
-  // samples along the internal refracted ray chord—so unloaded cantilever ends remain dark while true bearing
-  // fulcrums and bridge spans display physical Hertzian / bending isochromatics!
+  // Integrates MuJoCo's local 3-zone contact manifold (pe.xyz at local X = -2.5 cm, 0, +2.5 cm),
+  // Euler-Bernoulli flexural bending (|uY|) & Jourawski parabolic shear (1 - uY^2) (pe.w), AND arrested
+  // K_I crazing crack-tip residual stress across 3 quadrature samples along the internal refracted ray chord!
   let incLocal = safeNormalize(((*pBlk).worldToLocal * vec4<f32>(incidentDir, 0.0)).xyz, vec3<f32>(0.0, 0.0, 1.0));
   let rayChord = clamp(intersectLocalSlabRaw(input.localPos + incLocal * 0.001, incLocal).y, 0.06, 0.72);
   var chordStress = 0.0;
@@ -853,31 +931,34 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
     let bendSpan = pe.w * (abs(uY) * 1.12 + (1.0 - uY2) * 0.34) * (1.0 - 0.26 * uX * uX);
     chordStress = chordStress + (bearingCol + bendSpan);
   }
-  let localPhotoStress = clamp(chordStress * (1.0 / 3.0), 0.0, 1.35);
+  let localPhotoStress = clamp(chordStress * (1.0 / 3.0) + surfCrackSample.tipStress * 0.52, 0.0, 1.35);
   let retardNm = localPhotoStress * (250.0 + 950.0 * (rayChord / 0.28));
   let phaseRGB = retardNm * vec3<f32>(3.14159265 / 635.0, 3.14159265 / 546.0, 3.14159265 / 455.0);
   let sinP = sin(phaseRGB);
   let isochromaticRGB = sinP * sinP;
 
   if (polariscope > 0.5) {
-    let darkFieldRGB = refractedRGB * 0.14 + reflContrib * 0.42 + sunMicroSpec * 0.45;
+    let darkFieldRGB = (refractedRGB * 0.14 + reflContrib * 0.42 + sunMicroSpec * 0.45) * (1.0 - vitrail.cameMask * 0.85);
     let stressLum = max(0.24, dot(refractedRGB, vec3<f32>(0.2126, 0.7152, 0.0722)) * 2.15 + 0.22);
     let stressGate = smoothstep(0.035, 0.42, localPhotoStress);
-    finalRGB = darkFieldRGB + isochromaticRGB * stressLum * stressGate * (1.0 - fresnel * 0.55) + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
+    finalRGB = darkFieldRGB + isochromaticRGB * stressLum * stressGate * (1.0 - fresnel * 0.55) * (1.0 - vitrail.cameMask * 0.90)
+             + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
   } else if (localPhotoStress > 0.46 && grabbed < 0.5) {
     let subtleBiref = smoothstep(0.46, 0.98, localPhotoStress) * 0.055;
     finalRGB = mix(finalRGB, finalRGB * (0.94 + 0.22 * isochromaticRGB), subtleBiref);
   }
 
-  // Grazing Fresnel glint along surface-breaking hairline cleavage cracks ONLY when aligned with light
-  let blkCrack = (*pBlk).crackAndDamage;
-  if (blkCrack.w > 0.01) {
-    let surfCrack = evaluateInternalCracks(input.localPos, blkCrack.xyz, blkCrack.w, seed);
-    if (surfCrack > 0.01) {
-      let crackN = safeNormalize(glassNormal + vec3<f32>(0.32, 0.12, -0.26), glassNormal);
-      let crackSpec = evalGGXSpecular(crackN, V, L, 0.06);
-      finalRGB = finalRGB * (1.0 - surfCrack * 0.28) + surfCrack * sunColor * sunTransRGB * crackSpec * 0.45;
-    }
+  // Surface-breaking hairline cleavage cracks: true block-local cleavage normal + thin-air-film TIR silver glint on tilt!
+  if (surfCrackSample.mask > 0.01) {
+    let surfCrack = surfCrackSample.mask;
+    let crackWorldN = safeNormalize(mulBlockL2WDir(input.blockIdx, surfCrackSample.normalLocal), glassNormal);
+    let crackBevelN = safeNormalize(glassNormal + crackWorldN * 0.68, glassNormal);
+    let crackSpec = evalGGXSpecular(crackBevelN, V, L, 0.052);
+    let cosViewCleavage = clamp(abs(dot(V, crackWorldN)), 0.0, 1.0);
+    let fCleavage = dielectricFresnel(cosViewCleavage, GLASS_IOR_G, 1.0);
+    let silverGlint = sampleCathedralEnvironment(reflect(incidentDir, crackBevelN), L, reflSunColor, skyTint, atelierMix) * fCleavage * 0.24;
+    finalRGB = finalRGB * (1.0 - surfCrack * 0.26)
+             + surfCrack * (sunColor * sunTransRGB * crackSpec * 0.48 + silverGlint);
   }
 
   // Subtle Tactile UI Rim Feedback strictly along beveled glass edges

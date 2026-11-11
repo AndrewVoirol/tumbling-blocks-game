@@ -27,7 +27,7 @@ import { POST_PROCESS_WGSL } from './shaders/postProcess.wgsl';
 import { OrbitCamera } from '../engine/OrbitCamera';
 
 const SUN_DEPTH_MAP_SIZE = 2048;
-const CAUSTIC_MAP_SIZE = 1024;
+const CAUSTIC_MAP_SIZE = 2048;
 const MAX_BLOCKS_GPU = 96;
 const BLOCK_FLOATS = 52; // 208 bytes per GPUBlockData (2 mat4 + 5 vec4)
 const MAX_SHARDS_GPU = 512;
@@ -792,6 +792,8 @@ export class WebGPURenderer {
       entries: [
         { binding: 0, resource: { buffer: this.sceneUniformBuffer } },
         { binding: 2, resource: { buffer: this.shardStorageBuffer } },
+        { binding: 3, resource: this.sunOpticalDepthView },
+        { binding: 4, resource: this.sunDepthView },
         { binding: 5, resource: { buffer: this.shardVertexBuffer } },
       ],
     });
@@ -843,6 +845,7 @@ export class WebGPURenderer {
         { binding: 4, resource: { buffer: this.splinterStorageBuffer } },
         { binding: 5, resource: this.sunDepthView },
         { binding: 6, resource: this.sunOpticalDepthView },
+        { binding: 8, resource: { buffer: this.blockCentersUniformBuffer } },
       ],
     });
 
@@ -952,6 +955,7 @@ export class WebGPURenderer {
         { binding: 5, resource: this.sunDepthView },
         { binding: 6, resource: this.sunOpticalDepthView },
         { binding: 7, resource: { buffer: this.shardVertexBuffer } },
+        { binding: 8, resource: { buffer: this.blockCentersUniformBuffer } },
       ],
     });
 
@@ -1118,7 +1122,7 @@ export class WebGPURenderer {
         this.blockStorageData[base + 32] = swatch.absorption[0];
         this.blockStorageData[base + 33] = swatch.absorption[1];
         this.blockStorageData[base + 34] = swatch.absorption[2];
-        this.blockStorageData[base + 35] = worldHalfY;
+        this.blockStorageData[base + 35] = b.motif ?? 0;
 
         this.blockStorageData[base + 36] = swatch.accentAbsorption[0];
         this.blockStorageData[base + 37] = swatch.accentAbsorption[1];
@@ -1145,6 +1149,8 @@ export class WebGPURenderer {
       }
     }
 
+    // Always upload blockCentersUniformBuffer (slots 96..97 carry global intact AABB + polariscopeMode in [97].w)
+    // even when intactCount === 0 so Voronoi shards & splinters respond immediately to Polariscope toggles!
     if (intactCount > 0) {
       this.blockCentersData[96 * 4 + 0] = blkMinX;
       this.blockCentersData[96 * 4 + 1] = blkMinY;
@@ -1153,15 +1159,25 @@ export class WebGPURenderer {
       this.blockCentersData[97 * 4 + 0] = blkMaxX;
       this.blockCentersData[97 * 4 + 1] = blkMaxY;
       this.blockCentersData[97 * 4 + 2] = blkMaxZ;
-      this.blockCentersData[97 * 4 + 3] = this.polariscopeMode ? 1.0 : 0.0;
+    } else {
+      this.blockCentersData[96 * 4 + 0] = 10.0;
+      this.blockCentersData[96 * 4 + 1] = 10.0;
+      this.blockCentersData[96 * 4 + 2] = 10.0;
+      this.blockCentersData[96 * 4 + 3] = 0.085;
+      this.blockCentersData[97 * 4 + 0] = -10.0;
+      this.blockCentersData[97 * 4 + 1] = -10.0;
+      this.blockCentersData[97 * 4 + 2] = -10.0;
+    }
+    this.blockCentersData[97 * 4 + 3] = this.polariscopeMode ? 1.0 : 0.0;
+    this.device.queue.writeBuffer(
+      this.blockCentersUniformBuffer,
+      0,
+      this.blockCentersData.buffer,
+      0,
+      98 * 4 * 4
+    );
 
-      this.device.queue.writeBuffer(
-        this.blockCentersUniformBuffer,
-        0,
-        this.blockCentersData.buffer,
-        0,
-        98 * 4 * 4
-      );
+    if (intactCount > 0) {
       this.device.queue.writeBuffer(
         this.blockStorageBuffer,
         0,
@@ -1206,8 +1222,12 @@ export class WebGPURenderer {
       this.shardStorageData[base + 16] = swatch.absorption[0];
       this.shardStorageData[base + 17] = swatch.absorption[1];
       this.shardStorageData[base + 18] = swatch.absorption[2];
-      // Pack (firstVertex << 8) | (vertexCount & 0xff) into native u32 GPUShardInstance.packedMesh (offset 19)
-      this.shardStorageU32[base + 19] = ((s.firstVertex >>> 0) << 8) | (s.vertexCount & 0xff);
+      // Pack ((motif & 3) << 28) | ((firstVertex & 0x03ffff) << 8) | (vertexCount & 0xff) into u32 packedMesh
+      this.shardStorageU32[base + 19] =
+        ((((s.motif ?? 0) & 3) << 28) |
+          (((s.firstVertex >>> 0) & 0x03ffff) << 8) |
+          (s.vertexCount & 0xff)) >>>
+        0;
 
       this.shardStorageData[base + 20] = swatch.accentAbsorption[0];
       this.shardStorageData[base + 21] = swatch.accentAbsorption[1];
@@ -1581,7 +1601,7 @@ export class WebGPURenderer {
 
       pass.setPipeline(this.pipeTable);
       pass.setBindGroup(0, this.bgTable);
-      pass.draw(192 * 33, 1, 0, 0);
+      pass.draw(192 * 45, 1, 0, 0);
 
       pass.setPipeline(this.pipeSky);
       pass.setBindGroup(0, this.bgSky);

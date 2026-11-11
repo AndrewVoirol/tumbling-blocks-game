@@ -63,10 +63,10 @@ struct TableOut {
 };
 
 const TABLE_SEGMENTS: u32 = 192u;
-const TABLE_VERTS_PER_SLICE: u32 = 33u;
+const TABLE_VERTS_PER_SLICE: u32 = 45u;
 const TABLE_R_FLAT: f32 = 4.24;
 const TABLE_R_OUTER: f32 = 4.30;
-const TABLE_BULLNOSE_Y: f32 = -0.048;
+const TABLE_BULLNOSE_Y: f32 = -0.060;
 const TABLE_H: f32 = 0.34;
 const TABLE_R_SOFFIT: f32 = 3.78;
 const TABLE_SOFFIT_Y: f32 = -0.54;
@@ -76,13 +76,13 @@ const TABLE_R_PED_BASE: f32 = 1.18;
 const TABLE_PED_BASE_Y: f32 = -4.20;
 
 fn evalTableVertex(vid: u32) -> TableOut {
-  // Each radial slice emits 11 triangles (33 vertices):
+  // Each radial slice emits 15 triangles (45 vertices) with C1-continuous 3-ring quarter-round bullnose:
   // Tri 0 (0..2): Flat top disc (0 -> rFlat)
-  // Tri 1 & 2 (3..8): Smoothly curved bullnose upper chamfer (rFlat, 0 -> rOuter, -0.048)
-  // Tri 3 & 4 (9..14): Turned hardwood apron side band (rOuter, -0.048 -> rOuter*0.982, -TABLE_H)
-  // Tri 5 & 6 (15..20): Recessed cove under-bevel (rOuter*0.982, -TABLE_H -> rSoffit, -0.54)
-  // Tri 7 & 8 (21..26): Dark walnut sub-frame soffit (rSoffit, -0.54 -> rCollar, -0.72)
-  // Tri 9 & 10 (27..32): Turned central pedestal column (rCollar, -0.72 -> rPedBase, -4.20)
+  // Tri 1..6 (3..20): 3-ring circular bullnose (0 -> 30 -> 60 -> 90 deg, C1 continuous with flat top & apron!)
+  // Tri 7 & 8 (21..26): Turned hardwood apron side band (rOuter, -0.060 -> rOuter*0.982, -TABLE_H)
+  // Tri 9 & 10 (27..32): Recessed cove under-bevel
+  // Tri 11 & 12 (33..38): Sub-frame soffit
+  // Tri 13 & 14 (39..44): Turned central pedestal column
   let slice = vid / TABLE_VERTS_PER_SLICE;
   let sub = vid % TABLE_VERTS_PER_SLICE;
 
@@ -93,10 +93,12 @@ fn evalTableVertex(vid: u32) -> TableOut {
   let dir1 = vec2<f32>(cos(a1), sin(a1));
 
   let nTop = vec3<f32>(0.0, 1.0, 0.0);
-  let nBevelTop0 = normalize(vec3<f32>(dir0.x * 0.18, 1.0, dir0.y * 0.18));
-  let nBevelTop1 = normalize(vec3<f32>(dir1.x * 0.18, 1.0, dir1.y * 0.18));
-  let nRim0 = normalize(vec3<f32>(dir0.x, 0.38, dir0.y));
-  let nRim1 = normalize(vec3<f32>(dir1.x, 0.38, dir1.y));
+  let nBullA0 = vec3<f32>(dir0.x * 0.50, 0.8660254, dir0.y * 0.50);
+  let nBullA1 = vec3<f32>(dir1.x * 0.50, 0.8660254, dir1.y * 0.50);
+  let nBullB0 = vec3<f32>(dir0.x * 0.8660254, 0.50, dir0.y * 0.8660254);
+  let nBullB1 = vec3<f32>(dir1.x * 0.8660254, 0.50, dir1.y * 0.8660254);
+  let nRim0 = vec3<f32>(dir0.x, 0.0, dir0.y);
+  let nRim1 = vec3<f32>(dir1.x, 0.0, dir1.y);
   let nApron0 = normalize(vec3<f32>(dir0.x, -0.08, dir0.y));
   let nApron1 = normalize(vec3<f32>(dir1.x, -0.08, dir1.y));
   let nCove0 = normalize(vec3<f32>(dir0.x * 0.42, -0.91, dir0.y * 0.42));
@@ -106,9 +108,18 @@ fn evalTableVertex(vid: u32) -> TableOut {
   let nPed0 = normalize(vec3<f32>(dir0.x, -0.07, dir0.y));
   let nPed1 = normalize(vec3<f32>(dir1.x, -0.07, dir1.y));
 
+  let rBullA = TABLE_R_FLAT + 0.030;
+  let yBullA: f32 = -0.0080385;
+  let rBullB = TABLE_R_FLAT + 0.0519615;
+  let yBullB: f32 = -0.030;
+
   let pCenter = vec3<f32>(0.0, 0.0, 0.0);
   let pFlat0 = vec3<f32>(dir0.x * TABLE_R_FLAT, 0.0, dir0.y * TABLE_R_FLAT);
   let pFlat1 = vec3<f32>(dir1.x * TABLE_R_FLAT, 0.0, dir1.y * TABLE_R_FLAT);
+  let pBullA0 = vec3<f32>(dir0.x * rBullA, yBullA, dir0.y * rBullA);
+  let pBullA1 = vec3<f32>(dir1.x * rBullA, yBullA, dir1.y * rBullA);
+  let pBullB0 = vec3<f32>(dir0.x * rBullB, yBullB, dir0.y * rBullB);
+  let pBullB1 = vec3<f32>(dir1.x * rBullB, yBullB, dir1.y * rBullB);
   let pMid0 = vec3<f32>(dir0.x * TABLE_R_OUTER, TABLE_BULLNOSE_Y, dir0.y * TABLE_R_OUTER);
   let pMid1 = vec3<f32>(dir1.x * TABLE_R_OUTER, TABLE_BULLNOSE_Y, dir1.y * TABLE_R_OUTER);
   let pBot0 = vec3<f32>(dir0.x * (TABLE_R_OUTER * 0.982), -TABLE_H, dir0.y * (TABLE_R_OUTER * 0.982));
@@ -124,48 +135,64 @@ fn evalTableVertex(vid: u32) -> TableOut {
   var wn = nTop;
 
   switch (sub) {
-    case 0u: { wp = pCenter;  wn = nTop; }
-    case 1u: { wp = pFlat1;   wn = nTop; }
-    case 2u: { wp = pFlat0;   wn = nTop; }
+    case 0u:  { wp = pCenter;  wn = nTop; }
+    case 1u:  { wp = pFlat1;   wn = nTop; }
+    case 2u:  { wp = pFlat0;   wn = nTop; }
 
-    case 3u: { wp = pFlat0;   wn = nBevelTop0; }
-    case 4u: { wp = pFlat1;   wn = nBevelTop1; }
-    case 5u: { wp = pMid0;    wn = nRim0; }
+    case 3u:  { wp = pFlat0;   wn = nTop; }
+    case 4u:  { wp = pFlat1;   wn = nTop; }
+    case 5u:  { wp = pBullA0;  wn = nBullA0; }
 
-    case 6u: { wp = pFlat1;   wn = nBevelTop1; }
-    case 7u: { wp = pMid1;    wn = nRim1; }
-    case 8u: { wp = pMid0;    wn = nRim0; }
+    case 6u:  { wp = pFlat1;   wn = nTop; }
+    case 7u:  { wp = pBullA1;  wn = nBullA1; }
+    case 8u:  { wp = pBullA0;  wn = nBullA0; }
 
-    case 9u:  { wp = pMid0;   wn = nRim0; }
-    case 10u: { wp = pMid1;   wn = nRim1; }
-    case 11u: { wp = pBot0;   wn = nApron0; }
+    case 9u:  { wp = pBullA0;  wn = nBullA0; }
+    case 10u: { wp = pBullA1;  wn = nBullA1; }
+    case 11u: { wp = pBullB0;  wn = nBullB0; }
 
-    case 12u: { wp = pMid1;   wn = nRim1; }
-    case 13u: { wp = pBot1;   wn = nApron1; }
-    case 14u: { wp = pBot0;   wn = nApron0; }
+    case 12u: { wp = pBullA1;  wn = nBullA1; }
+    case 13u: { wp = pBullB1;  wn = nBullB1; }
+    case 14u: { wp = pBullB0;  wn = nBullB0; }
 
-    case 15u: { wp = pBot0;    wn = nCove0; }
-    case 16u: { wp = pBot1;    wn = nCove1; }
-    case 17u: { wp = pSoffit0; wn = nCove0; }
+    case 15u: { wp = pBullB0;  wn = nBullB0; }
+    case 16u: { wp = pBullB1;  wn = nBullB1; }
+    case 17u: { wp = pMid0;    wn = nRim0; }
 
-    case 18u: { wp = pBot1;    wn = nCove1; }
-    case 19u: { wp = pSoffit1; wn = nCove1; }
-    case 20u: { wp = pSoffit0; wn = nCove0; }
+    case 18u: { wp = pBullB1;  wn = nBullB1; }
+    case 19u: { wp = pMid1;    wn = nRim1; }
+    case 20u: { wp = pMid0;    wn = nRim0; }
 
-    case 21u: { wp = pSoffit0; wn = nSoffit0; }
-    case 22u: { wp = pSoffit1; wn = nSoffit1; }
-    case 23u: { wp = pCollar0; wn = nSoffit0; }
+    case 21u: { wp = pMid0;    wn = nRim0; }
+    case 22u: { wp = pMid1;    wn = nRim1; }
+    case 23u: { wp = pBot0;    wn = nApron0; }
 
-    case 24u: { wp = pSoffit1; wn = nSoffit1; }
-    case 25u: { wp = pCollar1; wn = nSoffit1; }
-    case 26u: { wp = pCollar0; wn = nSoffit0; }
+    case 24u: { wp = pMid1;    wn = nRim1; }
+    case 25u: { wp = pBot1;    wn = nApron1; }
+    case 26u: { wp = pBot0;    wn = nApron0; }
 
-    case 27u: { wp = pCollar0; wn = nPed0; }
-    case 28u: { wp = pCollar1; wn = nPed1; }
-    case 29u: { wp = pPed0;    wn = nPed0; }
+    case 27u: { wp = pBot0;    wn = nCove0; }
+    case 28u: { wp = pBot1;    wn = nCove1; }
+    case 29u: { wp = pSoffit0; wn = nCove0; }
 
-    case 30u: { wp = pCollar1; wn = nPed1; }
-    case 31u: { wp = pPed1;    wn = nPed1; }
+    case 30u: { wp = pBot1;    wn = nCove1; }
+    case 31u: { wp = pSoffit1; wn = nCove1; }
+    case 32u: { wp = pSoffit0; wn = nCove0; }
+
+    case 33u: { wp = pSoffit0; wn = nSoffit0; }
+    case 34u: { wp = pSoffit1; wn = nSoffit1; }
+    case 35u: { wp = pCollar0; wn = nSoffit0; }
+
+    case 36u: { wp = pSoffit1; wn = nSoffit1; }
+    case 37u: { wp = pCollar1; wn = nSoffit1; }
+    case 38u: { wp = pCollar0; wn = nSoffit0; }
+
+    case 39u: { wp = pCollar0; wn = nPed0; }
+    case 40u: { wp = pCollar1; wn = nPed1; }
+    case 41u: { wp = pPed0;    wn = nPed0; }
+
+    case 42u: { wp = pCollar1; wn = nPed1; }
+    case 43u: { wp = pPed1;    wn = nPed1; }
     default:  { wp = pPed0;    wn = nPed0; }
   }
 
@@ -211,14 +238,15 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
   let optDims = vec2<i32>(textureDimensions(uSunOpticalDepthTex));
   let maxCoord = optDims - vec2<i32>(1);
   let centerPx = vec2<i32>(uv * vec2<f32>(optDims));
+  let pxScale = max(1, optDims.x / 1024);
 
-  // 9-tap min-height blocker search up to +/- 11 texels (+/- 10.4 mm) so Layer-0 stays < 2.5 mm even under upper-row overlap
+  // Resolution-invariant 9-tap min-height blocker search (+/- 10.4 mm physical radius at both 1024 and 2048!)
   var outerOffsets = array<vec2<i32>, 5>(
     vec2<i32>(  0,   0),
-    vec2<i32>( 11,   4),
-    vec2<i32>(-11,  -4),
-    vec2<i32>( -4,  11),
-    vec2<i32>(  4, -11)
+    vec2<i32>( 11,   4) * pxScale,
+    vec2<i32>(-11,  -4) * pxScale,
+    vec2<i32>( -4,  11) * pxScale,
+    vec2<i32>(  4, -11) * pxScale
   );
   var minSearchY: f32 = 10.0;
   for (var s: i32 = 0; s < 5; s = s + 1) {
@@ -227,10 +255,10 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
   }
   if (minSearchY < 9.9) {
     var innerOffsets = array<vec2<i32>, 4>(
-      vec2<i32>(  5,   2),
-      vec2<i32>( -5,  -2),
-      vec2<i32>( -2,   5),
-      vec2<i32>(  2,  -5)
+      vec2<i32>(  5,   2) * pxScale,
+      vec2<i32>( -5,  -2) * pxScale,
+      vec2<i32>( -2,   5) * pxScale,
+      vec2<i32>(  2,  -5) * pxScale
     );
     for (var s: i32 = 0; s < 4; s = s + 1) {
       let px = clamp(centerPx + innerOffsets[s], vec2<i32>(0), maxCoord);
@@ -238,7 +266,8 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
     }
   }
 
-  let texel = 1.0 / f32(optDims.x);
+  // Physical world-space UV reference unit (0.947 mm on the 9.70 dm sun ortho frustum)
+  const UV_REF: f32 = 1.0 / 1024.0;
   let rotAngle = hash31(vec3<f32>(floor(worldPos.x * 400.0), 1.0, floor(worldPos.z * 400.0))) * 2.0 * PI;
   let ca = cos(rotAngle);
   let sa = sin(rotAngle);
@@ -250,7 +279,7 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
   var contactSharpWeight: f32 = 0.0;
   var sharpLit01: f32 = 1.0;
   if (minSearchY < 9.2) {
-    let shadowRadiusUV = texel * (0.18 + pow(liftedHeightDm, 1.25) * 5.0);
+    let shadowRadiusUV = UV_REF * (0.18 + pow(liftedHeightDm, 1.25) * 5.0);
     let centerTau = textureSampleLevel(uSunOpticalDepthTex, uLinearSampler, uv, 0.0).rgb;
     var baseAccum = evalTransmittedBaseFromTau(centerTau) * 0.20;
     var baseWeight: f32 = 0.20;
@@ -286,7 +315,12 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
 
       var bestTau = centerTau;
       var bestPeak = max(bestTau.r, max(bestTau.g, bestTau.b));
-      var nearOffs = array<vec2<i32>, 4>(vec2<i32>(1, 0), vec2<i32>(-1, 0), vec2<i32>(0, 1), vec2<i32>(0, -1));
+      var nearOffs = array<vec2<i32>, 4>(
+        vec2<i32>(pxScale, 0),
+        vec2<i32>(-pxScale, 0),
+        vec2<i32>(0, pxScale),
+        vec2<i32>(0, -pxScale)
+      );
       for (var n: i32 = 0; n < 4; n = n + 1) {
         let candTau = textureLoad(uSunOpticalDepthTex, clamp(centerPx + nearOffs[n], vec2<i32>(0), maxCoord), 0).rgb;
         let candPeak = max(candTau.r, max(candTau.g, candTau.b));
@@ -301,9 +335,10 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
   }
 
   // Fast early-out for unobstructed sunlit tabletop pixels outside both shadow and caustic halo (~75% of table)
-  let c0 = textureSampleLevel(uCausticTex, uLinearSampler, uv, 0.0).rgb;
+  let c0Full = textureSampleLevel(uCausticTex, uLinearSampler, uv, 0.0);
+  let c0 = c0Full.rgb;
   if (minSearchY >= 9.2) {
-    let step4 = texel * 5.0;
+    let step4 = UV_REF * 5.0;
     let cPx = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv + vec2<f32>(step4, 0.0), vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).rgb;
     let cNx = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv - vec2<f32>(step4, 0.0), vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).rgb;
     let cPy = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv + vec2<f32>(0.0, step4), vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).rgb;
@@ -320,18 +355,21 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
     }
   }
 
-  // 2. Additive Snell-refracted waterglass & vertical-corner focal caustic flux from uCausticTex
-  //    Filter R/G/B dispersion jointly inside the Vogel disk kernel so single-texel fold spikes never split into RGB comb stripes.
+  // 2. Additive Snell-refracted waterglass, block-flank, and Voronoi shard caustic flux from 2048x2048 uCausticTex:
+  //    uCausticTex.a carries additive shard-caustic tag so resting Voronoi shards cast full chromatic caustics
+  //    outside their un-deflected shadow silhouette while Layer-0 intact blocks keep 0.0 rectangular halo bleed!
   let sunClipDelta = uScene.sunViewProj * vec4<f32>(-sunDir.x, 0.0, -sunDir.z, 0.0);
   let sunProjDir = normalize(vec2<f32>(sunClipDelta.x, -sunClipDelta.y) + vec2<f32>(1e-5, 1e-5));
-  let dispMag = texel * (0.04 + pow(liftedHeightDm, 1.10) * 0.66);
+  let dispMag = UV_REF * (0.04 + pow(liftedHeightDm, 1.10) * 0.66);
   let dispVec = sunProjDir * dispMag;
 
-  let causticRadiusUV = texel * (0.18 + pow(liftedHeightDm, 1.15) * 1.14);
+  let isShardCausticCenter = smoothstep(0.001, 0.025, c0Full.a);
+  let causticRadiusUV = UV_REF * (mix(0.46, 0.14, isShardCausticCenter) + pow(liftedHeightDm, 1.15) * 1.56);
   let centerR = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv + dispVec, vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).r;
   let centerG = c0.g;
   let centerB = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv - dispVec, vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).b;
   var fluxAccum = vec3<f32>(centerR, centerG, centerB) * 0.22;
+  var shardTagAccum: f32 = c0Full.a * 0.22;
   var fluxWeight: f32 = 0.22;
   for (var i: i32 = 0; i < 12; i = i + 1) {
     let fi = f32(i) + 0.5;
@@ -342,12 +380,16 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
     let w = 1.0 - r * 0.32;
     let tapUV = clamp(uv + rotOff, vec2<f32>(0.002), vec2<f32>(0.998));
     let tapR = textureSampleLevel(uCausticTex, uLinearSampler, clamp(tapUV + dispVec, vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).r;
-    let tapG = textureSampleLevel(uCausticTex, uLinearSampler, tapUV, 0.0).g;
+    let tapGA = textureSampleLevel(uCausticTex, uLinearSampler, tapUV, 0.0);
     let tapB = textureSampleLevel(uCausticTex, uLinearSampler, clamp(tapUV - dispVec, vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).b;
-    fluxAccum += vec3<f32>(tapR, tapG, tapB) * w;
+    fluxAccum += vec3<f32>(tapR, tapGA.g, tapB) * w;
+    shardTagAccum += tapGA.a * w;
     fluxWeight += w;
   }
-  let dispersedFlux = (fluxAccum / fluxWeight) * (1.0 - sharpLit01 * contactSharpWeight);
+  let shardTagMean = shardTagAccum / fluxWeight;
+  let shardCausticBypass = smoothstep(0.0015, 0.028, max(c0Full.a, shardTagMean));
+  let contactHaloSuppress = sharpLit01 * contactSharpWeight * (1.0 - shardCausticBypass);
+  let dispersedFlux = (fluxAccum / fluxWeight) * (1.0 - contactHaloSuppress);
 
   return baseFiltered + dispersedFlux;
 }
@@ -379,8 +421,18 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
     mat.roughness = 0.44;
     mat.metallic = 0.0;
   }
-  let topMask = smoothstep(0.55, 0.95, input.worldNormal.y);
-  let N = safeNormalize(input.worldNormal + mat.normalPerturb * mix(0.22, 1.0, topMask), vec3<f32>(0.0, 1.0, 0.0));
+  let geomN = safeNormalize(input.worldNormal, vec3<f32>(0.0, 1.0, 0.0));
+  let surfTanX = safeNormalize(vec3<f32>(geomN.y, -geomN.x, 0.0), vec3<f32>(1.0, 0.0, 0.0));
+  let surfTanZ = safeNormalize(cross(surfTanX, geomN), vec3<f32>(0.0, 0.0, 1.0));
+  if (!isUnderStructure) {
+    // End-grain absorption & pore roughness where longitudinal X-staves meet the curved bullnose rim
+    let rimTilt = 1.0 - clamp(geomN.y, 0.0, 1.0);
+    let endGrainExposure = rimTilt * abs(geomN.x);
+    mat.albedo *= (1.0 - endGrainExposure * 0.16);
+    mat.roughness = clamp(mat.roughness + endGrainExposure * 0.08, 0.20, 0.70);
+  }
+  let tangentBump = surfTanX * mat.normalPerturb.x + surfTanZ * mat.normalPerturb.z + geomN * mat.normalPerturb.y;
+  let N = safeNormalize(geomN + tangentBump * mix(0.45, 1.0, clamp(geomN.y, 0.0, 1.0)), geomN);
 
   var causticRGB = vec3<f32>(0.0);
   var windowGobo: f32 = 0.0;
@@ -479,9 +531,15 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   let directIrradiance = sunColor * nDotL * causticRGB * windowGobo;
   let ambientIrradiance = evaluateTableAmbientIrradiance(skyTint, skyScale, atelierMix) * aoBounce * aoCrevice;
 
-  // Subsurface wood-grain scatter ONLY where focused stained-glass ribbons (> 1.02x unobstructed sun) hit the wood
-  let focalExcess = max(vec3<f32>(0.0), causticRGB - vec3<f32>(1.02)) * windowGobo;
-  let woodCausticScatter = diffuseAlbedo * focalExcess * sunColor * 0.18;
+  // Chromatic & focal subsurface wood-grain scatter:
+  // Unobstructed sunlit wood (causticRGB == 1.0 -> cMax - cMin == 0, focalExcess == 0) adds strictly 0.0,
+  // while saturated ruby/cobalt/emerald stained-glass pools and focused caustic ribbons warmly scatter through oak/walnut cellulose!
+  let cMax = max(causticRGB.r, max(causticRGB.g, causticRGB.b));
+  let cMin = min(causticRGB.r, min(causticRGB.g, causticRGB.b));
+  let chromaExcess = max(vec3<f32>(0.0), causticRGB - vec3<f32>(cMin)) * smoothstep(0.06, 0.44, cMax - cMin);
+  let focalExcess = max(vec3<f32>(0.0), causticRGB - vec3<f32>(1.01));
+  let woodSssTint = mix(vec3<f32>(1.18, 0.86, 0.56), vec3<f32>(1.12, 0.92, 0.68), atelierMix);
+  let woodCausticScatter = diffuseAlbedo * woodSssTint * (focalExcess * 0.20 + chromaExcess * 0.065) * sunColor * nDotL * windowGobo;
 
   let edgeVignette = 1.0 - smoothstep(3.45, 4.30, length(input.worldPos.xz)) * mix(0.32, 0.14, atelierMix);
   let finalColor = (diffuseAlbedo * (directIrradiance + ambientIrradiance) + woodCausticScatter + specDirect + envRefl) * edgeVignette

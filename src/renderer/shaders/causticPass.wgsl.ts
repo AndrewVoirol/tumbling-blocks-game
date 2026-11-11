@@ -20,7 +20,7 @@ ${COMMON_GLASS_WGSL}
 
 fn loadShardVertOffset(shardIdx: u32, vid: u32) -> u32 {
   let packed = uShards[shardIdx].packedMesh;
-  let firstVert = packed >> 8u;
+  let firstVert = (packed >> 8u) & 0x03ffffu;
   let vertCount = max(3u, packed & 255u);
   let localVid = select(vid, 0u, vid >= vertCount);
   return (firstVert + localVid) * 10u;
@@ -98,7 +98,7 @@ fn vs_optical_depth_block(
 @fragment
 fn fs_optical_depth_block(input: BlockOptDepthOut) -> @location(0) vec4<f32> {
   let blk = uBlocks[input.blockIdx];
-  let motifId: i32 = 0;
+  let motifId = i32(round(blk.absorptionAndMotif.w));
   let seed = blk.accentAndSeed.w;
   let L = safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0));
 
@@ -116,9 +116,10 @@ fn fs_optical_depth_block(input: BlockOptDepthOut) -> @location(0) vec4<f32> {
   ) + SODA_LIME_IRON_SIGMA;
 
   let cosSun = clamp(dot(safeNormalize(input.worldNormal, L), L), 0.0, 1.0);
-  let fEntry = 0.0426 + 0.30 * pow(1.0 - cosSun, 5.0);
+  let fEntry = dielectricFresnel(cosSun, 1.0, GLASS_IOR_G);
   let crackShadow = evaluateInternalCracks(input.localPos, blk.crackAndDamage.xyz, blk.crackAndDamage.w, seed);
-  let fresnelTau = -log(max(0.18, (1.0 - fEntry) * 0.9574 * (1.0 - crackShadow * 0.38)));
+  let cameBlock = max(vitrailEntry.cameMask, vitrailExit.cameMask);
+  let fresnelTau = -log(max(0.14, (1.0 - fEntry) * 0.9572 * (1.0 - crackShadow * 0.38) * (1.0 - cameBlock * 0.82)));
 
   let tauRGB = sigma * min(chordDm, 0.38) * 0.78 + vec3<f32>(fresnelTau);
   let casterExitY = clamp(min(input.worldPos.y, exitWorldPos.y), 0.0, 9.5);
@@ -160,7 +161,7 @@ fn vs_optical_depth_shard(
 @fragment
 fn fs_optical_depth_shard(input: ShardOptDepthOut) -> @location(0) vec4<f32> {
   let sh = uShards[input.shardIdx];
-  let motifId: i32 = 0;
+  let motifId = i32((sh.packedMesh >> 28u) & 3u);
   let seed = sh.accentAndSeed.w;
   let L = safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0));
 
@@ -186,8 +187,8 @@ fn fs_optical_depth_shard(input: ShardOptDepthOut) -> @location(0) vec4<f32> {
   let sigma = mix(sh.absorption, sh.accentAndSeed.xyz, vitrail.accentMix) + SODA_LIME_IRON_SIGMA;
 
   let cosSun = clamp(dot(safeNormalize(input.worldNormal, L), L), 0.0, 1.0);
-  let fEntry = 0.0426 + 0.34 * pow(1.0 - cosSun, 5.0);
-  let fresnelTau = -log(max(0.20, (1.0 - fEntry) * 0.9574));
+  let fEntry = dielectricFresnel(cosSun, 1.0, GLASS_IOR_G);
+  let fresnelTau = -log(max(0.14, (1.0 - fEntry) * 0.9572 * (1.0 - vitrail.cameMask * 0.82)));
 
   let tauRGB = sigma * chordDm * 0.92 + vec3<f32>(fresnelTau);
   let exitWorldY = clamp(input.worldY - L.y * chordDm, 0.0, 9.5);
@@ -216,7 +217,7 @@ fn vs_block_caustic_flux(
   @builtin(instance_index) instIdx: u32
 ) -> BlockCausticFluxOut {
   let blk = uBlocks[instIdx];
-  let motifId: i32 = 0;
+  let motifId = i32(round(blk.absorptionAndMotif.w));
   let seed = blk.accentAndSeed.w;
   let L = safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0));
 
@@ -271,12 +272,13 @@ fn vs_block_caustic_flux(
   let cosSun = dot(macroWN, L);
   let facingGate = step(0.005, cosSun);
   let cosClamped = clamp(cosSun, 0.0, 1.0);
-  let fEntry = 0.0426 + 0.30 * pow(1.0 - cosClamped, 5.0);
-  let fresnelTau = -log(max(0.18, (1.0 - fEntry) * 0.9574));
+  let fEntry = dielectricFresnel(cosClamped, 1.0, GLASS_IOR_G);
+  let cameOcc = max(vitrailEntry.cameMask, vitrailExit.cameMask);
+  let fresnelTau = -log(max(0.14, (1.0 - fEntry) * 0.9572 * (1.0 - cameOcc * 0.85)));
   let tauSelf = sigma * min(chordDm, 0.38) * 0.78 + vec3<f32>(fresnelTau);
 
   let crackShadow = evaluateInternalCracks(pos, blk.crackAndDamage.xyz, blk.crackAndDamage.w, seed);
-  let faceTint = (1.0 - fEntry) * 0.9574 * (1.0 - crackShadow * 0.40) * facingGate * exp(-sigma * 0.04);
+  let faceTint = (1.0 - fEntry) * 0.9572 * (1.0 - crackShadow * 0.40) * (1.0 - cameOcc * 0.90) * facingGate * exp(-sigma * 0.04);
 
   let projectedWorld = vec4<f32>(deflXZ.x, 0.0, deflXZ.y, 1.0);
 
@@ -330,7 +332,12 @@ struct ShardCausticFluxOut {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) origTableXZ: vec2<f32>,
   @location(1) deflTableXZ: vec2<f32>,
-  @location(2) beerPass: vec3<f32>,
+  @location(2) entryWorldPos: vec3<f32>,
+  @location(3) worldNormal: vec3<f32>,
+  @location(4) parentLocalPos: vec3<f32>,
+  @location(5) tauSelf: vec3<f32>,
+  @location(6) beerPass: vec3<f32>,
+  @location(7) @interpolate(flat) seedAndMotif: vec2<f32>,
 };
 
 @vertex
@@ -344,7 +351,7 @@ fn vs_shard_caustic(
   let parentLocalPos = vec3<f32>(uShardVerts[off + 6u], uShardVerts[off + 7u], uShardVerts[off + 8u]);
   let isOuter = uShardVerts[off + 9u];
   let sh = uShards[shardIdx];
-  let motifId: i32 = 0;
+  let motifId = i32((sh.packedMesh >> 28u) & 3u);
   let seed = sh.accentAndSeed.w;
   let L = safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0));
 
@@ -352,49 +359,125 @@ fn vs_shard_caustic(
   let wn = safeNormalize((sh.localToWorld * vec4<f32>(normal, 0.0)).xyz, vec3<f32>(0.0, 1.0, 0.0));
 
   let vitrail = evaluateVitrailPattern(parentLocalPos, motifId, seed);
-  let rippleWorld = (sh.localToWorld * vec4<f32>(vitrail.rippleGrad * 18.0 * isOuter, 0.0)).xyz;
-  let surfN = safeNormalize(wn + rippleWorld, wn);
+  // Conchoidal cleavage dish curvature on interior fracture faces + hand-rolled waterglass on outer faces
+  let conchoidalLocal = vec3<f32>(
+    centeredPos.x * 1.45 + sin(centeredPos.z * 28.0 + seed * 2.3) * 0.018,
+    centeredPos.y * 0.85,
+    centeredPos.z * 1.45 - cos(centeredPos.x * 26.0 - seed * 1.7) * 0.018
+  ) * (1.0 - isOuter);
+  let facetSlopeWorld = (sh.localToWorld * vec4<f32>(vitrail.rippleGrad * 16.0 * isOuter + conchoidalLocal * 0.22, 0.0)).xyz;
+  let surfN = safeNormalize(wn + facetSlopeWorld, wn);
 
-  var refrDir = refract(-L, surfN, 1.0 / 1.522);
-  if (length(refrDir) < 1e-4) {
-    refrDir = -L;
+  // 1. Entry Snell refraction (air -> soda-lime cathedral glass n = 1.522)
+  var inGlassWorld = refract(-L, surfN, 1.0 / GLASS_IOR_G);
+  if (length(inGlassWorld) < 1e-4) {
+    inGlassWorld = -L;
   } else {
-    refrDir = safeNormalize(refrDir, -L);
+    inGlassWorld = safeNormalize(inGlassWorld, -L);
   }
 
-  let origT = max(0.0, wp.y) / max(0.20, L.y);
-  let origXZ = wp.xz - L.xz * origT;
-  let deflT = max(0.0, wp.y) / max(0.20, -refrDir.y);
-  let rawDeflXZ = wp.xz + refrDir.xz * deflT;
-  let deflXZ = origXZ + clamp(rawDeflXZ - origXZ, vec2<f32>(-0.18), vec2<f32>(0.18));
+  // 2. Exact convex polyhedron optical chord through sh.planes[0..planeCount] (continuous concave min across facet!)
+  let r0 = sh.localToWorld[0].xyz;
+  let r1 = sh.localToWorld[1].xyz;
+  let r2 = sh.localToWorld[2].xyz;
+  let inGlassLocal = safeNormalize(vec3<f32>(dot(r0, inGlassWorld), dot(r1, inGlassWorld), dot(r2, inGlassWorld)), -normal);
+  let planeCount = min(MAX_SHARD_PLANES, u32(round(sh.originAndPlaneCount.w)));
+  var tExit: f32 = 0.095;
+  for (var k: u32 = 0u; k < planeCount; k = k + 1u) {
+    let pl = sh.planes[k];
+    let denom = dot(pl.xyz, inGlassLocal);
+    if (denom > 1e-4) {
+      let t = (abs(pl.w) - dot(pl.xyz, centeredPos + inGlassLocal * 0.0005)) / denom;
+      if (t >= 0.0 && t < tExit) {
+        tExit = t;
+      }
+    }
+  }
+  let chordDm = clamp(tExit, 0.010, 0.34);
+  let exitLocal = centeredPos + inGlassLocal * chordDm;
+  let exitVitrail = evaluateVitrailPattern(parentLocalPos + (exitLocal - centeredPos), motifId, seed);
 
-  let sigma = mix(sh.absorption, sh.accentAndSeed.xyz, vitrail.accentMix) + SODA_LIME_IRON_SIGMA;
-  let cosSun = clamp(dot(wn, L), 0.0, 1.0);
-  let fEntry = 0.0426 + 0.34 * pow(1.0 - cosSun, 5.0);
-  let beerPass = exp(-sigma * 0.08) * (1.0 - fEntry) * 0.9574 * smoothstep(0.02, 0.16, cosSun);
+  // 3. Project refracted prism wedge + continuous C-infinity waterglass wavelets onto y = 0 tabletop
+  //    Even resting wedge shards (wp.y ~ 0.03..0.14 dm) deflect solar rays 4..32 mm outside their shadow footprint!
+  let sunSlopeY = max(0.20, L.y);
+  let origT = max(0.0, wp.y) / sunSlopeY;
+  let origXZ = wp.xz - L.xz * origT;
+
+  let exitWorldPos = wp + inGlassWorld * chordDm;
+  // Smooth prism exit deviation (n - 1) * horizontal facet normal projects colored caustic pool alongside resting shards
+  let wedgePrismXZ = vec2<f32>(-surfN.x, -surfN.z) * (GLASS_IOR_G - 1.0) * (0.042 + 0.55 * chordDm);
+  let postExitDropT = max(0.0, exitWorldPos.y) / max(0.20, -inGlassWorld.y);
+  let snellRawXZ = exitWorldPos.xz + inGlassWorld.xz * postExitDropT + wedgePrismXZ;
+
+  let u1 = origXZ.x * 9.4 + origXZ.y * 6.8 + seed * 2.1;
+  let u2 = origXZ.y * 9.8 - origXZ.x * 6.2 - seed * 1.7;
+  let waveDelta = vec2<f32>(
+    sin(u1) * 0.018 + cos(u2) * 0.011,
+    cos(u2 * 0.94 + 0.6) * 0.018 - sin(u1 * 0.90 - 0.3) * 0.011
+  );
+  let rawDelta = (snellRawXZ - origXZ) + waveDelta;
+  let deltaLen = length(rawDelta);
+  let deflXZ = origXZ + rawDelta / (1.0 + deltaLen / 0.24);
+
+  let sigma = mix(
+    sh.absorption,
+    sh.accentAndSeed.xyz,
+    0.5 * (vitrail.accentMix + exitVitrail.accentMix)
+  ) + SODA_LIME_IRON_SIGMA;
+  let cosSun = dot(wn, L);
+  let facingGate = smoothstep(0.005, 0.12, cosSun);
+  let cosClamped = clamp(cosSun, 0.0, 1.0);
+  let fEntry = dielectricFresnel(cosClamped, 1.0, GLASS_IOR_G);
+  let cameOcc = max(vitrail.cameMask, exitVitrail.cameMask);
+  let fresnelTrans = (1.0 - fEntry) * 0.9572 * (1.0 - cameOcc * 0.88);
+  let tauSelf = sigma * chordDm * 0.92 + vec3<f32>(-log(max(0.14, fresnelTrans)));
+
+  // True Beer-Lambert spectral chord attenuation (with minimum 5.5 mm effective optical path so thin chips keep rich jewel hue)
+  let opticalPathDm = max(chordDm, 0.055) * 1.18;
+  let beerPass = exp(-sigma * opticalPathDm) * fresnelTrans * facingGate;
 
   var out: ShardCausticFluxOut;
   out.clipPos = uScene.sunViewProj * vec4<f32>(deflXZ.x, 0.0, deflXZ.y, 1.0);
   out.origTableXZ = origXZ;
   out.deflTableXZ = deflXZ;
+  out.entryWorldPos = wp;
+  out.worldNormal = wn;
+  out.parentLocalPos = parentLocalPos;
+  out.tauSelf = tauSelf;
   out.beerPass = beerPass;
+  out.seedAndMotif = vec2<f32>(seed, f32(motifId));
   return out;
 }
 
 @fragment
 fn fs_shard_caustic(input: ShardCausticFluxOut) -> @location(0) vec4<f32> {
+  // Unconditional screen-space derivatives & binding keep-alives at top of fragment shader!
   let dOrigX = dpdx(input.origTableXZ);
   let dOrigY = dpdy(input.origTableXZ);
   let dDeflX = dpdx(input.deflTableXZ);
   let dDeflY = dpdy(input.deflTableXZ);
+  let _keepOpt = f32(textureDimensions(uSunOpticalDepthTex).x) * 0.0;
+  let _keepDepth = f32(textureDimensions(uSunDepthTex).x) * 0.0;
   if (max(input.beerPass.r, max(input.beerPass.g, input.beerPass.b)) < 1e-4) {
     discard;
   }
 
+  let L = safeNormalize(uScene.sunDirAndBlockCount.xyz, vec3<f32>(0.0, 1.0, 0.0));
+  let rawSunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, input.entryWorldPos, input.worldNormal, L, 0.015);
+  let optSample = sampleSunOpticalDepth(uSunOpticalDepthTex, uScene.sunViewProj, input.entryWorldPos);
+  let tauUpstream = max(vec3<f32>(0.0), optSample.rgb - input.tauSelf) * (1.0 - rawSunVis);
+  let upstreamTrans = mix(exp(-tauUpstream * 0.65), vec3<f32>(1.0), smoothstep(0.15, 0.75, rawSunVis));
+
   let origArea = abs(dOrigX.x * dOrigY.y - dOrigX.y * dOrigY.x);
   let deflArea = abs(dDeflX.x * dDeflY.y - dDeflX.y * dDeflY.x);
-  let invJacobian = clamp(origArea / max(deflArea, 0.16 * origArea + 1e-8), 0.0, 4.5);
+  let invJacobian = clamp(origArea / max(deflArea, 0.18 * origArea + 1e-8), 0.0, 4.2);
 
-  return vec4<f32>(input.beerPass * invJacobian * 0.24, 0.0);
+  // Sub-polygon waterglass Laplacian focal modulation for 2048x2048 internal caustic striations
+  let vitrailSub = evaluateVitrailPattern(input.parentLocalPos, i32(round(input.seedAndMotif.y)), input.seedAndMotif.x);
+  let subFocus = clamp(1.0 + 0.42 * (-vitrailSub.rippleLaplacian), 0.58, 1.55);
+
+  let fluxRGB = input.beerPass * upstreamTrans * invJacobian * subFocus * 0.64 + vec3<f32>(_keepOpt + _keepDepth);
+  let shardFluxTag = max(fluxRGB.r, max(fluxRGB.g, fluxRGB.b));
+  return vec4<f32>(fluxRGB, shardFluxTag);
 }
 `;
