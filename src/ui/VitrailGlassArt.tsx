@@ -347,7 +347,7 @@ export const NameplateMarginInlaySvg: React.FC<{ side: 'left' | 'right' }> = ({ 
  * Slender Wright-style stained-glass right-margin jewel strip for each Game Mode course.
  */
 export const ModeRightJewelSvg: React.FC<{
-  mode: 'solo' | 'party' | 'sandbox';
+  mode: 'solo' | 'party' | 'online' | 'sandbox';
   active: boolean;
 }> = ({ mode, active }) => {
   const c =
@@ -355,6 +355,8 @@ export const ModeRightJewelSvg: React.FC<{
       ? ['#1d4ed8', '#fef08a', '#0284c7']
       : mode === 'party'
       ? ['#047857', '#fbbf24', '#0d9488']
+      : mode === 'online'
+      ? ['#0d9488', '#fde047', '#0284c7']
       : ['#6d28d9', '#f59e0b', '#be185d'];
 
   return (
@@ -374,7 +376,7 @@ export const ModeRightJewelSvg: React.FC<{
  * Full-bleed inlaid stained-glass mosaic medallion on the left end of each Game Mode course.
  */
 export const ModeMosaicMedallionSvg: React.FC<{
-  mode: 'solo' | 'party' | 'sandbox';
+  mode: 'solo' | 'party' | 'online' | 'sandbox';
   active: boolean;
 }> = ({ mode, active }) => {
   if (mode === 'solo') {
@@ -418,6 +420,39 @@ export const ModeMosaicMedallionSvg: React.FC<{
             stroke="#100e14"
             strokeWidth="1.5"
           />
+        </g>
+        <rect x="0" y="0" width="46" height="38" fill="url(#vitrail-sheet-sheen)" />
+      </svg>
+    );
+  }
+  if (mode === 'online') {
+    return (
+      <svg className="mode-medallion-svg" viewBox="0 0 46 38" aria-hidden="true">
+        <rect x="0" y="0" width="46" height="38" fill="#100e14" />
+        <g opacity={active ? 1 : 0.65}>
+          <polygon points="1,1 22,1 14,18 1,18" fill="#0f766e" />
+          <polygon points="24,1 45,1 45,18 32,18" fill="#0369a1" />
+          <polygon points="1,20 14,20 22,37 1,37" fill="#115e59" />
+          <polygon points="32,20 45,20 45,37 24,37" fill="#1d4ed8" />
+          {/* Linked globe meridian + twin distant prism nodes */}
+          <circle
+            cx="23"
+            cy="19"
+            r="10.5"
+            fill="#0d9488"
+            fillOpacity="0.55"
+            stroke="#100e14"
+            strokeWidth="1.5"
+          />
+          <path
+            d="M 13 19 Q 23 11 33 19 Q 23 27 13 19 Z"
+            fill="#67e8f9"
+            fillOpacity="0.85"
+            stroke="#100e14"
+            strokeWidth="1.2"
+          />
+          <polygon points="14,15 18,19 14,23 10,19" fill="#fde047" stroke="#100e14" strokeWidth="1.2" />
+          <polygon points="32,15 36,19 32,23 28,19" fill="#38bdf8" stroke="#100e14" strokeWidth="1.2" />
         </g>
         <rect x="0" y="0" width="46" height="38" fill="url(#vitrail-sheet-sheen)" />
       </svg>

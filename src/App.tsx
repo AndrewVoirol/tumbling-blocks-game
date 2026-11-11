@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { GameEngine } from './engine/GameEngine';
+import { GameEngine, VitrailHudTelemetry } from './engine/GameEngine';
 import {
   INITIAL_LAYERS,
   LIGHTING_PRESETS,
   STAINED_GLASS_PALETTE,
 } from './physics/constants';
-import { GameMode, TowerTelemetry } from './physics/PhysicsWorld';
+import { GameMode } from './physics/PhysicsWorld';
+import { isValidRoomCode, normalizeRoomCode } from './multiplayer';
 import {
   AcousticCrystalSvg,
   ClerestoryPaneMosaicSvg,
@@ -47,11 +48,12 @@ export type QuarryGlassTone =
   | 'teal'
   | 'grisaille-cobalt'
   | 'grisaille-emerald'
-  | 'grisaille-amethyst';
+  | 'grisaille-amethyst'
+  | 'grisaille-teal';
 
 type UiSoundTone = 'default' | 'tab' | 'primary' | 'danger' | 'step';
 
-const INITIAL_TELEMETRY: TowerTelemetry = {
+const INITIAL_TELEMETRY: VitrailHudTelemetry = {
   turnPhase: 'SELECT_BLOCK',
   gameMode: 'solo',
   currentPlayer: 0,
@@ -215,11 +217,17 @@ export const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<GameEngine | null>(null);
 
-  const [telemetry, setTelemetry] = useState<TowerTelemetry>(INITIAL_TELEMETRY);
+  const [telemetry, setTelemetry] = useState<VitrailHudTelemetry>(INITIAL_TELEMETRY);
   const [muted, setMuted] = useState<boolean>(false);
   const [lightPreset, setLightPreset] = useState<string>(LIGHTING_PRESETS[0].id);
   const [showHelp, setShowHelp] = useState<boolean>(false);
   const [gpuError, setGpuError] = useState<string | null>(null);
+  const [onlineDrawerOpen, setOnlineDrawerOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('room')
+  );
+  const [joinCodeDraft, setJoinCodeDraft] = useState<string>('');
+  const [copiedRoomLink, setCopiedRoomLink] = useState<boolean>(false);
+  const copyFeedbackTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -241,6 +249,9 @@ export const App: React.FC = () => {
 
     return () => {
       cancelled = true;
+      if (copyFeedbackTimerRef.current !== null) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+      }
       engine.dispose();
       if (engineRef.current === engine) {
         engineRef.current = null;
@@ -271,17 +282,64 @@ export const App: React.FC = () => {
   }, []);
 
   const handleModeChange = (mode: GameMode) => {
+    setOnlineDrawerOpen(false);
+    if (telemetry.mpRole) {
+      engineRef.current?.leaveOnlineRoom(mode, telemetry.playerCount);
+      return;
+    }
     engineRef.current?.resetGame(mode, telemetry.playerCount);
   };
 
+  const handleSelectOnlineTab = () => {
+    setOnlineDrawerOpen(true);
+  };
+
+  const handleHostOnlineRoom = () => {
+    setCopiedRoomLink(false);
+    engineRef.current?.startOnlineHost();
+  };
+
+  const handleJoinOnlineRoom = () => {
+    const clean = normalizeRoomCode(joinCodeDraft);
+    if (!isValidRoomCode(clean)) return;
+    setCopiedRoomLink(false);
+    if (engineRef.current?.joinOnlineRoom(clean)) {
+      setJoinCodeDraft('');
+    }
+  };
+
+  const handleLeaveOnlineRoom = () => {
+    setCopiedRoomLink(false);
+    setOnlineDrawerOpen(false);
+    engineRef.current?.leaveOnlineRoom('solo', 2);
+  };
+
+  const handleCopyInviteLink = () => {
+    const url = engineRef.current?.getOnlineInviteUrl() ?? telemetry.mpRoomCode ?? '';
+    if (!url) return;
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(url);
+    }
+    setCopiedRoomLink(true);
+    if (copyFeedbackTimerRef.current !== null) {
+      window.clearTimeout(copyFeedbackTimerRef.current);
+    }
+    copyFeedbackTimerRef.current = window.setTimeout(() => {
+      setCopiedRoomLink(false);
+      copyFeedbackTimerRef.current = null;
+    }, 1800);
+  };
+
   const handleSetPlayerCount = (count: number) => {
+    setOnlineDrawerOpen(false);
     engineRef.current?.setAiOpponentEnabled(false);
-    if (count !== telemetry.playerCount || telemetry.aiOpponentEnabled) {
+    if (count !== telemetry.playerCount || telemetry.aiOpponentEnabled || telemetry.mpRole) {
       engineRef.current?.resetGame('party', count);
     }
   };
 
   const handleToggleVsAi = () => {
+    setOnlineDrawerOpen(false);
     const next = !telemetry.aiOpponentEnabled;
     engineRef.current?.setAiOpponentEnabled(next);
   };
@@ -309,6 +367,10 @@ export const App: React.FC = () => {
   };
 
   const handleRebuild = () => {
+    if (telemetry.mpRole) {
+      engineRef.current?.requestOnlineRematch();
+      return;
+    }
     engineRef.current?.resetGame(telemetry.gameMode, telemetry.playerCount);
   };
 
@@ -408,6 +470,50 @@ export const App: React.FC = () => {
   const activeTensionSegments = Math.max(1, Math.round(telemetry.grabResistance01 * 12));
   const activeSettleSegments = Math.round(telemetry.settleProgress01 * 10);
 
+  const isOnlineSession = Boolean(telemetry.mpRole);
+  const isOnlineTabSelected = isOnlineSession || onlineDrawerOpen;
+  const localOnlinePlayerIdx = telemetry.mpRole === 'guest' ? 1 : 0;
+  const isLocalOnlineTurn =
+    !isOnlineSession ||
+    (Boolean(telemetry.mpPeerConnected || telemetry.mpRole === 'host') &&
+      telemetry.currentPlayer === localOnlinePlayerIdx);
+
+  const onlineStatusLabel = (() => {
+    if (!isOnlineSession) return 'Host or Join Room';
+    if (telemetry.mpConnectionState === 'error') return 'Room Error';
+    if (telemetry.mpConnectionState === 'reconnecting') return 'Reconnecting…';
+    if (telemetry.mpConnectionState === 'connecting') return 'Joining Room…';
+    if (telemetry.mpConnectionState === 'waiting_peer' && !telemetry.mpPeerConnected) {
+      return 'Waiting for P2…';
+    }
+    if (telemetry.turnPhase === 'COLLAPSED') {
+      if (telemetry.blocksStacked === 0) {
+        return telemetry.currentPlayer === localOnlinePlayerIdx
+          ? 'You Toppled'
+          : 'Opponent Toppled';
+      }
+      const winnerIdx = (telemetry.currentPlayer + 1) % 2;
+      return winnerIdx === localOnlinePlayerIdx ? 'You Win!' : 'Opponent Wins';
+    }
+    return telemetry.currentPlayer === localOnlinePlayerIdx ? 'Your Turn' : "Opponent's Turn";
+  })();
+
+  const onlineTransportTag =
+    telemetry.mpTransport === 'webrtc-p2p'
+      ? 'P2P'
+      : telemetry.mpTransport === 'ws-relay'
+      ? 'Relay'
+      : null;
+
+  const onlinePingLabel =
+    telemetry.mpPingMs !== null && telemetry.mpPingMs !== undefined
+      ? `${telemetry.mpPingMs} ms${onlineTransportTag ? ` · ${onlineTransportTag}` : ''}`
+      : onlineTransportTag ?? '';
+
+  const isLocalSoloSelected = !isOnlineTabSelected && telemetry.gameMode === 'solo';
+  const isLocalPartySelected = !isOnlineTabSelected && telemetry.gameMode === 'party';
+  const isLocalSandboxSelected = !isOnlineTabSelected && telemetry.gameMode === 'sandbox';
+
   const isBench =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('bench');
 
@@ -493,13 +599,13 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* 3 Horizontal Inlaid Stained-Glass Mode Courses */}
+              {/* 4 Horizontal Inlaid Stained-Glass Mode Courses */}
               <div className="lancet-mode-stack" role="tablist" aria-label="Game Mode">
                 <QuarryButton
                   role="tab"
-                  aria-selected={telemetry.gameMode === 'solo'}
-                  tone={telemetry.gameMode === 'solo' ? 'cobalt' : 'grisaille-cobalt'}
-                  active={telemetry.gameMode === 'solo'}
+                  aria-selected={isLocalSoloSelected}
+                  tone={isLocalSoloSelected ? 'cobalt' : 'grisaille-cobalt'}
+                  active={isLocalSoloSelected}
                   soundTone="tab"
                   onAudioDown={playUiDown}
                   onAudioUp={playUiUp}
@@ -508,20 +614,20 @@ export const App: React.FC = () => {
                 >
                   <ModeMosaicMedallionSvg
                     mode="solo"
-                    active={telemetry.gameMode === 'solo'}
+                    active={isLocalSoloSelected}
                   />
                   <span className="mode-course-copy">
                     <span className="mode-course-name">Solo</span>
                     <span className="mode-course-meta">Classic Stack</span>
                   </span>
-                  <ModeRightJewelSvg mode="solo" active={telemetry.gameMode === 'solo'} />
+                  <ModeRightJewelSvg mode="solo" active={isLocalSoloSelected} />
                 </QuarryButton>
 
                 <QuarryButton
                   role="tab"
-                  aria-selected={telemetry.gameMode === 'party'}
-                  tone={telemetry.gameMode === 'party' ? 'emerald' : 'grisaille-emerald'}
-                  active={telemetry.gameMode === 'party'}
+                  aria-selected={isLocalPartySelected}
+                  tone={isLocalPartySelected ? 'emerald' : 'grisaille-emerald'}
+                  active={isLocalPartySelected}
                   soundTone="tab"
                   onAudioDown={playUiDown}
                   onAudioUp={playUiUp}
@@ -530,17 +636,17 @@ export const App: React.FC = () => {
                 >
                   <ModeMosaicMedallionSvg
                     mode="party"
-                    active={telemetry.gameMode === 'party'}
+                    active={isLocalPartySelected}
                   />
                   <span className="mode-course-copy">
                     <span className="mode-course-name">Pass &amp; Play</span>
                     <span className="mode-course-meta">2–4 Players</span>
                   </span>
-                  <ModeRightJewelSvg mode="party" active={telemetry.gameMode === 'party'} />
+                  <ModeRightJewelSvg mode="party" active={isLocalPartySelected} />
                 </QuarryButton>
 
                 {/* Pass & Play Inlaid Sub-Course */}
-                {telemetry.gameMode === 'party' && (
+                {isLocalPartySelected && (
                   <div className="lancet-course party-subcourse">
                     <div className="party-turn-pane">
                       <span
@@ -590,9 +696,145 @@ export const App: React.FC = () => {
 
                 <QuarryButton
                   role="tab"
-                  aria-selected={telemetry.gameMode === 'sandbox'}
-                  tone={telemetry.gameMode === 'sandbox' ? 'amethyst' : 'grisaille-amethyst'}
-                  active={telemetry.gameMode === 'sandbox'}
+                  aria-selected={isOnlineTabSelected}
+                  tone={isOnlineTabSelected ? 'teal' : 'grisaille-teal'}
+                  active={isOnlineTabSelected}
+                  soundTone="tab"
+                  onAudioDown={playUiDown}
+                  onAudioUp={playUiUp}
+                  className="mode-course-btn"
+                  onClick={handleSelectOnlineTab}
+                >
+                  <ModeMosaicMedallionSvg mode="online" active={isOnlineTabSelected} />
+                  <span className="mode-course-copy">
+                    <span className="mode-course-name">Online</span>
+                    <span className="mode-course-meta">
+                      {isOnlineSession && telemetry.mpRoomCode
+                        ? `Room ${telemetry.mpRoomCode}`
+                        : 'Internet 2P'}
+                    </span>
+                  </span>
+                  <ModeRightJewelSvg mode="online" active={isOnlineTabSelected} />
+                </QuarryButton>
+
+                {/* Online 2P Internet Room Sub-Course */}
+                {isOnlineTabSelected && (
+                  <div className="lancet-course online-subcourse">
+                    {!isOnlineSession ? (
+                      <div className="online-lobby-row">
+                        <QuarryButton
+                          tone="teal"
+                          active
+                          soundTone="primary"
+                          onAudioDown={playUiDown}
+                          onAudioUp={playUiUp}
+                          className="online-host-btn"
+                          onClick={handleHostOnlineRoom}
+                          title="Create a 5-character Internet Room Code"
+                        >
+                          <span>Host</span>
+                        </QuarryButton>
+                        <input
+                          type="text"
+                          value={joinCodeDraft}
+                          onChange={(e) => setJoinCodeDraft(normalizeRoomCode(e.target.value))}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleJoinOnlineRoom();
+                            }
+                          }}
+                          placeholder="CODE…"
+                          maxLength={8}
+                          aria-label="Enter 5-character Room Code"
+                          className="online-code-input"
+                        />
+                        <QuarryButton
+                          tone="amber"
+                          active={isValidRoomCode(joinCodeDraft)}
+                          disabled={!isValidRoomCode(joinCodeDraft)}
+                          soundTone="primary"
+                          onAudioDown={playUiDown}
+                          onAudioUp={playUiUp}
+                          className="online-join-btn"
+                          onClick={handleJoinOnlineRoom}
+                          title="Join Room Code"
+                        >
+                          <span>Join</span>
+                        </QuarryButton>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="online-room-bar">
+                          <div className="online-code-plaque" title="Active Room Code">
+                            <span className="online-code-caption">
+                              {telemetry.mpRole === 'host' ? 'P1 Host' : 'P2 Guest'}
+                            </span>
+                            <span className="online-code-value">{telemetry.mpRoomCode}</span>
+                          </div>
+                          <QuarryButton
+                            tone={copiedRoomLink ? 'emerald' : 'amber'}
+                            active
+                            soundTone="step"
+                            onAudioDown={playUiDown}
+                            onAudioUp={playUiUp}
+                            className="online-action-btn"
+                            onClick={handleCopyInviteLink}
+                            title="Copy shareable ?room= invite link"
+                          >
+                            <span>{copiedRoomLink ? 'Copied' : 'Invite'}</span>
+                          </QuarryButton>
+                          <QuarryButton
+                            tone="crystal"
+                            soundTone="default"
+                            onAudioDown={playUiDown}
+                            onAudioUp={playUiUp}
+                            className="online-action-btn online-leave-btn"
+                            onClick={handleLeaveOnlineRoom}
+                            title="Leave Online Room"
+                          >
+                            <span>Exit</span>
+                          </QuarryButton>
+                        </div>
+
+                        <div className="online-status-row">
+                          <div className="online-status-pane">
+                            <span className="online-status-left">
+                              <span
+                                className="player-cabochon"
+                                style={{
+                                  backgroundColor: telemetry.mpPeerConnected
+                                    ? PLAYER_COLORS[telemetry.currentPlayer % 2]
+                                    : '#fbbf24',
+                                  boxShadow: `0 0 8px ${
+                                    telemetry.mpPeerConnected
+                                      ? PLAYER_COLORS[telemetry.currentPlayer % 2]
+                                      : '#fbbf24'
+                                  }`,
+                                }}
+                              />
+                              <span className="party-turn-copy">{onlineStatusLabel}</span>
+                            </span>
+                            {onlinePingLabel && (
+                              <span className="online-ping-pill">{onlinePingLabel}</span>
+                            )}
+                          </div>
+                        </div>
+                      </>
+                    )}
+                    {telemetry.mpError && (
+                      <div className="online-error-banner" role="alert">
+                        {telemetry.mpError}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <QuarryButton
+                  role="tab"
+                  aria-selected={isLocalSandboxSelected}
+                  tone={isLocalSandboxSelected ? 'amethyst' : 'grisaille-amethyst'}
+                  active={isLocalSandboxSelected}
                   soundTone="tab"
                   onAudioDown={playUiDown}
                   onAudioUp={playUiUp}
@@ -601,17 +843,17 @@ export const App: React.FC = () => {
                 >
                   <ModeMosaicMedallionSvg
                     mode="sandbox"
-                    active={telemetry.gameMode === 'sandbox'}
+                    active={isLocalSandboxSelected}
                   />
                   <span className="mode-course-copy">
                     <span className="mode-course-name">Sandbox</span>
                     <span className="mode-course-meta">Free Physics</span>
                   </span>
-                  <ModeRightJewelSvg mode="sandbox" active={telemetry.gameMode === 'sandbox'} />
+                  <ModeRightJewelSvg mode="sandbox" active={isLocalSandboxSelected} />
                 </QuarryButton>
 
                 {/* Sandbox Fracture Sub-Course */}
-                {telemetry.gameMode === 'sandbox' && (
+                {isLocalSandboxSelected && (
                   <div className="lancet-course sandbox-subcourse">
                     <QuarryButton
                       tone="ruby"
@@ -830,7 +1072,13 @@ export const App: React.FC = () => {
               </div>
               <div className="monument-body">
                 <div className="monument-title">
-                  {telemetry.shatteredCount > 0 ? 'Tower Shattered' : 'Tower Toppled'}
+                  {isOnlineSession
+                    ? `${onlineStatusLabel} · ${
+                        telemetry.shatteredCount > 0 ? 'Tower Shattered' : 'Tower Toppled'
+                      }`
+                    : telemetry.shatteredCount > 0
+                    ? 'Tower Shattered'
+                    : 'Tower Toppled'}
                 </div>
                 <p className="monument-prose">
                   {telemetry.shatteredCount > 0
@@ -860,99 +1108,115 @@ export const App: React.FC = () => {
                   onClick={handleRebuild}
                 >
                   <RebuildTowerSvg />
-                  <span>Rebuild Stained-Glass Tower</span>
+                  <span>
+                    {isOnlineSession
+                      ? 'Rematch Stained-Glass Tower'
+                      : 'Rebuild Stained-Glass Tower'}
+                  </span>
                 </QuarryButton>
               </div>
             </div>
           ) : telemetry.turnPhase === 'EXTRACTED' ? (
-            <div className="cut-glass-prism-bar is-interactive-prism">
+            <div
+              className={`cut-glass-prism-bar ${
+                isLocalOnlineTurn ? 'is-interactive-prism' : ''
+              }`}
+            >
               <PrismEndInlaySvg tone="emerald" />
               <div className="prism-bevel-chamber">
-                <div className="prism-phase-tag tag-emerald">Stack</div>
+                <div className="prism-phase-tag tag-emerald">
+                  {isOnlineSession && !isLocalOnlineTurn ? 'Opponent' : 'Stack'}
+                </div>
                 <div className="prism-copy-group">
                   <span className="prism-primary-line">
-                    Position across top course &amp; click to release
+                    {isOnlineSession && !isLocalOnlineTurn
+                      ? 'Opponent positioning extracted prism across top course…'
+                      : 'Position across top course & click to release'}
                   </span>
                   <span className="prism-secondary-line">
-                    Wheel or Q / E angles · R turns 90° · 0 aligns · Drag outside to orbit
+                    {isOnlineSession && !isLocalOnlineTurn
+                      ? 'Drag anywhere to orbit 360° · Scroll to zoom'
+                      : 'Wheel or Q / E angles · R turns 90° · 0 aligns · Drag outside to orbit'}
                   </span>
                 </div>
 
-                <div className="prism-inlaid-keys">
-                  <QuarryButton
-                    tone="crystal"
-                    soundTone="step"
-                    onAudioDown={playUiDown}
-                    onAudioUp={playUiUp}
-                    className="prism-key-btn"
-                    onClick={() => engineRef.current?.handleRotateCarried(-Math.PI / 24)}
-                    title="Angle −7.5° (Q)"
-                  >
-                    <PlacementGlyphSvg kind="ccw" />
-                    <span>Q</span>
-                  </QuarryButton>
-
-                  <QuarryButton
-                    tone="cobalt"
-                    active
-                    soundTone="step"
-                    onAudioDown={playUiDown}
-                    onAudioUp={playUiUp}
-                    className="prism-key-btn"
-                    onClick={() => engineRef.current?.handleRotateCarried(Math.PI * 0.5)}
-                    title="Turn 90° (R)"
-                  >
-                    <PlacementGlyphSvg kind="turn90" />
-                    <span>90° R</span>
-                  </QuarryButton>
-
-                  <QuarryButton
-                    tone="crystal"
-                    soundTone="step"
-                    onAudioDown={playUiDown}
-                    onAudioUp={playUiUp}
-                    className="prism-key-btn"
-                    onClick={() => engineRef.current?.handleRotateCarried(Math.PI / 24)}
-                    title="Angle +7.5° (E)"
-                  >
-                    <span>E</span>
-                    <PlacementGlyphSvg kind="cw" />
-                  </QuarryButton>
-
-                  {telemetry.carriedYawDeg !== 0 && (
+                {isLocalOnlineTurn && (
+                  <div className="prism-inlaid-keys">
                     <QuarryButton
-                      tone="teal"
+                      tone="crystal"
+                      soundTone="step"
+                      onAudioDown={playUiDown}
+                      onAudioUp={playUiUp}
+                      className="prism-key-btn"
+                      onClick={() => engineRef.current?.handleRotateCarried(-Math.PI / 24)}
+                      title="Angle −7.5° (Q)"
+                    >
+                      <PlacementGlyphSvg kind="ccw" />
+                      <span>Q</span>
+                    </QuarryButton>
+
+                    <QuarryButton
+                      tone="cobalt"
                       active
                       soundTone="step"
                       onAudioDown={playUiDown}
                       onAudioUp={playUiUp}
                       className="prism-key-btn"
-                      onClick={() => engineRef.current?.handleResetCarriedRotation()}
-                      title="Align square with course (0)"
+                      onClick={() => engineRef.current?.handleRotateCarried(Math.PI * 0.5)}
+                      title="Turn 90° (R)"
                     >
-                      <PlacementGlyphSvg kind="align" />
-                      <span>
-                        {telemetry.carriedYawDeg > 0
-                          ? `+${telemetry.carriedYawDeg}°`
-                          : `${telemetry.carriedYawDeg}°`}
-                      </span>
+                      <PlacementGlyphSvg kind="turn90" />
+                      <span>90° R</span>
                     </QuarryButton>
-                  )}
 
-                  <QuarryButton
-                    tone="amber"
-                    active
-                    soundTone="primary"
-                    onAudioDown={playUiDown}
-                    onAudioUp={playUiUp}
-                    className="prism-release-btn"
-                    onClick={() => engineRef.current?.handleReleaseOntoTop()}
-                    title="Release prism onto top course (Space / Enter)"
-                  >
-                    <PlacementGlyphSvg kind="place" />
-                    <span>Place Prism</span>
-                  </QuarryButton>
-                </div>
+                    <QuarryButton
+                      tone="crystal"
+                      soundTone="step"
+                      onAudioDown={playUiDown}
+                      onAudioUp={playUiUp}
+                      className="prism-key-btn"
+                      onClick={() => engineRef.current?.handleRotateCarried(Math.PI / 24)}
+                      title="Angle +7.5° (E)"
+                    >
+                      <span>E</span>
+                      <PlacementGlyphSvg kind="cw" />
+                    </QuarryButton>
+
+                    {telemetry.carriedYawDeg !== 0 && (
+                      <QuarryButton
+                        tone="teal"
+                        active
+                        soundTone="step"
+                        onAudioDown={playUiDown}
+                        onAudioUp={playUiUp}
+                        className="prism-key-btn"
+                        onClick={() => engineRef.current?.handleResetCarriedRotation()}
+                        title="Align square with course (0)"
+                      >
+                        <PlacementGlyphSvg kind="align" />
+                        <span>
+                          {telemetry.carriedYawDeg > 0
+                            ? `+${telemetry.carriedYawDeg}°`
+                            : `${telemetry.carriedYawDeg}°`}
+                        </span>
+                      </QuarryButton>
+                    )}
+
+                    <QuarryButton
+                      tone="amber"
+                      active
+                      soundTone="primary"
+                      onAudioDown={playUiDown}
+                      onAudioUp={playUiUp}
+                      className="prism-release-btn"
+                      onClick={() => engineRef.current?.handleReleaseOntoTop()}
+                      title="Release prism onto top course (Space / Enter)"
+                    >
+                      <PlacementGlyphSvg kind="place" />
+                      <span>Place Prism</span>
+                    </QuarryButton>
+                  </div>
+                )}
               </div>
               <PrismEndInlaySvg tone="amber" />
             </div>
@@ -960,7 +1224,9 @@ export const App: React.FC = () => {
             <div className="cut-glass-prism-bar">
               <PrismEndInlaySvg tone="cobalt" />
               <div className="prism-bevel-chamber">
-                <div className="prism-phase-tag tag-amber">Drawing</div>
+                <div className="prism-phase-tag tag-amber">
+                  {isOnlineSession && !isLocalOnlineTurn ? 'Opponent' : 'Drawing'}
+                </div>
 
                 <div className="leaded-tension-strip" aria-label="Pulling Resistance">
                   {Array.from({ length: 12 }).map((_, idx) => {
@@ -977,10 +1243,14 @@ export const App: React.FC = () => {
 
                 <div className="prism-copy-group">
                   <span className="prism-primary-line" style={{ color: resistanceColor }}>
-                    {resistanceLabel}
+                    {isOnlineSession && !isLocalOnlineTurn
+                      ? `Opponent Drawing · ${resistanceLabel}`
+                      : resistanceLabel}
                   </span>
                   <span className="prism-secondary-line">
-                    {telemetry.gameMode === 'sandbox'
+                    {isOnlineSession && !isLocalOnlineTurn
+                      ? 'Drag anywhere to orbit 360° & watch live spring tension'
+                      : telemetry.gameMode === 'sandbox'
                       ? 'Spring tether active · Release anytime or pull clear to drop onto table'
                       : 'Draw smoothly along channel · Release anytime to choose a looser prism'}
                   </span>
@@ -1020,12 +1290,22 @@ export const App: React.FC = () => {
                     telemetry.gameMode === 'sandbox' ? 'tag-amethyst' : 'tag-cobalt'
                   }`}
                 >
-                  {telemetry.gameMode === 'sandbox' ? 'Sandbox' : 'Extract'}
+                  {isOnlineSession
+                    ? isLocalOnlineTurn
+                      ? 'Your Turn'
+                      : 'Spectate'
+                    : telemetry.gameMode === 'sandbox'
+                    ? 'Sandbox'
+                    : 'Extract'}
                 </div>
 
                 <div className="prism-copy-group">
                   <span className="prism-primary-line">
-                    {telemetry.gameMode === 'sandbox'
+                    {isOnlineSession && !telemetry.mpPeerConnected
+                      ? `Share Room Code ${telemetry.mpRoomCode ?? ''} or Invite Link to connect Player 2`
+                      : isOnlineSession && !isLocalOnlineTurn
+                      ? 'Opponent scouting stained-glass stack · Drag anywhere to orbit 360°'
+                      : telemetry.gameMode === 'sandbox'
                       ? 'Tap any prism to test resonance · Drag freely to pull or shatter'
                       : 'Tap any legal prism to hear looseness · Drag horizontally to draw out'}
                   </span>

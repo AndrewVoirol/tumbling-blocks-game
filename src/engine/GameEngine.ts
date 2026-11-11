@@ -3,21 +3,110 @@ import {
   BLOCK_HALF_X,
   BLOCK_HALF_Y,
   BLOCK_HALF_Z,
+  INITIAL_LAYERS,
   LIGHTING_PRESETS,
+  SHARD_SLOT_STRIDE_VERTS,
 } from '../physics/constants';
 import {
   BlockCriticalityCandidate,
   ensureRapierInitialized,
   GameMode,
   PhysicsWorld,
+  ShardMeshAppendEvent,
   TowerTelemetry,
 } from '../physics/PhysicsWorld';
 import { MujocoWorkerBridge } from '../physics/MujocoWorkerBridge';
 import { WebGPURenderer } from '../renderer/WebGPURenderer';
 import { intersectRayOBB, quatRotateVec3, RayOBBHit, Vec3 } from '../math/vecMat';
 import { OrbitCamera } from './OrbitCamera';
+import {
+  applyDeterministicTowerPalette,
+  DecodedBlockFrameState,
+  DecodedShardFrameState,
+  generateRoomCode,
+  generateRoomSeed,
+  GuestRemoteCommand,
+  inferShardLocalCentroid,
+  isValidRoomCode,
+  MP_MAX_SHARDS_PER_FRAME,
+  MP_MAX_SPLINTERS_PER_FRAME,
+  MultiplayerConnectionState,
+  MultiplayerControlMessage,
+  MultiplayerGuestWorld,
+  MultiplayerRole,
+  MultiplayerStateFrame,
+  MultiplayerStatusSnapshot,
+  MultiplayerTransportKind,
+  NetworkAudioEvent,
+  normalizeRoomCode,
+  SerializedShardMeta,
+  VitrailMultiplayerClient,
+  VitrailMultiplayerClientOptions,
+} from '../multiplayer';
 
-export type TelemetryListener = (telemetry: TowerTelemetry) => void;
+export interface VitrailHudTelemetry extends TowerTelemetry {
+  mpActive?: boolean;
+  mpRole?: MultiplayerRole | null;
+  mpRoomCode?: string | null;
+  mpConnectionState?: MultiplayerConnectionState;
+  mpTransport?: MultiplayerTransportKind;
+  mpPeerConnected?: boolean;
+  mpPingMs?: number | null;
+  mpError?: string | null;
+}
+
+export type TelemetryListener = (telemetry: VitrailHudTelemetry) => void;
+
+interface OptionalPhysicsHooks {
+  consumeShardImpacts?: () => Array<{
+    pos: Vec3;
+    speed: number;
+    massKg: number;
+    surface: 'wood' | 'glass';
+    slotIndex: number;
+  }>;
+  consumeWobbleEvents?: () => Array<{
+    blockId: number;
+    tiltAngleRad: number;
+    angularSpeedRadPerSec: number;
+    clampingLoadN: number;
+    worldPos: Vec3;
+    surface: 'glass' | 'wood';
+    damage: number;
+  }>;
+  rebuildTower: (mode?: GameMode, players?: number, layers?: number, seed?: number) => void;
+}
+
+interface OptionalAcousticsHooks {
+  playShardImpacts?: (
+    impacts: ReadonlyArray<{
+      pos: Vec3;
+      speed: number;
+      massKg: number;
+      surface: 'wood' | 'glass';
+      slotIndex: number;
+    }>,
+    camPos?: Vec3,
+    camRight?: Vec3
+  ) => number;
+  playWobbleRock?: (
+    tiltAngleRad: number,
+    angularSpeedRadPerSec?: number,
+    clampingLoadN?: number,
+    worldPos?: Vec3,
+    options?: {
+      surface?: 'glass' | 'wood';
+      damage?: number;
+      camPos?: Vec3;
+      camRight?: Vec3;
+    }
+  ) => number;
+}
+
+export type OnlineSessionOverrides = Omit<
+  VitrailMultiplayerClientOptions,
+  'role' | 'roomCode' | 'onControlMessage' | 'onStateFrame' | 'onStatusChange'
+>;
 
 export class GameEngine {
   private canvas: HTMLCanvasElement;
@@ -71,19 +160,60 @@ export class GameEngine {
   private aiHoverTargetXZ: [number, number] = [0, 0];
   private aiHoverCurrentXZ: [number, number] = [0, 0];
 
+  // Internet Multiplayer (Host-Authoritative + Render-Interpolated Guest Mirror)
+  private authoritativePhysics: PhysicsWorld | null = null;
+  private authoritativeWorkerActive: boolean = false;
+  private guestWorld: MultiplayerGuestWorld | null = null;
+  private mpClient: VitrailMultiplayerClient | null = null;
+  public mpRole: MultiplayerRole | null = null;
+  public mpRoomCode: string | null = null;
+  public mpRoomSeed: number = 0;
+  private mpStatus: MultiplayerStatusSnapshot = {
+    active: false,
+    role: null,
+    roomCode: null,
+    roomSeed: 0,
+    connectionState: 'idle',
+    transport: 'none',
+    peerConnected: false,
+    pingMs: null,
+    errorMessage: null,
+  };
+  private mpStateSeq: number = 0;
+  private mpLastSnapshotSentMs: number = 0;
+  private mpForceImmediateSnapshot: boolean = false;
+  private mpLastCollapseReasonSent: string | null = null;
+  private mpGuestCmdSeq: number = 0;
+  private mpLastGuestCmdSentMs: number = 0;
+  private mpLastSentGuestHoverId: number | null = null;
+  private mpPendingPullTarget: Vec3 | null = null;
+
+  // Host Voronoi shard & discrete spatial audio replication buffers
+  private hostRawConsumeShardUploads: (() => ShardMeshAppendEvent[]) | null = null;
+  private hostStagedRendererUploads: ShardMeshAppendEvent[] = [];
+  private hostSlotLocalCentroids = new Map<number, Vec3>();
+  private hostActiveShardMetas = new Map<number, SerializedShardMeta>();
+  private hostAudioTapInstalled: boolean = false;
+  private mpOutboundAudioQueue: NetworkAudioEvent[] = [];
+  private mpLastSlideAudioSentMs: number = 0;
+  private mpLastSlideWasNonZero: boolean = false;
+  private scratchWrench4 = new Float32Array(4);
+
   constructor(canvas?: HTMLCanvasElement, onTelemetry?: TelemetryListener) {
-    this.canvas = (canvas ?? ({ style: {} } as HTMLCanvasElement));
+    this.canvas = canvas ?? ({ style: {} } as HTMLCanvasElement);
     this.listener = onTelemetry ?? null;
     this.audio = new GlassAudioEngine();
     this.camera = new OrbitCamera();
   }
 
   /**
-   * Initializes Rapier + PhysicsWorld + OrbitCamera without WebGPU for fast headless playability tests (`T4`).
+   * Initializes MuJoCo + PhysicsWorld + OrbitCamera without WebGPU for fast headless playability & multiplayer tests.
    */
   public async initHeadless(): Promise<void> {
     await ensureRapierInitialized();
     this.physics = new PhysicsWorld(this.audio);
+    this.authoritativePhysics = this.physics;
+    this.authoritativeWorkerActive = false;
     this.camera.update(0.016, 16 / 9);
     this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
   }
@@ -123,11 +253,19 @@ export class GameEngine {
       this.physicsWorkerActive = false;
     }
 
+    this.authoritativePhysics = this.physics;
+    this.authoritativeWorkerActive = this.physicsWorkerActive;
+
     if (benchScene && params) {
       const presetId = params.get('preset') ?? undefined;
       const darkParam = params.get('darkroom');
       const darkScale = darkParam !== null ? Number(darkParam) : undefined;
       this.configureBenchScene(benchScene, presetId, darkScale);
+    } else {
+      const roomParam = params?.get('room') ?? null;
+      if (roomParam && isValidRoomCode(roomParam)) {
+        this.joinOnlineRoom(roomParam);
+      }
     }
 
     this.attachEvents();
@@ -138,6 +276,94 @@ export class GameEngine {
 
     // Expose engine handle for DevTools runtime profiling & automated verification
     (window as unknown as { __VITRAIL_ENGINE__?: GameEngine }).__VITRAIL_ENGINE__ = this;
+  }
+
+  /**
+   * Deterministic headless step helper for unit & two-peer multiplayer integration tests.
+   */
+  public stepHeadless(dt: number = 1 / 60): void {
+    const clampedDt = Math.min(0.05, Math.max(0.001, dt));
+    this.elapsedSec += clampedDt;
+    if (!this.benchCameraLocked) {
+      this.camera.update(clampedDt, 16 / 9);
+    } else {
+      this.camera.setPoseImmediate(
+        this.camera.azimuth,
+        this.camera.elevation,
+        this.camera.distance,
+        this.camera.target,
+        16 / 9
+      );
+    }
+    this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
+    if (!this.benchPaused) {
+      this.updateMasterGlazierAi(clampedDt);
+      this.stepPhysicsAndSecondaryAcoustics(clampedDt);
+    }
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.pumpMultiplayerStep(now);
+  }
+
+  private stepPhysicsAndSecondaryAcoustics(dt: number): void {
+    this.physics.step(dt);
+
+    if ((this.physics as unknown as { isRemoteGuestMirror?: boolean }).isRemoteGuestMirror) {
+      return;
+    }
+
+    const physHooks = this.physics as unknown as OptionalPhysicsHooks;
+    const audioHooks = this.audio as unknown as OptionalAcousticsHooks;
+
+    if (typeof physHooks.consumeShardImpacts === 'function') {
+      const impacts = physHooks.consumeShardImpacts();
+      if (impacts && impacts.length > 0) {
+        if (typeof audioHooks.playShardImpacts === 'function') {
+          audioHooks.playShardImpacts(
+            impacts,
+            this.camera.position,
+            this.camera.getRightVector()
+          );
+        } else if (this.mpRole === 'host' && this.mpStatus.peerConnected) {
+          this.enqueueHostAudioEvent({
+            kind: 'shardImpacts',
+            impacts: impacts.slice(0, 8),
+          });
+        }
+      }
+    }
+
+    if (typeof physHooks.consumeWobbleEvents === 'function') {
+      const wobbles = physHooks.consumeWobbleEvents();
+      if (wobbles && wobbles.length > 0) {
+        for (let i = 0; i < wobbles.length; i++) {
+          const w = wobbles[i];
+          if (typeof audioHooks.playWobbleRock === 'function') {
+            audioHooks.playWobbleRock(
+              w.tiltAngleRad,
+              w.angularSpeedRadPerSec,
+              w.clampingLoadN,
+              w.worldPos,
+              {
+                surface: w.surface,
+                damage: w.damage,
+                camPos: this.camera.position,
+                camRight: this.camera.getRightVector(),
+              }
+            );
+          } else if (this.mpRole === 'host' && this.mpStatus.peerConnected) {
+            this.enqueueHostAudioEvent({
+              kind: 'wobbleRock',
+              tiltAngleRad: w.tiltAngleRad,
+              angularSpeedRadPerSec: w.angularSpeedRadPerSec,
+              clampingLoadN: w.clampingLoadN,
+              worldPos: w.worldPos,
+              surface: w.surface,
+              damage: w.damage,
+            });
+          }
+        }
+      }
+    }
   }
 
   private tick = (nowMs: number): void => {
@@ -168,8 +394,10 @@ export class GameEngine {
 
     if (!this.benchPaused) {
       this.updateMasterGlazierAi(dt);
-      this.physics.step(dt);
+      this.stepPhysicsAndSecondaryAcoustics(dt);
     }
+
+    this.pumpMultiplayerStep(nowMs);
 
     // Smooth camera focus adjustment: frame top of tower when placing an extracted block!
     const topSlotY =
@@ -206,7 +434,945 @@ export class GameEngine {
       aiActionLabel: this.aiActionLabel,
       polariscopeMode: this.polariscopeMode,
       physicsWorkerActive: this.physicsWorkerActive,
+      mpActive: this.mpStatus.active,
+      mpRole: this.mpRole,
+      mpRoomCode: this.mpRoomCode,
+      mpConnectionState: this.mpStatus.connectionState,
+      mpTransport: this.mpStatus.transport,
+      mpPeerConnected: this.mpStatus.peerConnected,
+      mpPingMs: this.mpStatus.pingMs,
+      mpError: this.mpStatus.errorMessage,
     });
+  }
+
+  public getTelemetrySnapshot(): VitrailHudTelemetry {
+    const base = this.physics.getTelemetry();
+    return {
+      ...base,
+      aiOpponentEnabled: this.aiOpponentEnabled,
+      aiThinking: this.aiThinking,
+      aiActionLabel: this.aiActionLabel,
+      polariscopeMode: this.polariscopeMode,
+      physicsWorkerActive: this.physicsWorkerActive,
+      mpActive: this.mpStatus.active,
+      mpRole: this.mpRole,
+      mpRoomCode: this.mpRoomCode,
+      mpConnectionState: this.mpStatus.connectionState,
+      mpTransport: this.mpStatus.transport,
+      mpPeerConnected: this.mpStatus.peerConnected,
+      mpPingMs: this.mpStatus.pingMs,
+      mpError: this.mpStatus.errorMessage,
+    };
+  }
+
+  // ============================================================================
+  // INTERNET MULTIPLAYER ORCHESTRATION (HOST + GUEST + TURN LOCK)
+  // ============================================================================
+
+  public getOnlineInviteUrl(): string | null {
+    if (!this.mpRoomCode || typeof window === 'undefined' || !window.location) {
+      return null;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.delete('bench');
+    url.searchParams.set('room', this.mpRoomCode);
+    return url.toString();
+  }
+
+  private syncBrowserRoomQueryParam(code: string | null): void {
+    if (typeof window === 'undefined' || !window.history?.replaceState || !window.location) {
+      return;
+    }
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('bench')) return;
+      if (code) {
+        url.searchParams.set('room', code);
+      } else {
+        url.searchParams.delete('room');
+      }
+      window.history.replaceState(null, '', url.toString());
+    } catch {
+      // Ignore history security errors in sandboxed frames
+    }
+  }
+
+  private restoreAuthoritativePhysics(): void {
+    if (this.authoritativePhysics) {
+      this.physics = this.authoritativePhysics;
+      this.physicsWorkerActive = this.authoritativeWorkerActive;
+    }
+    if (this.guestWorld) {
+      this.guestWorld.dispose();
+      this.guestWorld = null;
+    }
+  }
+
+  private shutdownMultiplayerSessionOnly(): void {
+    if (this.mpClient) {
+      this.mpClient.dispose();
+      this.mpClient = null;
+    }
+    this.mpRole = null;
+    this.mpRoomCode = null;
+    this.mpStatus = {
+      active: false,
+      role: null,
+      roomCode: null,
+      roomSeed: 0,
+      connectionState: 'idle',
+      transport: 'none',
+      peerConnected: false,
+      pingMs: null,
+      errorMessage: null,
+    };
+    this.mpOutboundAudioQueue = [];
+    this.mpPendingPullTarget = null;
+    this.mpLastSentGuestHoverId = null;
+    this.hostStagedRendererUploads = [];
+    this.hostSlotLocalCentroids.clear();
+    this.hostActiveShardMetas.clear();
+  }
+
+  private rebuildAuthoritativeTowerWithSeed(seed: number): void {
+    const physHooks = this.physics as unknown as OptionalPhysicsHooks;
+    physHooks.rebuildTower('party', 2, INITIAL_LAYERS, seed >>> 0);
+    applyDeterministicTowerPalette(this.physics.blocks, seed >>> 0);
+    this.hostStagedRendererUploads = [];
+    this.hostSlotLocalCentroids.clear();
+    this.hostActiveShardMetas.clear();
+    this.mpStateSeq = 0;
+    this.mpLastCollapseReasonSent = null;
+    this.mpForceImmediateSnapshot = true;
+  }
+
+  private installHostShardUploadHook(targetPhysics: PhysicsWorld): void {
+    const tagged = targetPhysics as unknown as {
+      _vitrailMpShardHooked?: boolean;
+      consumePendingShardUploads: () => ShardMeshAppendEvent[];
+    };
+    if (tagged._vitrailMpShardHooked) return;
+
+    const rawConsume = targetPhysics.consumePendingShardUploads.bind(targetPhysics);
+    this.hostRawConsumeShardUploads = rawConsume;
+    tagged._vitrailMpShardHooked = true;
+
+    targetPhysics.consumePendingShardUploads = (): ShardMeshAppendEvent[] => {
+      const fresh = rawConsume();
+      if (fresh.length > 0) {
+        this.recordShardUploadCentroids(fresh);
+      }
+      if (this.hostStagedRendererUploads.length > 0) {
+        const combined =
+          fresh.length > 0
+            ? this.hostStagedRendererUploads.concat(fresh)
+            : this.hostStagedRendererUploads;
+        this.hostStagedRendererUploads = [];
+        return combined;
+      }
+      return fresh;
+    };
+  }
+
+  private recordShardUploadCentroids(uploads: ShardMeshAppendEvent[]): void {
+    for (let i = 0; i < uploads.length; i++) {
+      const ev = uploads[i];
+      const slotIndex = Math.floor(ev.firstVertex / SHARD_SLOT_STRIDE_VERTS);
+      if (ev.vertexData.length >= 9) {
+        this.hostSlotLocalCentroids.set(slotIndex, [
+          ev.vertexData[6] - ev.vertexData[0],
+          ev.vertexData[7] - ev.vertexData[1],
+          ev.vertexData[8] - ev.vertexData[2],
+        ]);
+      }
+    }
+  }
+
+  private harvestHostShardUploadsBeforeNetwork(): void {
+    if (!this.hostRawConsumeShardUploads) return;
+    const fresh = this.hostRawConsumeShardUploads();
+    if (fresh.length === 0) return;
+    this.recordShardUploadCentroids(fresh);
+    if (this.renderer) {
+      for (let i = 0; i < fresh.length; i++) {
+        this.hostStagedRendererUploads.push(fresh[i]);
+      }
+    }
+  }
+
+  private enqueueHostAudioEvent(ev: NetworkAudioEvent): void {
+    if (this.mpRole !== 'host' || !this.mpStatus.peerConnected) return;
+    if (this.mpOutboundAudioQueue.length < 32) {
+      this.mpOutboundAudioQueue.push(ev);
+    }
+  }
+
+  private installHostAudioTap(): void {
+    if (this.hostAudioTapInstalled) return;
+    this.hostAudioTapInstalled = true;
+
+    const audioAny = this.audio as unknown as {
+      updateSlideFriction: (
+        speed: number,
+        res: number,
+        power?: number,
+        torsion?: number,
+        loadN?: number
+      ) => void;
+      playTapTestResonance: (
+        pinch01: number,
+        worldPos?: Vec3,
+        camPos?: Vec3,
+        camRight?: Vec3,
+        damage?: number
+      ) => void;
+      playGlassImpact: (
+        intensity01: number,
+        pitchMul?: number,
+        worldPos?: Vec3,
+        camPos?: Vec3,
+        camRight?: Vec3,
+        options?: { impactSpeedMps?: number; damage?: number; surface?: 'glass' | 'wood' }
+      ) => void;
+      playGlassCrack: (
+        damage01: number,
+        worldPos?: Vec3,
+        camPos?: Vec3,
+        camRight?: Vec3
+      ) => void;
+      playGlassShatter: (
+        intensity01: number,
+        hitTable?: boolean,
+        worldPos?: Vec3,
+        camPos?: Vec3,
+        camRight?: Vec3
+      ) => void;
+      playRankedShardCollisions: (
+        events: Array<{
+          energy: number;
+          intensity01: number;
+          volumeDm3: number;
+          worldPos: Vec3;
+          hitGlass: boolean;
+        }>,
+        camPos?: Vec3,
+        camRight?: Vec3
+      ) => void;
+      playStackSuccess: (layerCount: number) => void;
+      playShardImpacts?: OptionalAcousticsHooks['playShardImpacts'];
+      playWobbleRock?: OptionalAcousticsHooks['playWobbleRock'];
+    };
+
+    const origSlide = audioAny.updateSlideFriction.bind(this.audio);
+    audioAny.updateSlideFriction = (speed, res, power = 0, torsion = 0, loadN) => {
+      origSlide(speed, res, power, torsion, loadN);
+      if (this.mpRole !== 'host' || !this.mpStatus.peerConnected) return;
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const isZero = speed <= 0.001;
+      if (isZero && this.mpLastSlideWasNonZero) {
+        this.mpLastSlideWasNonZero = false;
+        this.mpLastSlideAudioSentMs = now;
+        this.enqueueHostAudioEvent({
+          kind: 'slideFriction',
+          slideSpeedDmPerSec: 0,
+          resistance01: 0,
+          slipPowerMw: 0,
+          torsionRadPerSec: 0,
+          clampingLoadN: loadN,
+        });
+      } else if (!isZero && now - this.mpLastSlideAudioSentMs >= 48) {
+        this.mpLastSlideWasNonZero = true;
+        this.mpLastSlideAudioSentMs = now;
+        this.enqueueHostAudioEvent({
+          kind: 'slideFriction',
+          slideSpeedDmPerSec: speed,
+          resistance01: res,
+          slipPowerMw: power,
+          torsionRadPerSec: torsion,
+          clampingLoadN: loadN,
+        });
+      }
+    };
+
+    const origTap = audioAny.playTapTestResonance.bind(this.audio);
+    audioAny.playTapTestResonance = (pinch01, worldPos, camPos, camRight, damage) => {
+      origTap(pinch01, worldPos, camPos, camRight, damage);
+      this.enqueueHostAudioEvent({ kind: 'tapTest', pinch01, worldPos, damage });
+    };
+
+    const origImpact = audioAny.playGlassImpact.bind(this.audio);
+    audioAny.playGlassImpact = (intensity01, pitchMul = 1.0, worldPos, camPos, camRight, opts) => {
+      origImpact(intensity01, pitchMul, worldPos, camPos, camRight, opts);
+      this.enqueueHostAudioEvent({
+        kind: 'glassImpact',
+        intensity01,
+        pitchMul,
+        worldPos,
+        impactSpeedMps: opts?.impactSpeedMps,
+        damage: opts?.damage,
+        surface: opts?.surface,
+      });
+    };
+
+    const origCrack = audioAny.playGlassCrack.bind(this.audio);
+    audioAny.playGlassCrack = (damage01, worldPos, camPos, camRight) => {
+      origCrack(damage01, worldPos, camPos, camRight);
+      this.enqueueHostAudioEvent({ kind: 'glassCrack', damage01, worldPos });
+    };
+
+    const origShatter = audioAny.playGlassShatter.bind(this.audio);
+    audioAny.playGlassShatter = (intensity01, hitTable = false, worldPos, camPos, camRight) => {
+      origShatter(intensity01, hitTable, worldPos, camPos, camRight);
+      this.enqueueHostAudioEvent({ kind: 'glassShatter', intensity01, hitTable, worldPos });
+    };
+
+    const origRanked = audioAny.playRankedShardCollisions.bind(this.audio);
+    audioAny.playRankedShardCollisions = (events, camPos, camRight) => {
+      origRanked(events, camPos, camRight);
+      if (events.length > 0) {
+        this.enqueueHostAudioEvent({ kind: 'rankedShards', events: events.slice(0, 6) });
+      }
+    };
+
+    const origStack = audioAny.playStackSuccess.bind(this.audio);
+    audioAny.playStackSuccess = (layerCount) => {
+      origStack(layerCount);
+      this.enqueueHostAudioEvent({ kind: 'stackSuccess', layerCount });
+    };
+
+    if (typeof audioAny.playShardImpacts === 'function') {
+      const origShardImpacts = audioAny.playShardImpacts.bind(this.audio);
+      audioAny.playShardImpacts = (impacts, camPos, camRight) => {
+        const played = origShardImpacts(impacts, camPos, camRight);
+        if (impacts.length > 0) {
+          this.enqueueHostAudioEvent({ kind: 'shardImpacts', impacts: impacts.slice(0, 8) });
+        }
+        return played;
+      };
+    }
+
+    if (typeof audioAny.playWobbleRock === 'function') {
+      const origWobble = audioAny.playWobbleRock.bind(this.audio);
+      audioAny.playWobbleRock = (tilt, speed = 0, load = 0, worldPos = [0, 0, 0], opts) => {
+        const played = origWobble(tilt, speed, load, worldPos, opts);
+        this.enqueueHostAudioEvent({
+          kind: 'wobbleRock',
+          tiltAngleRad: tilt,
+          angularSpeedRadPerSec: speed,
+          clampingLoadN: load,
+          worldPos,
+          surface: opts?.surface ?? 'glass',
+          damage: opts?.damage ?? 0,
+        });
+        return played;
+      };
+    }
+  }
+
+  /**
+   * Hosts a new 2-player Online Vitrail room (Player 1 = Host, Player 2 = Guest).
+   */
+  public startOnlineHost(
+    customRoomCode?: string,
+    overrides?: OnlineSessionOverrides
+  ): string {
+    if (!this.physics && !this.authoritativePhysics) {
+      throw new Error('GameEngine must be initialized before hosting an online room.');
+    }
+    this.handlePointerCancel();
+    this.shutdownMultiplayerSessionOnly();
+    this.restoreAuthoritativePhysics();
+
+    this.aiOpponentEnabled = false;
+    this.resetAiController();
+    this.benchPaused = false;
+    this.benchCameraLocked = false;
+
+    const code =
+      customRoomCode && isValidRoomCode(customRoomCode)
+        ? normalizeRoomCode(customRoomCode)
+        : generateRoomCode(5);
+    const seed = overrides?.roomSeed !== undefined ? overrides.roomSeed >>> 0 : generateRoomSeed();
+
+    this.mpRole = 'host';
+    this.mpRoomCode = code;
+    this.mpRoomSeed = seed;
+
+    this.installHostShardUploadHook(this.physics);
+    this.installHostAudioTap();
+    this.rebuildAuthoritativeTowerWithSeed(seed);
+    this.camera.resetView(27.0);
+    this.syncBrowserRoomQueryParam(code);
+
+    const client = new VitrailMultiplayerClient({
+      ...overrides,
+      role: 'host',
+      roomCode: code,
+      roomSeed: seed,
+      onStatusChange: (status) => {
+        this.mpStatus = status;
+        this.emitTelemetry(true);
+      },
+      onPeerConnected: () => {
+        this.sendHostRoomWelcome();
+        this.mpForceImmediateSnapshot = true;
+        this.pumpMultiplayerStep(
+          typeof performance !== 'undefined' ? performance.now() : Date.now()
+        );
+        overrides?.onPeerConnected?.();
+      },
+      onPeerDisconnected: () => {
+        if (this.physics.currentPlayer === 1 && this.physics.isPointerDraggingBlock) {
+          this.physics.endGrab(false);
+        }
+        overrides?.onPeerDisconnected?.();
+      },
+      onControlMessage: (msg) => {
+        this.handleHostControlMessage(msg);
+      },
+    });
+    this.mpClient = client;
+    client.connect();
+    this.mpStatus = client.getStatus();
+    this.emitTelemetry(true);
+    return code;
+  }
+
+  /**
+   * Joins an existing 2-player Online Vitrail room as Player 2 (`Guest`).
+   */
+  public joinOnlineRoom(
+    rawRoomCode: string,
+    overrides?: OnlineSessionOverrides
+  ): boolean {
+    const code = normalizeRoomCode(rawRoomCode);
+    if (!isValidRoomCode(code)) {
+      return false;
+    }
+    this.handlePointerCancel();
+    this.shutdownMultiplayerSessionOnly();
+    this.restoreAuthoritativePhysics();
+
+    this.aiOpponentEnabled = false;
+    this.resetAiController();
+    this.benchPaused = false;
+    this.benchCameraLocked = false;
+
+    const initialSeed = overrides?.roomSeed ?? 0x56495452;
+    const guestMirror = new MultiplayerGuestWorld(this.audio, INITIAL_LAYERS, initialSeed);
+    guestMirror.setListenerPose(this.camera.position, this.camera.getRightVector());
+
+    this.guestWorld = guestMirror;
+    this.physics = guestMirror as unknown as PhysicsWorld;
+    this.physicsWorkerActive = false;
+    this.mpRole = 'guest';
+    this.mpRoomCode = code;
+    this.mpRoomSeed = guestMirror.roomSeed;
+    this.camera.resetView(27.0);
+    this.syncBrowserRoomQueryParam(code);
+
+    const client = new VitrailMultiplayerClient({
+      ...overrides,
+      role: 'guest',
+      roomCode: code,
+      roomSeed: initialSeed,
+      onStatusChange: (status) => {
+        this.mpStatus = status;
+        this.emitTelemetry(true);
+      },
+      onPeerConnected: () => {
+        client.sendControl({ type: 'request_resync', lastSeq: 0 });
+        overrides?.onPeerConnected?.();
+      },
+      onPeerDisconnected: () => {
+        this.audio.updateSlideFriction(0, 0);
+        this.guestWorld?.setOptimisticGuestPullAnchor(null);
+        overrides?.onPeerDisconnected?.();
+      },
+      onControlMessage: (msg) => {
+        this.handleGuestControlMessage(msg);
+      },
+      onStateFrame: (frame) => {
+        this.handleGuestStateFrame(frame);
+      },
+    });
+    this.mpClient = client;
+    client.connect();
+    this.mpStatus = client.getStatus();
+    this.emitTelemetry(true);
+    return true;
+  }
+
+  public leaveOnlineRoom(nextMode: GameMode = 'solo', players: number = 2): void {
+    this.handlePointerCancel();
+    this.shutdownMultiplayerSessionOnly();
+    this.restoreAuthoritativePhysics();
+    this.syncBrowserRoomQueryParam(null);
+    this.resetGame(nextMode, players);
+  }
+
+  public requestOnlineRematch(): void {
+    if (!this.mpRole || !this.mpClient) return;
+    if (this.mpRole === 'host') {
+      this.executeHostRematchReset();
+    } else {
+      this.mpClient.sendControl({ type: 'rematch_request' });
+    }
+  }
+
+  private executeHostRematchReset(): void {
+    if (this.mpRole !== 'host' || !this.mpClient) return;
+    const retiredIds = Array.from(this.hostActiveShardMetas.keys());
+    const nextSeed = generateRoomSeed();
+    this.mpRoomSeed = nextSeed;
+    this.mpClient.roomSeed = nextSeed;
+    this.audio.updateSlideFriction(0, 0);
+    this.rebuildAuthoritativeTowerWithSeed(nextSeed);
+    this.camera.resetView(27.0);
+    this.sendHostRoomWelcome(retiredIds);
+    this.mpForceImmediateSnapshot = true;
+    this.pumpMultiplayerStep(
+      typeof performance !== 'undefined' ? performance.now() : Date.now()
+    );
+    this.emitTelemetry(true);
+  }
+
+  private sendChunkedShardSpawns(
+    spawned: SerializedShardMeta[],
+    retiredIds: number[]
+  ): void {
+    if (!this.mpClient || !this.mpStatus.peerConnected) return;
+    const CHUNK_SIZE = 48; // Strictly < 16 KB per message (< 64 KB WebRTC SCTP maxMessageSize across all browsers)
+    if (spawned.length === 0) {
+      if (retiredIds.length > 0) {
+        this.mpClient.sendControl({ type: 'shard_spawn', spawned: [], retiredIds });
+      }
+      return;
+    }
+    for (let i = 0; i < spawned.length; i += CHUNK_SIZE) {
+      this.mpClient.sendControl({
+        type: 'shard_spawn',
+        spawned: spawned.slice(i, i + CHUNK_SIZE),
+        retiredIds: i === 0 ? retiredIds : [],
+      });
+    }
+  }
+
+  private syncHostShardMetasAndBroadcast(): void {
+    this.harvestHostShardUploadsBeforeNetwork();
+
+    const currentIds = new Set<number>();
+    const spawned: SerializedShardMeta[] = [];
+
+    for (let i = 0; i < this.physics.shards.length; i++) {
+      const s = this.physics.shards[i];
+      currentIds.add(s.id);
+      if (!this.hostActiveShardMetas.has(s.id)) {
+        const cachedLc =
+          this.hostSlotLocalCentroids.get(s.slotIndex) ??
+          inferShardLocalCentroid(s.planes, s.planeCount, s.impactLocalPos);
+        const planeFloats = Math.min(48, s.planeCount * 4);
+        const planes: number[] = new Array(planeFloats);
+        for (let k = 0; k < planeFloats; k++) {
+          planes[k] = +s.planes[k].toFixed(4);
+        }
+        const meta: SerializedShardMeta = {
+          id: s.id,
+          slotIndex: s.slotIndex,
+          swatchId: s.swatchId,
+          motif: s.motif,
+          rippleSeed: +s.rippleSeed.toFixed(4),
+          localCentroid: [
+            +cachedLc[0].toFixed(4),
+            +cachedLc[1].toFixed(4),
+            +cachedLc[2].toFixed(4),
+          ],
+          impactLocalPos: [
+            +s.impactLocalPos[0].toFixed(4),
+            +s.impactLocalPos[1].toFixed(4),
+            +s.impactLocalPos[2].toFixed(4),
+          ],
+          planeCount: s.planeCount,
+          planes,
+        };
+        this.hostActiveShardMetas.set(s.id, meta);
+        spawned.push(meta);
+      }
+    }
+
+    const retiredIds: number[] = [];
+    for (const existingId of this.hostActiveShardMetas.keys()) {
+      if (!currentIds.has(existingId)) {
+        retiredIds.push(existingId);
+        this.hostActiveShardMetas.delete(existingId);
+      }
+    }
+
+    if (spawned.length > 0 || retiredIds.length > 0) {
+      this.sendChunkedShardSpawns(spawned, retiredIds);
+    }
+  }
+
+  private sendHostRoomWelcome(explicitRetiredIds: number[] = []): void {
+    if (this.mpRole !== 'host' || !this.mpClient || !this.mpRoomCode) return;
+    this.syncHostShardMetasAndBroadcast();
+    const allActiveShards = Array.from(this.hostActiveShardMetas.values());
+    this.mpClient.sendControl({
+      type: 'room_welcome',
+      roomCode: this.mpRoomCode,
+      roomSeed: this.mpRoomSeed,
+      initialLayers: INITIAL_LAYERS,
+      collapseReason: this.physics.collapseReason,
+      activeShardMetas: [],
+      retiredShardIds: explicitRetiredIds,
+    });
+    if (allActiveShards.length > 0) {
+      this.sendChunkedShardSpawns(allActiveShards, []);
+    }
+  }
+
+  private buildHostStateFrame(): MultiplayerStateFrame {
+    const blocksLen = this.physics.blocks.length;
+    const blocks: DecodedBlockFrameState[] = new Array(blocksLen);
+    const wScratch = this.scratchWrench4;
+
+    for (let i = 0; i < blocksLen; i++) {
+      const b = this.physics.blocks[i];
+      this.physics.writeBlockPhotoelasticWrench(i, wScratch, 0);
+      blocks[i] = {
+        position: [b.position[0], b.position[1], b.position[2]],
+        rotation: [b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]],
+        damage: b.damage,
+        shattered: b.shattered,
+        extracted: b.extracted,
+        isLegalTarget: b.isLegalTarget,
+        isLooseSlot: b.isLooseSlot,
+        swatchId: b.swatchId,
+        motif: b.motif,
+        assignedLayer: b.assignedLayer,
+        assignedSlot: b.assignedSlot,
+        stress01: this.physics.getBlockPhotoelasticStress01(i),
+        crackLocalOrigin: [
+          b.crackLocalOrigin[0],
+          b.crackLocalOrigin[1],
+          b.crackLocalOrigin[2],
+        ],
+        photoelasticWrench: [wScratch[0], wScratch[1], wScratch[2], wScratch[3]],
+      };
+    }
+
+    const shardLimit = Math.min(MP_MAX_SHARDS_PER_FRAME, this.physics.shards.length);
+    const shards: DecodedShardFrameState[] = new Array(shardLimit);
+    for (let i = 0; i < shardLimit; i++) {
+      const s = this.physics.shards[i];
+      shards[i] = {
+        id: s.id,
+        position: [s.position[0], s.position[1], s.position[2]],
+        rotation: [s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3]],
+      };
+    }
+
+    const splinters = this.physics.splinters.slice(0, MP_MAX_SPLINTERS_PER_FRAME);
+    const tf = this.physics.topSupportFrame;
+    const tel = this.physics.getTelemetry();
+    this.mpStateSeq = (this.mpStateSeq + 1) >>> 0;
+
+    return {
+      seq: this.mpStateSeq,
+      hostElapsedSec: this.elapsedSec,
+      roomSeed: this.mpRoomSeed,
+      turnPhase: this.physics.turnPhase,
+      gameMode: this.physics.gameMode,
+      currentPlayer: this.physics.currentPlayer,
+      playerCount: this.physics.playerCount,
+      blocksStacked: this.physics.blocksStacked,
+      shatteredCount: tel.shatteredCount,
+      currentLayers: tel.currentLayers,
+      peakLayers: tel.peakLayers,
+      activeBlockId: this.physics.activeBlockId,
+      hoveredBlockId: this.physics.hoveredBlockId,
+      hoveredSlotIndex: this.physics.hoveredSlotIndex,
+      lockedMinRow: tel.lockedMinRow,
+      isPointerDraggingBlock: this.physics.isPointerDraggingBlock,
+      isExtractionLiftReady: this.physics.isExtractionLiftReady,
+      polariscopeMode: this.polariscopeMode,
+      grabResistance01: this.physics.grabResistance01,
+      settleProgress01: tel.settleProgress01,
+      leanAngleDeg: tel.leanAngleDeg,
+      wobbleSpeedDegPerSec: tel.wobbleSpeedDegPerSec,
+      liveHeightCm: tel.liveHeightCm,
+      peakHeightCm: tel.peakHeightCm,
+      centerOfMassXZCm: [
+        this.physics.centerOfMassXZCm[0],
+        this.physics.centerOfMassXZCm[1],
+      ],
+      carriedYawOffsetRad: this.physics.carriedYawOffsetRad,
+      grabCurrentWorldOnBlock: [...this.physics.grabCurrentWorldOnBlock],
+      grabWorldAnchor: [...this.physics.grabWorldAnchor],
+      carriedLandingPos: [...this.physics.carriedLandingPos],
+      carriedTargetQuat: [...this.physics.carriedTargetQuat],
+      topSupportSurfaceCenter: [...tf.surfaceCenter],
+      topSupportUpNormal: [...tf.upNormal],
+      topSupportDefaultRot: [...tf.defaultRotation],
+      topSupportTargetLayer: tf.targetLayer,
+      blocks,
+      shards,
+      splinters,
+    };
+  }
+
+  private pumpMultiplayerStep(nowMs: number): void {
+    if (!this.mpClient || !this.mpRole) return;
+
+    if (this.mpRole === 'guest') {
+      if (
+        this.mpPendingPullTarget &&
+        this.mpStatus.peerConnected &&
+        nowMs - this.mpLastGuestCmdSentMs >= 15
+      ) {
+        const target = this.mpPendingPullTarget;
+        this.mpPendingPullTarget = null;
+        this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: target }, nowMs);
+      }
+      return;
+    }
+
+    // Host role: synchronize new Voronoi shard geometries even while waiting for Guest so reconnects/joins have complete metadata
+    this.syncHostShardMetasAndBroadcast();
+
+    if (!this.mpStatus.peerConnected) {
+      this.mpOutboundAudioQueue = [];
+      return;
+    }
+
+    if (this.physics.collapseReason !== this.mpLastCollapseReasonSent) {
+      this.mpLastCollapseReasonSent = this.physics.collapseReason;
+      this.mpClient.sendControl({
+        type: 'collapse_info',
+        collapseReason: this.physics.collapseReason,
+      });
+    }
+
+    if (this.mpOutboundAudioQueue.length > 0) {
+      const batch = this.mpOutboundAudioQueue;
+      this.mpOutboundAudioQueue = [];
+      this.mpClient.sendControl({ type: 'audio_batch', events: batch });
+    }
+
+    // Stream compact `< 4 KB` binary snapshots at `30 Hz` (`~32 ms` cadence) or immediately on discrete state transitions
+    if (this.mpForceImmediateSnapshot || nowMs - this.mpLastSnapshotSentMs >= 32) {
+      this.mpForceImmediateSnapshot = false;
+      this.mpLastSnapshotSentMs = nowMs;
+      const frame = this.buildHostStateFrame();
+      this.mpClient.sendStateFrame(frame);
+    }
+  }
+
+  private handleHostControlMessage(msg: MultiplayerControlMessage): void {
+    if (this.mpRole !== 'host' || !this.physics) return;
+    switch (msg.type) {
+      case 'hello':
+      case 'request_resync': {
+        this.sendHostRoomWelcome();
+        this.mpForceImmediateSnapshot = true;
+        this.pumpMultiplayerStep(
+          typeof performance !== 'undefined' ? performance.now() : Date.now()
+        );
+        break;
+      }
+      case 'guest_cmd': {
+        this.executeAuthoritativeGuestCommand(msg.cmd);
+        break;
+      }
+      case 'rematch_request': {
+        this.executeHostRematchReset();
+        break;
+      }
+    }
+  }
+
+  /**
+   * Authoritative Host command gate: strictly enforces turn ownership (`currentPlayer === 1`)
+   * before applying any Guest pointer/keyboard action to the MuJoCo simulation.
+   */
+  private executeAuthoritativeGuestCommand(cmd: GuestRemoteCommand): void {
+    if (this.mpRole !== 'host' || !this.physics) return;
+    if (
+      this.physics.currentPlayer !== 1 ||
+      this.physics.turnPhase === 'COLLAPSED' ||
+      this.physics.turnPhase === 'SETTLING'
+    ) {
+      return;
+    }
+
+    switch (cmd.kind) {
+      case 'hover_block': {
+        if (this.physics.turnPhase === 'SELECT_BLOCK') {
+          const blk = cmd.blockId !== null ? this.physics.blocks[cmd.blockId] : undefined;
+          this.physics.hoveredBlockId = blk && !blk.shattered ? blk.id : null;
+        }
+        break;
+      }
+      case 'tap_block': {
+        if (this.physics.turnPhase === 'SELECT_BLOCK') {
+          this.physics.tapNudgeBlock(cmd.blockId, cmd.localNormal, cmd.localPoint);
+          this.mpForceImmediateSnapshot = true;
+        }
+        break;
+      }
+      case 'begin_pull': {
+        if (this.physics.turnPhase === 'SELECT_BLOCK') {
+          const started = this.physics.startGrabBlock(
+            cmd.blockId,
+            cmd.localPoint,
+            cmd.worldPoint
+          );
+          if (started) {
+            this.mpForceImmediateSnapshot = true;
+            this.emitTelemetry(true);
+          }
+        }
+        break;
+      }
+      case 'update_pull': {
+        if (this.physics.turnPhase === 'PULLING') {
+          this.physics.updateGrabTarget(cmd.worldTarget);
+        }
+        break;
+      }
+      case 'end_pull': {
+        if (
+          this.physics.turnPhase === 'PULLING' ||
+          this.physics.turnPhase === 'EXTRACTED'
+        ) {
+          this.physics.endGrab(cmd.dropIfPoisedOverTower);
+          this.mpForceImmediateSnapshot = true;
+          this.emitTelemetry(true);
+        }
+        break;
+      }
+      case 'nudge_placement': {
+        if (this.physics.turnPhase === 'EXTRACTED') {
+          this.physics.updateCarriedHover(cmd.rayOrigin, cmd.rayDir);
+        }
+        break;
+      }
+      case 'rotate_placement': {
+        if (this.physics.turnPhase === 'EXTRACTED') {
+          this.physics.rotateCarriedBlock(cmd.deltaYawRad);
+          this.mpForceImmediateSnapshot = true;
+        }
+        break;
+      }
+      case 'reset_rotation': {
+        if (this.physics.turnPhase === 'EXTRACTED') {
+          this.physics.resetCarriedBlockRotation();
+          this.mpForceImmediateSnapshot = true;
+        }
+        break;
+      }
+      case 'confirm_placement': {
+        if (
+          this.physics.turnPhase === 'EXTRACTED' &&
+          this.physics.isExtractionLiftReady
+        ) {
+          this.physics.releaseExtractedBlockOntoTop();
+          this.mpForceImmediateSnapshot = true;
+          this.emitTelemetry(true);
+        }
+        break;
+      }
+    }
+  }
+
+  private handleGuestControlMessage(msg: MultiplayerControlMessage): void {
+    if (this.mpRole !== 'guest' || !this.guestWorld) return;
+    switch (msg.type) {
+      case 'room_welcome': {
+        this.mpRoomSeed = msg.roomSeed >>> 0;
+        this.guestWorld.applyRoomWelcome({
+          roomSeed: msg.roomSeed,
+          initialLayers: msg.initialLayers,
+          collapseReason: msg.collapseReason,
+          activeShardMetas: msg.activeShardMetas,
+          retiredShardIds: msg.retiredShardIds,
+        });
+        this.emitTelemetry(true);
+        break;
+      }
+      case 'shard_spawn': {
+        this.guestWorld.applyShardSpawn(msg.spawned, msg.retiredIds);
+        break;
+      }
+      case 'collapse_info': {
+        this.guestWorld.collapseReason = msg.collapseReason;
+        this.emitTelemetry(true);
+        break;
+      }
+      case 'audio_batch': {
+        this.guestWorld.setListenerPose(this.camera.position, this.camera.getRightVector());
+        this.guestWorld.replayNetworkAudioEvents(msg.events);
+        break;
+      }
+    }
+  }
+
+  private handleGuestStateFrame(frame: MultiplayerStateFrame): void {
+    if (this.mpRole !== 'guest' || !this.guestWorld) return;
+    const prevPhase = this.guestWorld.turnPhase;
+    const prevPlayer = this.guestWorld.currentPlayer;
+    const applied = this.guestWorld.applyNetworkStateFrame(frame);
+    if (!applied) return;
+    this.mpRoomSeed = this.guestWorld.roomSeed;
+
+    if (
+      prevPhase !== this.guestWorld.turnPhase ||
+      prevPlayer !== this.guestWorld.currentPlayer
+    ) {
+      if (this.guestWorld.currentPlayer !== 1) {
+        this.guestWorld.setOptimisticGuestHover(null);
+        this.guestWorld.setOptimisticGuestPullAnchor(null);
+        if (this.interactionMode !== 'orbit' && this.interactionMode !== 'none') {
+          this.interactionMode = 'none';
+          this.pendingTapHit = null;
+        }
+      }
+      this.updateCursorStyle();
+      this.emitTelemetry(true);
+    }
+  }
+
+  private sendGuestRemoteCommand(cmd: GuestRemoteCommand, nowOverrideMs?: number): void {
+    if (this.mpRole !== 'guest' || !this.mpClient || !this.mpStatus.peerConnected) return;
+    this.mpGuestCmdSeq = (this.mpGuestCmdSeq + 1) >>> 0;
+    this.mpLastGuestCmdSentMs =
+      nowOverrideMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    this.mpClient.sendControl({
+      type: 'guest_cmd',
+      seq: this.mpGuestCmdSeq,
+      cmd,
+    });
+  }
+
+  private canLocalPlayerManipulateBlocks(): boolean {
+    if (!this.physics) return false;
+    if (this.isAiTurnActive()) return false;
+    if (this.mpRole === 'host') {
+      return (
+        this.physics.currentPlayer === 0 &&
+        this.physics.turnPhase !== 'COLLAPSED' &&
+        this.physics.turnPhase !== 'SETTLING'
+      );
+    }
+    if (this.mpRole === 'guest') {
+      return (
+        this.mpStatus.peerConnected &&
+        this.physics.currentPlayer === 1 &&
+        this.physics.turnPhase !== 'COLLAPSED' &&
+        this.physics.turnPhase !== 'SETTLING'
+      );
+    }
+    return true;
   }
 
   public setPolariscopeMode(enabled: boolean): void {
@@ -218,6 +1384,9 @@ export class GameEngine {
   }
 
   public setAiOpponentEnabled(enabled: boolean): void {
+    if (enabled && this.mpRole) {
+      this.leaveOnlineRoom('party', 2);
+    }
     this.aiOpponentEnabled = enabled;
     this.resetAiController();
     if (enabled && this.physics && (this.physics.gameMode !== 'party' || this.physics.playerCount !== 2)) {
@@ -237,6 +1406,7 @@ export class GameEngine {
 
   private isAiTurnActive(): boolean {
     return (
+      !this.mpRole &&
       this.aiOpponentEnabled &&
       !this.modalOpen &&
       Boolean(this.physics) &&
@@ -451,6 +1621,18 @@ export class GameEngine {
 
   public resetGame(mode?: GameMode, players?: number): void {
     if (!this.physics) return;
+
+    // In active Online mode, clicking Rebuild triggers a synchronized deterministic rematch
+    if (this.mpRole && mode === undefined) {
+      this.requestOnlineRematch();
+      return;
+    }
+    if (this.mpRole) {
+      this.shutdownMultiplayerSessionOnly();
+      this.restoreAuthoritativePhysics();
+      this.syncBrowserRoomQueryParam(null);
+    }
+
     this.benchPaused = false;
     this.benchCameraLocked = false;
     this.resetAiController();
@@ -615,7 +1797,9 @@ export class GameEngine {
       this.physics.triggerSandboxCollapseImpulse();
       for (let f = 0; f < 165; f++) {
         this.physics.step(1 / 60);
-        if (f > 115 && this.physics.shards.length >= 320) {
+        // Capture the mid-cascade Voronoi shard peak (`~409` active shards on the 43 cm oak table
+        // before outer radial shards drop past the circular rim onto the hidden shelf).
+        if (f >= 34 && this.physics.shards.length >= 340) {
           break;
         }
       }
@@ -643,6 +1827,7 @@ export class GameEngine {
   }
 
   public triggerCollapseDemo(): void {
+    if (this.mpRole) return;
     this.audio.unlock();
     this.physics.triggerSandboxCollapseImpulse();
     this.emitTelemetry(true);
@@ -684,9 +1869,12 @@ export class GameEngine {
   }
 
   /**
-   * Grazing-safe axial drag plane projection:
-   * Below 25 deg camera pitch, tilts the drag plane normal toward the camera so the ray-plane angle
-   * never drops below 25 deg, eliminating the 5.2x horizon depth blowup while staying 0-jump at grab start.
+   * Grazing- & upward-pitch-safe isometric drag-plane projection:
+   * Below `25 deg` camera elevation, tilts the proxy plane normal toward the camera by
+   * `tiltBeta = min(90 deg, 25 deg - elevRad)` and unfolds the in-plane displacement
+   * `dRad = (relX * hCamX + relZ * hCamZ) * cosB - relY * sinB` isometrically onto `y = anchorPoint[1]`.
+   * Preserves `0.0 mm` grab-start jump, C^1 continuity at `25 deg`, and exact `1.00x` radial pull gain
+   * even at steep upward camera pitches (`-25 deg` to `-65 deg`) without `cos(tiltBeta)` foreshortening.
    */
   public projectBlockDragPlane(
     rayOrigin: Vec3,
@@ -713,29 +1901,58 @@ export class GameEngine {
     const ny = cosB;
     const nz = hCamZ * sinB;
 
-    const denom = rayDir[0] * nx + rayDir[1] * ny + rayDir[2] * nz;
-    if (Math.abs(denom) < 1e-4) return null;
-    const t =
-      ((anchorPoint[0] - rayOrigin[0]) * nx +
-        (anchorPoint[1] - rayOrigin[1]) * ny +
-        (anchorPoint[2] - rayOrigin[2]) * nz) /
-      denom;
+    const num =
+      (anchorPoint[0] - rayOrigin[0]) * nx +
+      (anchorPoint[1] - rayOrigin[1]) * ny +
+      (anchorPoint[2] - rayOrigin[2]) * nz;
+    const rawDenom = rayDir[0] * nx + rayDir[1] * ny + rayDir[2] * nz;
+
+    let denom = rawDenom;
+    if (num <= 0) {
+      if (rawDenom > -0.08) denom = -0.08;
+    } else if (Math.abs(rawDenom) < 1e-4) {
+      return null;
+    }
+
+    const t = num / denom;
     if (t <= 0) return null;
 
+    const relX = rayOrigin[0] + rayDir[0] * t - anchorPoint[0];
+    const relY = rayOrigin[1] + rayDir[1] * t - anchorPoint[1];
+    const relZ = rayOrigin[2] + rayDir[2] * t - anchorPoint[2];
+
+    let dLat = -relX * hCamZ + relZ * hCamX;
+    let dRad = (relX * hCamX + relZ * hCamZ) * cosB - relY * sinB;
+
+    const excursion = Math.hypot(dRad, dLat);
+    const maxExcursionDm = 2.6;
+    if (excursion > maxExcursionDm) {
+      const scale = maxExcursionDm / excursion;
+      dRad *= scale;
+      dLat *= scale;
+    }
+
     return [
-      rayOrigin[0] + rayDir[0] * t,
+      anchorPoint[0] + hCamX * dRad - hCamZ * dLat,
       anchorPoint[1],
-      rayOrigin[2] + rayDir[2] * t,
+      anchorPoint[2] + hCamZ * dRad + hCamX * dLat,
     ];
   }
 
   private updateCursorStyle(): void {
-    if (!this.canvas?.style) return;
+    if (!this.canvas?.style || !this.physics) return;
     if (this.interactionMode === 'orbit') {
       this.canvas.style.cursor = 'move';
       return;
     }
-    if (this.physics.turnPhase === 'PULLING' && this.physics.isPointerDraggingBlock) {
+    if (!this.canLocalPlayerManipulateBlocks()) {
+      this.canvas.style.cursor = 'default';
+      return;
+    }
+    if (
+      (this.physics.turnPhase === 'PULLING' && this.physics.isPointerDraggingBlock) ||
+      (this.mpRole === 'guest' && this.interactionMode === 'block')
+    ) {
       this.canvas.style.cursor = 'grabbing';
       return;
     }
@@ -804,7 +2021,7 @@ export class GameEngine {
     const rect = this.getViewportRect(overrideRect);
     const { origin, dir } = this.camera.screenToRay(clientX, clientY, rect);
 
-    if (button === 2 || altKey || this.isAiTurnActive()) {
+    if (button === 2 || altKey || !this.canLocalPlayerManipulateBlocks()) {
       this.interactionMode = 'orbit';
       this.camera.isUserOrbiting = true;
       this.updateCursorStyle();
@@ -818,7 +2035,15 @@ export class GameEngine {
         ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 1.15;
 
       if (nearTopTower) {
-        this.physics.updateCarriedHover(origin, dir);
+        if (this.mpRole === 'guest') {
+          this.sendGuestRemoteCommand({
+            kind: 'nudge_placement',
+            rayOrigin: origin,
+            rayDir: dir,
+          });
+        } else {
+          this.physics.updateCarriedHover(origin, dir);
+        }
         this.interactionMode = 'place_top';
       } else {
         this.interactionMode = 'orbit';
@@ -835,7 +2060,7 @@ export class GameEngine {
       if (
         blk &&
         ((blk.isLegalTarget && this.physics.turnPhase === 'SELECT_BLOCK') ||
-          this.physics.gameMode === 'sandbox')
+          (!this.mpRole && this.physics.gameMode === 'sandbox'))
       ) {
         this.pendingTapHit = pick;
         this.grabAnchorOrigin = [...pick.hit.worldPoint];
@@ -858,8 +2083,40 @@ export class GameEngine {
   ): void {
     const rect = this.getViewportRect(overrideRect);
     const { origin, dir } = this.camera.screenToRay(clientX, clientY, rect);
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
     if (this.activePointerId === null || pointerId !== this.activePointerId) {
+      if (!this.canLocalPlayerManipulateBlocks()) {
+        if (this.mpRole === 'guest') {
+          this.guestWorld?.setOptimisticGuestHover(null);
+        }
+        this.updateCursorStyle();
+        return;
+      }
+
+      if (this.mpRole === 'guest') {
+        if (this.physics.turnPhase === 'EXTRACTED') {
+          if (now - this.mpLastGuestCmdSentMs >= 15) {
+            this.sendGuestRemoteCommand(
+              { kind: 'nudge_placement', rayOrigin: origin, rayDir: dir },
+              now
+            );
+          }
+        } else if (this.physics.turnPhase === 'SELECT_BLOCK') {
+          const pick = this.raycastIntactBlocks(origin, dir);
+          const pickId = pick ? pick.blockId : null;
+          this.guestWorld?.setOptimisticGuestHover(pickId);
+          if (pickId !== this.mpLastSentGuestHoverId && now - this.mpLastGuestCmdSentMs >= 15) {
+            this.mpLastSentGuestHoverId = pickId;
+            this.sendGuestRemoteCommand({ kind: 'hover_block', blockId: pickId }, now);
+          }
+        } else {
+          this.guestWorld?.setOptimisticGuestHover(null);
+        }
+        this.updateCursorStyle();
+        return;
+      }
+
       if (this.physics.turnPhase === 'EXTRACTED') {
         this.physics.updateCarriedHover(origin, dir);
       }
@@ -886,23 +2143,53 @@ export class GameEngine {
       return;
     }
 
+    if (!this.canLocalPlayerManipulateBlocks()) {
+      this.handlePointerCancel(pointerId);
+      return;
+    }
+
     if (this.interactionMode === 'place_top' && this.physics.turnPhase === 'EXTRACTED') {
-      this.physics.updateCarriedHover(origin, dir);
+      if (this.mpRole === 'guest') {
+        if (now - this.mpLastGuestCmdSentMs >= 15) {
+          this.sendGuestRemoteCommand(
+            { kind: 'nudge_placement', rayOrigin: origin, rayDir: dir },
+            now
+          );
+        }
+      } else {
+        this.physics.updateCarriedHover(origin, dir);
+      }
       this.updateCursorStyle();
       return;
     }
 
     if (this.interactionMode === 'block_pending' && this.pointerMovedDist >= 5.0 && this.pendingTapHit) {
-      const started = this.physics.startGrabBlock(
-        this.pendingTapHit.blockId,
-        this.pendingTapHit.hit.localPoint,
-        this.pendingTapHit.hit.worldPoint
-      );
-      if (started) {
+      if (this.mpRole === 'guest') {
+        this.sendGuestRemoteCommand(
+          {
+            kind: 'begin_pull',
+            blockId: this.pendingTapHit.blockId,
+            localPoint: this.pendingTapHit.hit.localPoint,
+            worldPoint: this.pendingTapHit.hit.worldPoint,
+          },
+          now
+        );
+        this.guestWorld?.setOptimisticGuestPullAnchor(this.pendingTapHit.hit.worldPoint);
         this.interactionMode = 'block';
         this.emitTelemetry(true);
       } else {
-        this.interactionMode = 'none';
+        const started = this.physics.startGrabBlock(
+          this.pendingTapHit.blockId,
+          this.pendingTapHit.hit.localPoint,
+          this.pendingTapHit.hit.worldPoint
+        );
+        if (started) {
+          this.interactionMode = 'block';
+          this.mpForceImmediateSnapshot = true;
+          this.emitTelemetry(true);
+        } else {
+          this.interactionMode = 'none';
+        }
       }
     }
 
@@ -913,16 +2200,35 @@ export class GameEngine {
         const nearTopPlane =
           ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 1.35;
         if (this.physics.isExtractionLiftReady && nearTopPlane) {
-          this.physics.updateCarriedHover(origin, dir);
+          if (this.mpRole === 'guest') {
+            if (now - this.mpLastGuestCmdSentMs >= 15) {
+              this.sendGuestRemoteCommand(
+                { kind: 'nudge_placement', rayOrigin: origin, rayDir: dir },
+                now
+              );
+            }
+          } else {
+            this.physics.updateCarriedHover(origin, dir);
+          }
         }
       } else {
         const anchorPlaneOrigin: Vec3 =
-          this.physics.gameMode === 'sandbox'
+          !this.mpRole && this.physics.gameMode === 'sandbox'
             ? [this.grabAnchorOrigin[0], this.physics.grabPlaneY, this.grabAnchorOrigin[2]]
             : this.grabAnchorOrigin;
         const planePt = this.projectBlockDragPlane(origin, dir, anchorPlaneOrigin);
         if (planePt) {
-          this.physics.updateGrabTarget(planePt);
+          if (this.mpRole === 'guest') {
+            this.guestWorld?.setOptimisticGuestPullAnchor(planePt);
+            if (now - this.mpLastGuestCmdSentMs >= 15) {
+              this.mpPendingPullTarget = null;
+              this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: planePt }, now);
+            } else {
+              this.mpPendingPullTarget = planePt;
+            }
+          } else {
+            this.physics.updateGrabTarget(planePt);
+          }
         }
       }
       this.updateCursorStyle();
@@ -946,21 +2252,56 @@ export class GameEngine {
       const stillOverTop =
         ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 0.95;
       if (this.pointerMovedDist < 18.0 || stillOverTop) {
-        this.physics.updateCarriedHover(origin, dir);
-        this.physics.releaseExtractedBlockOntoTop();
+        if (this.mpRole === 'guest') {
+          this.sendGuestRemoteCommand({
+            kind: 'nudge_placement',
+            rayOrigin: origin,
+            rayDir: dir,
+          });
+          this.sendGuestRemoteCommand({ kind: 'confirm_placement' });
+        } else {
+          this.physics.updateCarriedHover(origin, dir);
+          this.physics.releaseExtractedBlockOntoTop();
+          this.mpForceImmediateSnapshot = true;
+        }
       }
     } else if (this.interactionMode === 'block_pending') {
       // Pointer moved < 5.0 px: acoustic & tactile tap-test without leaving SELECT_BLOCK!
-      if (this.pendingTapHit) {
-        this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
-        this.physics.tapNudgeBlock(
-          this.pendingTapHit.blockId,
-          this.pendingTapHit.hit.localNormal,
-          this.pendingTapHit.hit.localPoint
-        );
+      if (this.pendingTapHit && this.canLocalPlayerManipulateBlocks()) {
+        if (this.mpRole === 'guest') {
+          this.sendGuestRemoteCommand({
+            kind: 'tap_block',
+            blockId: this.pendingTapHit.blockId,
+            localNormal: this.pendingTapHit.hit.localNormal,
+            localPoint: this.pendingTapHit.hit.localPoint,
+          });
+        } else {
+          this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
+          this.physics.tapNudgeBlock(
+            this.pendingTapHit.blockId,
+            this.pendingTapHit.hit.localNormal,
+            this.pendingTapHit.hit.localPoint
+          );
+          this.mpForceImmediateSnapshot = true;
+        }
       }
     } else if (this.interactionMode === 'block') {
-      if (this.physics.turnPhase === 'EXTRACTED') {
+      if (this.mpRole === 'guest') {
+        this.guestWorld?.setOptimisticGuestPullAnchor(null);
+        if (this.mpPendingPullTarget) {
+          const finalTarget = this.mpPendingPullTarget;
+          this.mpPendingPullTarget = null;
+          this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: finalTarget });
+        }
+        const lc = this.physics.topSupportFrame.layerCenter;
+        const ptTop = this.intersectTopSupportPlane(origin, dir);
+        const overTop =
+          this.physics.turnPhase === 'EXTRACTED' &&
+          this.physics.isExtractionLiftReady &&
+          ptTop !== null &&
+          Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 0.78;
+        this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: overTop });
+      } else if (this.physics.turnPhase === 'EXTRACTED') {
         const lc = this.physics.topSupportFrame.layerCenter;
         const ptTop = this.intersectTopSupportPlane(origin, dir);
         const overTop =
@@ -968,8 +2309,10 @@ export class GameEngine {
           ptTop !== null &&
           Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 0.78;
         this.physics.endGrab(overTop);
+        this.mpForceImmediateSnapshot = true;
       } else {
         this.physics.endGrab(false);
+        this.mpForceImmediateSnapshot = true;
       }
     }
 
@@ -986,7 +2329,14 @@ export class GameEngine {
     if (pointerId !== undefined && pointerId !== this.activePointerId) return;
 
     if (this.interactionMode === 'block') {
-      this.physics.endGrab(false);
+      if (this.mpRole === 'guest') {
+        this.mpPendingPullTarget = null;
+        this.guestWorld?.setOptimisticGuestPullAnchor(null);
+        this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: false });
+      } else {
+        this.physics.endGrab(false);
+        this.mpForceImmediateSnapshot = true;
+      }
     }
 
     this.camera.isUserOrbiting = false;
@@ -998,20 +2348,35 @@ export class GameEngine {
   }
 
   public handleRotateCarried(deltaYawRad: number): void {
-    if (this.physics.turnPhase !== 'EXTRACTED') return;
+    if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
+    if (this.mpRole === 'guest') {
+      this.sendGuestRemoteCommand({ kind: 'rotate_placement', deltaYawRad });
+      return;
+    }
     this.physics.rotateCarriedBlock(deltaYawRad);
+    this.mpForceImmediateSnapshot = true;
     this.emitTelemetry(true);
   }
 
   public handleResetCarriedRotation(): void {
-    if (this.physics.turnPhase !== 'EXTRACTED') return;
+    if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
+    if (this.mpRole === 'guest') {
+      this.sendGuestRemoteCommand({ kind: 'reset_rotation' });
+      return;
+    }
     this.physics.resetCarriedBlockRotation();
+    this.mpForceImmediateSnapshot = true;
     this.emitTelemetry(true);
   }
 
   public handleReleaseOntoTop(): void {
-    if (this.physics.turnPhase !== 'EXTRACTED') return;
+    if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
+    if (this.mpRole === 'guest') {
+      this.sendGuestRemoteCommand({ kind: 'confirm_placement' });
+      return;
+    }
     this.physics.releaseExtractedBlockOntoTop();
+    this.mpForceImmediateSnapshot = true;
     this.emitTelemetry(true);
   }
 
@@ -1082,7 +2447,13 @@ export class GameEngine {
 
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
-    if (this.physics.turnPhase === 'EXTRACTED' && !e.altKey && !e.ctrlKey && !e.metaKey) {
+    if (
+      this.canLocalPlayerManipulateBlocks() &&
+      this.physics.turnPhase === 'EXTRACTED' &&
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey
+    ) {
       const wheelAxis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
       const yawStep = Math.max(-0.16, Math.min(0.16, wheelAxis * 0.0009));
       this.handleRotateCarried(yawStep);
@@ -1107,7 +2478,7 @@ export class GameEngine {
       return;
     }
 
-    if (this.physics.turnPhase !== 'EXTRACTED') return;
+    if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
 
     if (e.code === 'KeyQ' || e.code === 'BracketLeft') {
       e.preventDefault();
@@ -1120,8 +2491,7 @@ export class GameEngine {
       this.handleRotateCarried(Math.PI * 0.5);
     } else if (e.code === 'Digit0') {
       e.preventDefault();
-      this.physics.resetCarriedBlockRotation();
-      this.emitTelemetry(true);
+      this.handleResetCarriedRotation();
     } else if (
       (e.code === 'Space' || e.code === 'Enter') &&
       tag !== 'BUTTON' &&
@@ -1187,6 +2557,15 @@ export class GameEngine {
     }
     this.resizeObserver?.disconnect();
 
+    this.shutdownMultiplayerSessionOnly();
+    if (this.guestWorld) {
+      this.guestWorld.dispose();
+      this.guestWorld = null;
+    }
+    if (this.authoritativePhysics && this.authoritativePhysics !== this.physics) {
+      this.authoritativePhysics.dispose();
+      this.authoritativePhysics = null;
+    }
     this.renderer?.dispose();
     this.physics?.dispose();
     this.audio?.dispose();
