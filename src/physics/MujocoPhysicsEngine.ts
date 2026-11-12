@@ -5820,8 +5820,6 @@ export class MujocoPhysicsEngine {
 
     const savedIter = this.model.opt.iterations;
     const savedLsIter = this.model.opt.ls_iterations;
-    this.model.opt.iterations = Math.min(savedIter, 10);
-    this.model.opt.ls_iterations = Math.min(savedLsIter, 4);
 
     const scratch = this.scratchOracleData;
     const probePullAzimuth = (

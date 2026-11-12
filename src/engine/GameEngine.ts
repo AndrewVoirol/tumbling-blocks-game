@@ -2510,18 +2510,6 @@ export class GameEngine {
         : 10;
     // Keep >= 6 solver steps so `predictedSlideMm / 1.8` cleanly separates free prisms from jammed bearing columns
     const rolloutSteps = 6;
-    const maybeWorker = this.physics as unknown as {
-      evaluateCounterfactualBlockCriticalityAsync?: (
-        c: number,
-        s: number
-      ) => Promise<BlockCriticalityCandidate[]>;
-    };
-    if (typeof maybeWorker.evaluateCounterfactualBlockCriticalityAsync === 'function') {
-      void maybeWorker
-        .evaluateCounterfactualBlockCriticalityAsync(maxC, rolloutSteps)
-        .then((candidates) => this.applyAiOracleDecision(candidates));
-      return;
-    }
 
     const layerCounts = new Map<number, number>();
     for (let i = 0; i < this.physics.blocks.length; i++) {
@@ -2565,6 +2553,20 @@ export class GameEngine {
     scoredLegal.sort((a, b) => b.rankScore - a.rankScore);
     const candidateIds =
       scoredLegal.length > 0 ? scoredLegal.slice(0, maxC).map((s) => s.id) : undefined;
+
+    const maybeWorker = this.physics as unknown as {
+      evaluateCounterfactualBlockCriticalityAsync?: (
+        c: number,
+        s: number,
+        candidateBlockIds?: number[]
+      ) => Promise<BlockCriticalityCandidate[]>;
+    };
+    if (typeof maybeWorker.evaluateCounterfactualBlockCriticalityAsync === 'function') {
+      void maybeWorker
+        .evaluateCounterfactualBlockCriticalityAsync(maxC, rolloutSteps, candidateIds)
+        .then((candidates) => this.applyAiOracleDecision(candidates));
+      return;
+    }
 
     const syncCandidates = this.physics.evaluateCounterfactualBlockCriticality(
       maxC,
