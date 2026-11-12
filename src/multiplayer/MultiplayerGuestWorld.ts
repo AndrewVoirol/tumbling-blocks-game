@@ -19,6 +19,7 @@ import {
 } from '../physics/PhysicsWorld';
 import {
   applyDeterministicTowerPalette,
+  canonicalizeQuatHemisphere,
   computeDeterministicBlockMaterial,
   computeNominalTowerBlockPose,
   MultiplayerStateFrame,
@@ -187,6 +188,7 @@ export class MultiplayerGuestWorld {
   private receivedAudioBatchSeqs = new Set<number>();
   private duplicateAudioBatchCount: number = 0;
   private hasReceivedWelcome: boolean = false;
+  private hasCurrentSeedStateFrame: boolean = false;
   private snapNextPose: boolean = true;
 
   private localGuestHoverBlockId: number | null = null;
@@ -221,6 +223,7 @@ export class MultiplayerGuestWorld {
       this.duplicateAudioBatchCount = 0;
       this.hasReceivedWelcome = false;
     }
+    this.hasCurrentSeedStateFrame = false;
     this.snapNextPose = true;
     this.collapseReason = null;
     this.turnPhase = 'SELECT_BLOCK';
@@ -342,23 +345,58 @@ export class MultiplayerGuestWorld {
       this.shardMap.delete(oldId);
     }
     for (const meta of spawned) {
-      if (this.shardMap.has(meta.id)) continue;
+      const hasInitPose =
+        Array.isArray(meta.initialPosition) &&
+        meta.initialPosition.length === 3 &&
+        Array.isArray(meta.initialRotation) &&
+        meta.initialRotation.length === 4;
+
+      const existing = this.shardMap.get(meta.id);
+      if (existing) {
+        if (hasInitPose && (!existing.hasPose || this.snapNextPose)) {
+          existing.currentPos = [...meta.initialPosition!];
+          existing.targetPos = [...meta.initialPosition!];
+          existing.currentQuat = canonicalizeQuatHemisphere(meta.initialRotation!);
+          existing.targetQuat = [...existing.currentQuat];
+          existing.hasPose = true;
+        }
+        continue;
+      }
+
+      // Evict any stale shard occupying the same 512-slot GPU vertex ring slot
+      for (const [oldId, entry] of this.shardMap.entries()) {
+        if (oldId !== meta.id && entry.meta.slotIndex === meta.slotIndex) {
+          this.shardMap.delete(oldId);
+        }
+      }
+
       const built = reconstructShardVerticesFromMeta(meta);
       const firstVertex = meta.slotIndex * SHARD_SLOT_STRIDE_VERTS;
       this.pendingShardUploads.push({
         firstVertex,
         vertexData: built.renderVertices,
       });
+      const initPos: Vec3 = hasInitPose
+        ? [meta.initialPosition![0], meta.initialPosition![1], meta.initialPosition![2]]
+        : [0, -10, 0];
+      const initQuat: Quat = hasInitPose
+        ? canonicalizeQuatHemisphere([
+            meta.initialRotation![0],
+            meta.initialRotation![1],
+            meta.initialRotation![2],
+            meta.initialRotation![3],
+          ])
+        : [0, 0, 0, 1];
       this.shardMap.set(meta.id, {
         meta,
         planesFloat32: built.planesFloat32,
         firstVertex,
         vertexCount: built.vertexCount,
-        currentPos: [0, -10, 0],
-        currentQuat: [0, 0, 0, 1],
-        targetPos: [0, -10, 0],
-        targetQuat: [0, 0, 0, 1],
-        hasPose: false,
+        currentPos: [...initPos],
+        currentQuat: [...initQuat],
+        targetPos: [...initPos],
+        targetQuat: [...initQuat],
+        hasPose: hasInitPose,
       });
     }
     this.rebuildShardList();
@@ -381,6 +419,7 @@ export class MultiplayerGuestWorld {
 
     this.lastAcceptedSeq = frame.seq >>> 0;
     this.acceptedFrameCount++;
+    this.hasCurrentSeedStateFrame = true;
 
     const snapImmediate = this.snapNextPose;
     this.snapNextPose = false;
@@ -588,6 +627,10 @@ export class MultiplayerGuestWorld {
   }
 
   private rebuildShardList(): void {
+    if (!this.hasCurrentSeedStateFrame) {
+      this.shards = [];
+      return;
+    }
     const next: GlassShardState[] = [];
     for (const [id, entry] of this.shardMap.entries()) {
       if (!entry.hasPose) continue;

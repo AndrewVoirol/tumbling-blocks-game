@@ -260,6 +260,7 @@ export class GameEngine {
   private hostStagedRendererUploads: ShardMeshAppendEvent[] = [];
   private hostSlotLocalCentroids = new Map<number, Vec3>();
   private hostActiveShardMetas = new Map<number, SerializedShardMeta>();
+  private mpShardCursor: number = 0;
   private hostAudioTapInstalled: boolean = false;
   private hostAudioTapDepth: number = 0;
   private mpOutboundAudioQueue: NetworkAudioEvent[] = [];
@@ -746,6 +747,7 @@ export class GameEngine {
     this.hostStagedRendererUploads = [];
     this.hostSlotLocalCentroids.clear();
     this.hostActiveShardMetas.clear();
+    this.mpShardCursor = 0;
   }
 
   private enforceHostPaletteParity(): void {
@@ -807,6 +809,7 @@ export class GameEngine {
     this.hostStagedRendererUploads = [];
     this.hostSlotLocalCentroids.clear();
     this.hostActiveShardMetas.clear();
+    this.mpShardCursor = 0;
     // Preserve strictly monotonic `mpStateSeq` across rematches so delayed pre-rematch `0x564d`
     // packets (`frame.seq <= lastAcceptedSeq`) are 100% discarded by `MultiplayerGuestWorld`!
     this.mpOutboundAudioQueue = [];
@@ -1460,6 +1463,17 @@ export class GameEngine {
           planes,
           volume: +s.volume.toFixed(6),
           massKg: +s.massKg.toFixed(6),
+          initialPosition: [
+            +s.position[0].toFixed(4),
+            +s.position[1].toFixed(4),
+            +s.position[2].toFixed(4),
+          ],
+          initialRotation: [
+            +s.rotation[0].toFixed(5),
+            +s.rotation[1].toFixed(5),
+            +s.rotation[2].toFixed(5),
+            +s.rotation[3].toFixed(5),
+          ],
         };
         this.hostActiveShardMetas.set(s.id, meta);
         spawned.push(meta);
@@ -1476,12 +1490,30 @@ export class GameEngine {
 
     if (spawned.length > 0 || retiredIds.length > 0) {
       this.sendChunkedShardSpawns(spawned, retiredIds);
+      this.emitTelemetry(true);
     }
   }
 
   private sendHostRoomWelcome(explicitRetiredIds: number[] = []): void {
     if (this.mpRole !== 'host' || !this.mpClient || !this.mpRoomCode) return;
     this.syncHostShardMetasAndBroadcast();
+    for (let i = 0; i < this.physics.shards.length; i++) {
+      const s = this.physics.shards[i];
+      const meta = this.hostActiveShardMetas.get(s.id);
+      if (meta) {
+        meta.initialPosition = [
+          +s.position[0].toFixed(4),
+          +s.position[1].toFixed(4),
+          +s.position[2].toFixed(4),
+        ];
+        meta.initialRotation = [
+          +s.rotation[0].toFixed(5),
+          +s.rotation[1].toFixed(5),
+          +s.rotation[2].toFixed(5),
+          +s.rotation[3].toFixed(5),
+        ];
+      }
+    }
     const allActiveShards = Array.from(this.hostActiveShardMetas.values());
     this.mpClient.sendControl({
       type: 'room_welcome',
@@ -1530,15 +1562,22 @@ export class GameEngine {
       };
     }
 
-    const shardLimit = Math.min(MP_MAX_SHARDS_PER_FRAME, this.physics.shards.length);
+    const totalShards = this.physics.shards.length;
+    const shardLimit = Math.min(MP_MAX_SHARDS_PER_FRAME, totalShards);
     const shards: DecodedShardFrameState[] = new Array(shardLimit);
-    for (let i = 0; i < shardLimit; i++) {
-      const s = this.physics.shards[i];
-      shards[i] = {
-        id: s.id,
-        position: [s.position[0], s.position[1], s.position[2]],
-        rotation: [s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3]],
-      };
+    if (shardLimit > 0) {
+      const start = this.mpShardCursor % totalShards;
+      for (let i = 0; i < shardLimit; i++) {
+        const s = this.physics.shards[(start + i) % totalShards];
+        shards[i] = {
+          id: s.id,
+          position: [s.position[0], s.position[1], s.position[2]],
+          rotation: [s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3]],
+        };
+      }
+      this.mpShardCursor = (start + shardLimit) % totalShards;
+    } else {
+      this.mpShardCursor = 0;
     }
 
     const splinters = this.physics.splinters.slice(0, MP_MAX_SPLINTERS_PER_FRAME);
@@ -1875,6 +1914,7 @@ export class GameEngine {
       }
       case 'shard_spawn': {
         this.guestWorld.applyShardSpawn(msg.spawned, msg.retiredIds);
+        this.emitTelemetry(true);
         break;
       }
       case 'collapse_info': {
@@ -1895,6 +1935,8 @@ export class GameEngine {
     const prevSeed = this.guestWorld.roomSeed;
     const prevPhase = this.guestWorld.turnPhase;
     const prevPlayer = this.guestWorld.currentPlayer;
+    const prevShards = this.guestWorld.shards.length;
+    const prevShattered = this.guestWorld.shatteredCount;
     const applied = this.guestWorld.applyNetworkStateFrame(frame);
     if (!applied) return;
     this.mpRoomSeed = this.guestWorld.roomSeed;
@@ -1908,7 +1950,9 @@ export class GameEngine {
 
     if (
       prevPhase !== this.guestWorld.turnPhase ||
-      prevPlayer !== this.guestWorld.currentPlayer
+      prevPlayer !== this.guestWorld.currentPlayer ||
+      prevShards !== this.guestWorld.shards.length ||
+      prevShattered !== this.guestWorld.shatteredCount
     ) {
       if (this.guestWorld.currentPlayer !== 1) {
         this.clearGuestLocalBlockInteraction();

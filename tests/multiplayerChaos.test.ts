@@ -860,4 +860,164 @@ describe('Vitrail Multiplayer Resilience, <=4s ICE Fallback & 100-Match Chaos Su
       }
     }
   );
+
+  it(
+    'T-CHAOS5: replicates > 300 Voronoi shards (1:1 activeShardCount & < 2.0 mm pose convergence across all shards) via initial poses + round-robin < 4 KB 0x564d cursor',
+    async () => {
+      const httpModName = 'node:http';
+      const relayModPath = '../workers/vitrail-rooms/nodeRelay.mjs';
+      const http = (await import(/* @vite-ignore */ httpModName)) as unknown as MinimalHttpModule;
+      const { attachVitrailRoomRelay } = (await import(
+        /* @vite-ignore */ relayModPath
+      )) as unknown as NodeRelayModule;
+
+      const server = http.createServer();
+      const relay = attachVitrailRoomRelay(server, '/__vitrail_mp');
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      const relayUrl = `ws://127.0.0.1:${port}/__vitrail_mp`;
+
+      const host = new GameEngine();
+      const guest = new GameEngine();
+      const guestLate = new GameEngine();
+      await host.initHeadless();
+      await guest.initHeadless();
+      await guestLate.initHeadless();
+
+      let hostLastActiveShardCount = 0;
+      let guestLastActiveShardCount = 0;
+      (host as unknown as { listener: (t: { activeShardCount: number }) => void }).listener = (
+        t
+      ) => {
+        hostLastActiveShardCount = t.activeShardCount;
+      };
+      (guest as unknown as { listener: (t: { activeShardCount: number }) => void }).listener = (
+        t
+      ) => {
+        guestLastActiveShardCount = t.activeShardCount;
+      };
+
+      try {
+        host.startOnlineHost('SHD33', {
+          relayUrl,
+          enablePeerJsFallback: false,
+          enableWebRtcUpgrade: false,
+          roomSeed: 0x33557799,
+        });
+        guest.joinOnlineRoom('SHD33', {
+          relayUrl,
+          enablePeerJsFallback: false,
+          enableWebRtcUpgrade: false,
+        });
+
+        const paired = await waitUntilWall(
+          () =>
+            Boolean(
+              host.getTelemetrySnapshot().mpPeerConnected &&
+                guest.getTelemetrySnapshot().mpPeerConnected
+            ),
+          2500,
+          () => {
+            host.stepHeadless(1 / 60);
+            guest.stepHeadless(1 / 120);
+          }
+        );
+        expect(paired).toBe(true);
+
+        // Shatter 16 blocks across the tower to spawn ~330–360 active Voronoi shards (> 2.7x MP_MAX_SHARDS_PER_FRAME=120)
+        const hostPhysicsAny = host.physics as unknown as {
+          shatterBlock: (blk: unknown, origin: [number, number, number], speed: number) => void;
+        };
+        let shatteredBlocks = 0;
+        for (let i = 0; i < host.physics.blocks.length && shatteredBlocks < 16; i++) {
+          const blk = host.physics.blocks[i];
+          if (!blk.shattered && !blk.extracted && i % 3 === 1) {
+            hostPhysicsAny.shatterBlock(
+              blk,
+              [blk.position[0], blk.position[1], blk.position[2]],
+              1.4
+            );
+            shatteredBlocks++;
+          }
+        }
+
+        // Step dynamic collapse for ~0.45 s so shards fall & scatter far from their initial fracture origins
+        for (let step = 0; step < 28; step++) {
+          host.stepHeadless(1 / 60);
+          guest.stepHeadless(1 / 120);
+          guest.stepHeadless(1 / 120);
+          await sleepWallMs(35);
+        }
+
+        // Freeze Host physics so shard poses are stationary and verify round-robin 120-shard 0x564d cursor
+        // converges ALL > 300 shards on Guest within < 2.0 mm AND HUD activeShardCount matches 1:1!
+        host.benchPaused = true;
+        for (let sweep = 0; sweep < 14; sweep++) {
+          host.stepHeadless(1 / 60);
+          for (let g = 0; g < 4; g++) {
+            guest.stepHeadless(1 / 120);
+          }
+          await sleepWallMs(34);
+        }
+
+        const hostTel = host.getTelemetrySnapshot();
+        const guestTel = guest.getTelemetrySnapshot();
+        expect(hostTel.activeShardCount).toBeGreaterThan(300);
+        expect(guestTel.activeShardCount).toBe(hostTel.activeShardCount);
+        expect(guestLastActiveShardCount).toBe(hostLastActiveShardCount);
+
+        const guestShardById = new Map<number, (typeof guest.physics.shards)[number]>();
+        for (const gs of guest.physics.shards) {
+          guestShardById.set(gs.id, gs);
+        }
+        expect(guestShardById.size).toBe(host.physics.shards.length);
+
+        let maxShardErrMm = 0;
+        for (let i = 0; i < host.physics.shards.length; i++) {
+          const hs = host.physics.shards[i];
+          const gs = guestShardById.get(hs.id);
+          expect(gs).toBeDefined();
+          const errMm =
+            Math.hypot(
+              hs.position[0] - gs!.position[0],
+              hs.position[1] - gs!.position[1],
+              hs.position[2] - gs!.position[2]
+            ) * 100.0;
+          if (errMm > maxShardErrMm) maxShardErrMm = errMm;
+        }
+        expect(maxShardErrMm).toBeLessThan(2.0);
+
+        // Also verify late-joining / reconnecting Guest immediately gets 1:1 activeShardCount (> 300) on room_welcome!
+        guest.leaveOnlineRoom();
+        await sleepWallMs(40);
+        guestLate.joinOnlineRoom('SHD33', {
+          relayUrl,
+          enablePeerJsFallback: false,
+          enableWebRtcUpgrade: false,
+        });
+        const lateSynced = await waitUntilWall(
+          () =>
+            Boolean(
+              guestLate.getTelemetrySnapshot().mpPeerConnected &&
+                guestLate.getTelemetrySnapshot().activeShardCount === hostTel.activeShardCount
+            ),
+          2500,
+          () => {
+            host.stepHeadless(1 / 60);
+            guestLate.stepHeadless(1 / 120);
+          }
+        );
+        expect(lateSynced).toBe(true);
+        expect(guestLate.getTelemetrySnapshot().activeShardCount).toBeGreaterThan(300);
+      } finally {
+        host.dispose();
+        guest.dispose();
+        guestLate.dispose();
+        relay.detach();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+    20000
+  );
 });

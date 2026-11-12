@@ -63,6 +63,8 @@ export interface SerializedShardMeta {
   planes: number[];
   volume?: number;
   massKg?: number;
+  initialPosition?: Vec3;
+  initialRotation?: Quat;
 }
 
 export type NetworkAudioEvent =
