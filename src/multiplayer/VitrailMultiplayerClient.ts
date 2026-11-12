@@ -490,6 +490,7 @@ export class VitrailMultiplayerClient {
   private primaryRelayBaseUrl: string | null = null;
   private fallbackRelayBaseUrl: string | null = null;
   private activeRelayBaseUrl: string | null = null;
+  private failedRelayBaseUrls = new Set<string>();
   private forcedRelayMode: boolean = false;
 
   // PeerJS public signaling WebSocket state
@@ -594,6 +595,7 @@ export class VitrailMultiplayerClient {
     if (this.disposed) return;
     this.errorMessage = null;
     this.webrtcUpgradeSuppressed = false;
+    this.failedRelayBaseUrls.clear();
     this.updateStatus(this.role === 'host' ? 'waiting_peer' : 'connecting');
 
     const primaryRelay = this.primaryRelayBaseUrl;
@@ -741,7 +743,18 @@ export class VitrailMultiplayerClient {
   // ============================================================================
 
   private getPreferredFallbackRelayUrl(): string | null {
-    return this.activeRelayBaseUrl ?? this.fallbackRelayBaseUrl ?? this.primaryRelayBaseUrl;
+    const candidates = [
+      this.activeRelayBaseUrl,
+      this.fallbackRelayBaseUrl,
+      this.primaryRelayBaseUrl,
+    ];
+    for (let i = 0; i < candidates.length; i++) {
+      const url = candidates[i];
+      if (url && !this.failedRelayBaseUrls.has(url)) {
+        return url;
+      }
+    }
+    return null;
   }
 
   private ensureRelaySocketConnectedImmediate(): void {
@@ -755,11 +768,13 @@ export class VitrailMultiplayerClient {
       clearTimeout(this.relayReconnectTimer);
       this.relayReconnectTimer = null;
     }
-    this.connectRelaySocket(
-      targetUrl,
-      false,
-      targetUrl === this.primaryRelayBaseUrl ? this.fallbackRelayBaseUrl : null
-    );
+    const secondaryCandidate =
+      targetUrl === this.primaryRelayBaseUrl &&
+      this.fallbackRelayBaseUrl &&
+      !this.failedRelayBaseUrls.has(this.fallbackRelayBaseUrl)
+        ? this.fallbackRelayBaseUrl
+        : null;
+    this.connectRelaySocket(targetUrl, false, secondaryCandidate);
   }
 
   private connectRelaySocket(
@@ -769,7 +784,6 @@ export class VitrailMultiplayerClient {
   ): void {
     if (this.disposed || typeof WebSocket === 'undefined') return;
     this.cleanupRelaySocket();
-    this.activeRelayBaseUrl = baseUrl;
 
     const wsUrl = buildRelayRoomSocketUrl(baseUrl, this.roomCode, this.role, this.clientId);
     let openedOnce = false;
@@ -777,6 +791,7 @@ export class VitrailMultiplayerClient {
     try {
       ws = new WebSocket(wsUrl);
     } catch {
+      this.failedRelayBaseUrls.add(baseUrl);
       if (nextFallbackRelayUrl && nextFallbackRelayUrl !== baseUrl) {
         this.connectRelaySocket(nextFallbackRelayUrl, fallbackToPeerJsOnError, null);
       } else if (fallbackToPeerJsOnError) {
@@ -794,6 +809,8 @@ export class VitrailMultiplayerClient {
     ws.onopen = () => {
       if (this.disposed || this.relayWs !== ws) return;
       openedOnce = true;
+      this.activeRelayBaseUrl = baseUrl;
+      this.failedRelayBaseUrls.delete(baseUrl);
       this.relayConnected = true;
       this.updateStatus();
     };
@@ -812,6 +829,9 @@ export class VitrailMultiplayerClient {
       this.relayWs = null;
       this.relayConnected = false;
       this.relayPeerPresent = false;
+      if (!openedOnce) {
+        this.failedRelayBaseUrls.add(baseUrl);
+      }
       this.updateStatus();
 
       if (this.disposed) return;
@@ -900,6 +920,14 @@ export class VitrailMultiplayerClient {
       this.peerJsFallbackDeadlineTimer = setTimeout(() => {
         this.peerJsFallbackDeadlineTimer = null;
         if (this.disposed || this.ctrlChannel?.readyState === 'open') return;
+        if (this.role === 'host' && this.peerJsOpen && !this.pc && !this.hadPeerConnectionOnce) {
+          // Host PeerJS lobby is open and waiting for a Guest OFFER (`webrtcHandshakeTimer` guards
+          // ICE once OFFER arrives); connect any live backup room relay without suppressing WebRTC!
+          if (this.getPreferredFallbackRelayUrl()) {
+            this.ensureRelaySocketConnectedImmediate();
+          }
+          return;
+        }
         this.handleWebRtcDisconnectOrFailover('peerjs-handshake-timeout');
       }, this.webrtcHandshakeTimeoutMs);
     }

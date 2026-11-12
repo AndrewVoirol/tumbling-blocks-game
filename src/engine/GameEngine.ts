@@ -186,6 +186,10 @@ export class GameEngine {
   public polariscopeMode: boolean = false;
   public physicsWorkerActive: boolean = false;
   private resizeObserver: ResizeObserver | null = null;
+  private rendererInitialized: boolean = false;
+  private gpuYieldChannel: BroadcastChannel | null = null;
+  private gpuYieldUntilMs: number = 0;
+  private readonly gpuInstanceId: string = `eng_${Math.random().toString(36).slice(2, 10)}`;
 
   // Glazier AI 2-ply turn controller state
   private aiStage:
@@ -289,12 +293,87 @@ export class GameEngine {
     this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
   }
 
+  private ensureGpuYieldChannel(): BroadcastChannel | null {
+    if (this.disposed || typeof BroadcastChannel === 'undefined') return null;
+    if (this.gpuYieldChannel) return this.gpuYieldChannel;
+    try {
+      const ch = new BroadcastChannel('vitrail_webgpu_yield');
+      ch.onmessage = (ev: MessageEvent) => {
+        if (this.disposed) return;
+        const data = ev.data as { type?: string; senderId?: string } | null;
+        if (!data || data.senderId === this.gpuInstanceId) return;
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (data.type === 'gpu-init-start') {
+          this.gpuYieldUntilMs = Math.max(this.gpuYieldUntilMs, now + 350);
+        } else if (data.type === 'gpu-init-done') {
+          this.gpuYieldUntilMs = 0;
+        }
+      };
+      this.gpuYieldChannel = ch;
+      return ch;
+    } catch {
+      return null;
+    }
+  }
+
+  private closeGpuYieldChannel(): void {
+    if (!this.gpuYieldChannel) return;
+    try {
+      this.gpuYieldChannel.onmessage = null;
+      this.gpuYieldChannel.close();
+    } catch {
+      // Ignore BroadcastChannel close errors
+    }
+    this.gpuYieldChannel = null;
+  }
+
   public async init(): Promise<void> {
+    // Yield one microtask so React 19 StrictMode's synchronous mount -> cleanup -> remount
+    // disposes throwaway Mount #1 BEFORE touching `navigator.gpu.requestAdapter()`.
+    await Promise.resolve();
+    if (this.disposed) {
+      return;
+    }
+
+    const yieldCh = this.ensureGpuYieldChannel();
+    if (yieldCh) {
+      try {
+        yieldCh.postMessage({ type: 'gpu-init-start', senderId: this.gpuInstanceId });
+      } catch {
+        // Ignore postMessage errors
+      }
+      // Allow sibling tabs' in-flight Retina 4x MSAA rAF command buffers (~4-16 ms) to drain
+      // on Dawn's GPU process before entering `navigator.gpu.requestAdapter()`.
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      if (this.disposed) {
+        try {
+          yieldCh.postMessage({ type: 'gpu-init-done', senderId: this.gpuInstanceId });
+        } catch {
+          // Ignore
+        }
+        this.closeGpuYieldChannel();
+        return;
+      }
+    }
+
     this.renderer = new WebGPURenderer(this.canvas);
-    await this.renderer.init();
+    try {
+      await this.renderer.init();
+      this.rendererInitialized = true;
+    } finally {
+      try {
+        this.gpuYieldChannel?.postMessage({
+          type: 'gpu-init-done',
+          senderId: this.gpuInstanceId,
+        });
+      } catch {
+        // Ignore
+      }
+    }
 
     if (this.disposed) {
       this.renderer.dispose();
+      this.closeGpuYieldChannel();
       return;
     }
 
@@ -471,7 +550,10 @@ export class GameEngine {
 
     const cw = this.canvas.clientWidth || window.innerWidth;
     const ch = Math.max(1, this.canvas.clientHeight || window.innerHeight);
-    if (cw > 0 && ch > 0) {
+    const shouldYieldGpu =
+      (typeof document !== 'undefined' && Boolean(document.hidden)) ||
+      nowMs < this.gpuYieldUntilMs;
+    if (!shouldYieldGpu && this.rendererInitialized && cw > 0 && ch > 0) {
       this.renderer.resize(cw, ch);
     }
     const aspect = cw / ch;
@@ -509,7 +591,9 @@ export class GameEngine {
       }
     }
 
-    this.renderer.render(this.physics, this.camera, this.elapsedSec);
+    if (!shouldYieldGpu && this.rendererInitialized) {
+      this.renderer.render(this.physics, this.camera, this.elapsedSec);
+    }
 
     if (nowMs - this.lastTelemetryEmitMs >= 45) {
       this.emitTelemetry(false);
@@ -4366,6 +4450,10 @@ export class GameEngine {
     });
 
     this.resizeObserver = new ResizeObserver((entries) => {
+      if (this.disposed || !this.rendererInitialized) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (now < this.gpuYieldUntilMs) return;
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
         if (width > 0 && height > 0) {
@@ -4402,6 +4490,7 @@ export class GameEngine {
       window.removeEventListener('keydown', this.onFirstGestureUnlock, true);
     }
     this.resizeObserver?.disconnect();
+    this.closeGpuYieldChannel();
 
     this.shutdownMultiplayerSessionOnly();
     if (this.guestWorld) {
@@ -4412,7 +4501,9 @@ export class GameEngine {
       this.authoritativePhysics.dispose();
       this.authoritativePhysics = null;
     }
-    this.renderer?.dispose();
+    if (this.rendererInitialized) {
+      this.renderer?.dispose();
+    }
     this.physics?.dispose();
     this.audio?.dispose();
   }

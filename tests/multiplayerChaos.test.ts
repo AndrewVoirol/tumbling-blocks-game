@@ -548,4 +548,316 @@ describe('Vitrail Multiplayer Resilience, <=4s ICE Fallback & 100-Match Chaos Su
     },
     300000
   );
+
+  it(
+    'T-CHAOS4: static/preview Host without /__vitrail_mp survives PeerJS lobby wait (> deadline) & accepts late Guest OFFER; StrictMode unmount & BroadcastChannel WebGPU yield prevent Dawn adapter starvation',
+    async () => {
+      // --- Part 1: Static/Preview Host Lobby Survival & Late Guest PeerJS Offer (Bug 1 Regression) ---
+      const savedWs = globalThis.WebSocket;
+      const savedRtc = globalThis.RTCPeerConnection;
+
+      let deadRelayDialCount = 0;
+      const peerJsPeers = new Map<string, MockStaticPeerJsWebSocket>();
+      const sdpMap = new Map<string, MockInstantRTCPeerConnection>();
+
+      class MockStaticPeerJsWebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+
+        public readyState = MockStaticPeerJsWebSocket.CONNECTING;
+        public binaryType = 'arraybuffer';
+        public onopen: ((ev: unknown) => void) | null = null;
+        public onmessage: ((ev: { data: unknown }) => void) | null = null;
+        public onclose: ((ev: unknown) => void) | null = null;
+        public onerror: ((ev: unknown) => void) | null = null;
+        private peerId = '';
+        private isPeerJs = false;
+
+        constructor(url: string) {
+          const parsed = new URL(url);
+          if (parsed.pathname.includes('peerjs')) {
+            this.isPeerJs = true;
+            this.peerId = parsed.searchParams.get('id') ?? '';
+            setTimeout(() => {
+              if (this.readyState !== MockStaticPeerJsWebSocket.CONNECTING) return;
+              this.readyState = MockStaticPeerJsWebSocket.OPEN;
+              peerJsPeers.set(this.peerId, this);
+              this.onopen?.({});
+              setTimeout(() => {
+                if (this.readyState === MockStaticPeerJsWebSocket.OPEN) {
+                  this.onmessage?.({ data: JSON.stringify({ type: 'OPEN' }) });
+                }
+              }, 3);
+            }, 5);
+          } else {
+            deadRelayDialCount++;
+            setTimeout(() => {
+              if (this.readyState === MockStaticPeerJsWebSocket.CLOSED) return;
+              this.readyState = MockStaticPeerJsWebSocket.CLOSED;
+              this.onerror?.({});
+              this.onclose?.({ code: 1006, reason: 'Static server 404' });
+            }, 6);
+          }
+        }
+
+        send(data: string): void {
+          if (!this.isPeerJs || this.readyState !== MockStaticPeerJsWebSocket.OPEN) return;
+          const parsed = JSON.parse(data) as {
+            type: string;
+            dst?: string;
+            payload?: unknown;
+          };
+          if (parsed.type === 'HEARTBEAT' || !parsed.dst) return;
+          const target = peerJsPeers.get(parsed.dst);
+          setTimeout(() => {
+            if (target && target.readyState === MockStaticPeerJsWebSocket.OPEN) {
+              target.onmessage?.({
+                data: JSON.stringify({
+                  type: parsed.type,
+                  src: this.peerId,
+                  dst: parsed.dst,
+                  payload: parsed.payload,
+                }),
+              });
+            }
+          }, 5);
+        }
+
+        close(): void {
+          if (this.readyState === MockStaticPeerJsWebSocket.CLOSED) return;
+          this.readyState = MockStaticPeerJsWebSocket.CLOSED;
+          if (this.isPeerJs && peerJsPeers.get(this.peerId) === this) {
+            peerJsPeers.delete(this.peerId);
+          }
+          this.onclose?.({ code: 1000 });
+        }
+      }
+
+      class MockInstantRTCPeerConnection {
+        public signalingState = 'stable';
+        public iceConnectionState = 'new';
+        public connectionState = 'new';
+        public localDescription: RTCSessionDescriptionInit | null = null;
+        public remoteDescription: RTCSessionDescriptionInit | null = null;
+        public onicecandidate: ((ev: unknown) => void) | null = null;
+        public onconnectionstatechange: (() => void) | null = null;
+        public oniceconnectionstatechange: (() => void) | null = null;
+        public channels = new Map<
+          number,
+          {
+            label: string;
+            readyState: string;
+            binaryType: string;
+            bufferedAmount: number;
+            onopen: (() => void) | null;
+            onmessage: ((ev: { data: unknown }) => void) | null;
+            onclose: (() => void) | null;
+            onerror: (() => void) | null;
+            send: (data: unknown) => void;
+            close: () => void;
+          }
+        >();
+        public partner: MockInstantRTCPeerConnection | null = null;
+        private id = Math.random().toString(36).slice(2, 8);
+
+        createDataChannel(label: string, opts?: { id?: number }) {
+          const chId = opts?.id ?? (label === 'ctrl' ? 0 : 1);
+          const self = this;
+          const ch = {
+            label,
+            readyState: 'connecting',
+            binaryType: 'arraybuffer',
+            bufferedAmount: 0,
+            onopen: null as (() => void) | null,
+            onmessage: null as ((ev: { data: unknown }) => void) | null,
+            onclose: null as (() => void) | null,
+            onerror: null as (() => void) | null,
+            send(data: unknown) {
+              const peerCh = self.partner?.channels.get(chId);
+              if (peerCh && peerCh.readyState === 'open') {
+                setTimeout(() => peerCh.onmessage?.({ data }), 2);
+              }
+            },
+            close() {
+              this.readyState = 'closed';
+            },
+          };
+          this.channels.set(chId, ch);
+          return ch;
+        }
+
+        async createOffer(): Promise<RTCSessionDescriptionInit> {
+          return { type: 'offer', sdp: `v=0\r\no=${this.id} 1 1 IN IP4 127.0.0.1\r\n` };
+        }
+
+        async createAnswer(): Promise<RTCSessionDescriptionInit> {
+          return { type: 'answer', sdp: `v=0\r\no=${this.id} 2 1 IN IP4 127.0.0.1\r\n` };
+        }
+
+        async setLocalDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+          this.localDescription = desc;
+          if (desc.sdp) sdpMap.set(desc.sdp, this);
+          this.signalingState = desc.type === 'offer' ? 'have-local-offer' : 'stable';
+          this.maybeOpen();
+        }
+
+        async setRemoteDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+          this.remoteDescription = desc;
+          const remote = desc.sdp ? sdpMap.get(desc.sdp) : undefined;
+          if (remote && remote !== this) {
+            this.partner = remote;
+            remote.partner = this;
+          }
+          this.signalingState = desc.type === 'offer' ? 'have-remote-offer' : 'stable';
+          this.maybeOpen();
+        }
+
+        async addIceCandidate(): Promise<void> {}
+
+        private maybeOpen(): void {
+          if (!this.partner || this.signalingState !== 'stable' || this.partner.signalingState !== 'stable') {
+            return;
+          }
+          setTimeout(() => {
+            for (const p of [this, this.partner!]) {
+              p.iceConnectionState = 'connected';
+              p.connectionState = 'connected';
+              p.oniceconnectionstatechange?.();
+              p.onconnectionstatechange?.();
+              for (const ch of p.channels.values()) {
+                if (ch.readyState !== 'open') {
+                  ch.readyState = 'open';
+                  ch.onopen?.();
+                }
+              }
+            }
+          }, 5);
+        }
+
+        close(): void {
+          this.connectionState = 'closed';
+          this.iceConnectionState = 'closed';
+          for (const ch of this.channels.values()) ch.readyState = 'closed';
+        }
+      }
+
+      globalThis.WebSocket = MockStaticPeerJsWebSocket as unknown as typeof WebSocket;
+      globalThis.RTCPeerConnection =
+        MockInstantRTCPeerConnection as unknown as typeof RTCPeerConnection;
+
+      try {
+        // Simulate static/preview origin where primaryRelayUrl points to local `/__vitrail_mp` (404/closed)
+        // and fallbackRelayUrl is null (`enablePeerJsFallback: true`)
+        const staticHost = new VitrailMultiplayerClient({
+          role: 'host',
+          roomCode: 'PRVW1',
+          relayUrl: 'ws://127.0.0.1:4173/__vitrail_mp',
+          fallbackRelayUrl: null,
+          peerJsUrl: 'wss://0.peerjs.com/peerjs',
+          enablePeerJsFallback: true,
+          enableWebRtcUpgrade: true,
+          webrtcHandshakeTimeoutMs: 120,
+        });
+        staticHost.connect();
+
+        // Wait > 2.6x `webrtcHandshakeTimeoutMs` before any Guest joins!
+        await sleepWallMs(320);
+
+        expect(staticHost.getStatus().connectionState).toBe('waiting_peer');
+        expect(staticHost.getStatus().errorMessage).toBeNull();
+        // Dead static `/__vitrail_mp` URL must NEVER be re-dialed after initial `!openedOnce` failure
+        expect(deadRelayDialCount).toBe(1);
+
+        // Now late Guest joins over PeerJS after 320 ms — Host MUST still accept OFFER & open WebRTC P2P!
+        const staticGuest = new VitrailMultiplayerClient({
+          role: 'guest',
+          roomCode: 'PRVW1',
+          relayUrl: 'ws://127.0.0.1:4173/__vitrail_mp',
+          fallbackRelayUrl: null,
+          peerJsUrl: 'wss://0.peerjs.com/peerjs',
+          enablePeerJsFallback: true,
+          enableWebRtcUpgrade: true,
+          webrtcHandshakeTimeoutMs: 500,
+        });
+        staticGuest.connect();
+
+        try {
+          const paired = await waitUntilWall(
+            () =>
+              staticHost.getStatus().peerConnected &&
+              staticGuest.getStatus().peerConnected &&
+              staticHost.getStatus().transport === 'webrtc-p2p' &&
+              staticGuest.getStatus().transport === 'webrtc-p2p',
+            1500
+          );
+          expect(paired).toBe(true);
+          expect(deadRelayDialCount).toBe(2); // 1 initial attempt on Host + 1 initial attempt on Guest
+        } finally {
+          staticHost.dispose();
+          staticGuest.dispose();
+        }
+      } finally {
+        globalThis.WebSocket = savedWs;
+        globalThis.RTCPeerConnection = savedRtc;
+      }
+
+      // --- Part 2: React 19 StrictMode Synchronous Unmount & Sibling-Tab BroadcastChannel Yield (Bug 2 Regression) ---
+      const navObj = globalThis.navigator as unknown as Record<string, unknown>;
+      const prevGpuDesc = Object.getOwnPropertyDescriptor(navObj, 'gpu');
+      let requestAdapterCalls = 0;
+      Object.defineProperty(navObj, 'gpu', {
+        configurable: true,
+        writable: true,
+        value: {
+          requestAdapter: async () => {
+            requestAdapterCalls++;
+            return null;
+          },
+        },
+      });
+
+      try {
+        // React 19 StrictMode Mount #1: `init()` followed synchronously by `dispose()` MUST exit at microtask fence
+        // before constructing `WebGPURenderer` or invoking `navigator.gpu.requestAdapter()`!
+        const strictMount1 = new GameEngine();
+        const initPromise = strictMount1.init();
+        strictMount1.dispose();
+        await initPromise;
+        expect(requestAdapterCalls).toBe(0);
+
+        // Sibling-tab `BroadcastChannel('vitrail_webgpu_yield')` pulse sets & clears `gpuYieldUntilMs`
+        if (typeof BroadcastChannel !== 'undefined') {
+          const liveTabEngine = new GameEngine();
+          await liveTabEngine.initHeadless();
+          const engInternal = liveTabEngine as unknown as {
+            ensureGpuYieldChannel: () => BroadcastChannel | null;
+            gpuYieldUntilMs: number;
+          };
+          engInternal.ensureGpuYieldChannel();
+
+          const siblingSender = new BroadcastChannel('vitrail_webgpu_yield');
+          try {
+            siblingSender.postMessage({ type: 'gpu-init-start', senderId: 'tab_guest_2' });
+            const yielded = await waitUntilWall(() => engInternal.gpuYieldUntilMs > 0, 500);
+            expect(yielded).toBe(true);
+
+            siblingSender.postMessage({ type: 'gpu-init-done', senderId: 'tab_guest_2' });
+            const resumed = await waitUntilWall(() => engInternal.gpuYieldUntilMs === 0, 500);
+            expect(resumed).toBe(true);
+          } finally {
+            siblingSender.close();
+            liveTabEngine.dispose();
+          }
+        }
+      } finally {
+        if (prevGpuDesc) {
+          Object.defineProperty(navObj, 'gpu', prevGpuDesc);
+        } else {
+          delete navObj.gpu;
+        }
+      }
+    }
+  );
 });
