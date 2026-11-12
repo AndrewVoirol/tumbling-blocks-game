@@ -181,6 +181,12 @@ export class MultiplayerGuestWorld {
   private shardMap = new Map<number, ShardCacheEntry>();
   private pendingShardUploads: ShardMeshAppendEvent[] = [];
   private lastAcceptedSeq: number = 0;
+  private acceptedFrameCount: number = 0;
+  private rejectedFrameCount: number = 0;
+  private audioBatchSeqFloor: number = 0;
+  private receivedAudioBatchSeqs = new Set<number>();
+  private duplicateAudioBatchCount: number = 0;
+  private hasReceivedWelcome: boolean = false;
   private snapNextPose: boolean = true;
 
   private localGuestHoverBlockId: number | null = null;
@@ -192,7 +198,11 @@ export class MultiplayerGuestWorld {
     this.initDeterministicTower(initialLayers, roomSeed);
   }
 
-  public initDeterministicTower(layers: number = INITIAL_LAYERS, roomSeed: number = 0x56495452): void {
+  public initDeterministicTower(
+    layers: number = INITIAL_LAYERS,
+    roomSeed: number = 0x56495452,
+    options?: { preserveSequenceState?: boolean }
+  ): void {
     this.roomSeed = roomSeed >>> 0;
     const total = layers * 3;
     this.blocks = [];
@@ -202,7 +212,15 @@ export class MultiplayerGuestWorld {
     this.splinters = [];
     this.shardMap.clear();
     this.pendingShardUploads = [];
-    this.lastAcceptedSeq = 0;
+    if (!options?.preserveSequenceState) {
+      this.lastAcceptedSeq = 0;
+      this.acceptedFrameCount = 0;
+      this.rejectedFrameCount = 0;
+      this.audioBatchSeqFloor = 0;
+      this.receivedAudioBatchSeqs.clear();
+      this.duplicateAudioBatchCount = 0;
+      this.hasReceivedWelcome = false;
+    }
     this.snapNextPose = true;
     this.collapseReason = null;
     this.turnPhase = 'SELECT_BLOCK';
@@ -266,19 +284,53 @@ export class MultiplayerGuestWorld {
     collapseReason: string | null;
     activeShardMetas: SerializedShardMeta[];
     retiredShardIds: number[];
+    minSnapshotSeq?: number;
+    currentAudioBatchSeq?: number;
   }): void {
+    const nextSeed = params.roomSeed >>> 0;
+    const isFreshWelcome = !this.hasReceivedWelcome && this.lastAcceptedSeq === 0;
+    const seedChanged = this.roomSeed !== nextSeed;
+    this.hasReceivedWelcome = true;
+
     if (
-      this.roomSeed !== (params.roomSeed >>> 0) ||
+      seedChanged ||
       this.blocks.length !== params.initialLayers * 3
     ) {
-      this.initDeterministicTower(params.initialLayers, params.roomSeed);
+      this.initDeterministicTower(params.initialLayers, nextSeed, {
+        preserveSequenceState: !isFreshWelcome,
+      });
+      this.hasReceivedWelcome = true;
     } else {
-      applyDeterministicTowerPalette(this.blocks, params.roomSeed, params.initialLayers);
-      this.shardMap.clear();
-      this.shards = [];
-      this.lastAcceptedSeq = 0;
-      this.snapNextPose = true;
+      applyDeterministicTowerPalette(this.blocks, nextSeed, params.initialLayers);
+      if (isFreshWelcome) {
+        this.snapNextPose = true;
+      }
     }
+
+    if (
+      typeof params.minSnapshotSeq === 'number' &&
+      Number.isFinite(params.minSnapshotSeq) &&
+      params.minSnapshotSeq > this.lastAcceptedSeq
+    ) {
+      this.lastAcceptedSeq = params.minSnapshotSeq >>> 0;
+    }
+
+    if (
+      (isFreshWelcome || seedChanged) &&
+      typeof params.currentAudioBatchSeq === 'number' &&
+      Number.isFinite(params.currentAudioBatchSeq)
+    ) {
+      const targetFloor = params.currentAudioBatchSeq >>> 0;
+      if (targetFloor > this.audioBatchSeqFloor) {
+        this.audioBatchSeqFloor = targetFloor;
+        for (const seq of this.receivedAudioBatchSeqs) {
+          if (seq <= targetFloor) {
+            this.receivedAudioBatchSeqs.delete(seq);
+          }
+        }
+      }
+    }
+
     this.collapseReason = params.collapseReason;
     if (params.activeShardMetas.length > 0 || params.retiredShardIds.length > 0) {
       this.applyShardSpawn(params.activeShardMetas, params.retiredShardIds);
@@ -313,15 +365,22 @@ export class MultiplayerGuestWorld {
   }
 
   public applyNetworkStateFrame(frame: MultiplayerStateFrame): boolean {
-    const seedChanged = (frame.roomSeed >>> 0) !== this.roomSeed && frame.roomSeed !== 0;
-    if (seedChanged) {
-      const layers = Math.max(1, Math.round(frame.blocks.length / 3) || INITIAL_LAYERS);
-      this.initDeterministicTower(layers, frame.roomSeed);
-    } else if (!this.snapNextPose && frame.seq <= this.lastAcceptedSeq) {
-      // Guard against out-of-order UDP packets on the unordered WebRTC DataChannel
+    if (!Number.isFinite(frame.seq) || frame.seq <= this.lastAcceptedSeq) {
+      // Strictly discard ANY stale or out-of-order 0x564d UDP packet across both normal play and rapid rematches
+      this.rejectedFrameCount++;
       return false;
     }
-    this.lastAcceptedSeq = frame.seq;
+
+    const nextSeed = frame.roomSeed >>> 0;
+    const seedChanged = nextSeed !== this.roomSeed && nextSeed !== 0;
+    if (seedChanged) {
+      const layers = Math.max(1, Math.round(frame.blocks.length / 3) || INITIAL_LAYERS);
+      this.initDeterministicTower(layers, nextSeed, { preserveSequenceState: true });
+      this.hasReceivedWelcome = true;
+    }
+
+    this.lastAcceptedSeq = frame.seq >>> 0;
+    this.acceptedFrameCount++;
 
     const snapImmediate = this.snapNextPose;
     this.snapNextPose = false;
@@ -398,7 +457,11 @@ export class MultiplayerGuestWorld {
       this.grabCurrentWorldOnBlock = [...this.targetGrabOnBlock];
       this.grabWorldAnchor = [...this.targetGrabAnchor];
       this.carriedLandingPos = [...this.targetCarriedLandingPos];
-      this.carriedTargetQuat = [...this.targetCarriedQuat];
+      this.carriedTargetQuat = quatSlerpHemisphere(
+        this.carriedTargetQuat,
+        this.targetCarriedQuat,
+        1.0
+      );
     }
 
     const neededCap = frame.blocks.length + 8;
@@ -492,7 +555,9 @@ export class MultiplayerGuestWorld {
       entry.targetQuat = [...fs.rotation];
       if (!entry.hasPose || snapImmediate) {
         entry.currentPos = [...fs.position];
-        entry.currentQuat = [...fs.rotation];
+        entry.currentQuat = entry.hasPose
+          ? quatSlerpHemisphere(entry.currentQuat, fs.rotation, 1.0)
+          : [...fs.rotation];
         entry.hasPose = true;
       }
     }
@@ -628,7 +693,69 @@ export class MultiplayerGuestWorld {
     }
   }
 
-  public replayNetworkAudioEvents(events: NetworkAudioEvent[]): void {
+  public getLastAcceptedSeq(): number {
+    return this.lastAcceptedSeq;
+  }
+
+  public getAcceptedFrameCount(): number {
+    return this.acceptedFrameCount;
+  }
+
+  public getRejectedFrameCount(): number {
+    return this.rejectedFrameCount;
+  }
+
+  public getLastAcceptedAudioBatchSeq(): number {
+    return this.audioBatchSeqFloor;
+  }
+
+  public getDuplicateAudioBatchCount(): number {
+    return this.duplicateAudioBatchCount;
+  }
+
+  public hasCompletedInitialWelcome(): boolean {
+    return this.hasReceivedWelcome;
+  }
+
+  public replayNetworkAudioEvents(
+    events: NetworkAudioEvent[],
+    batchSeq?: number,
+    roomSeed?: number
+  ): boolean {
+    if (
+      roomSeed !== undefined &&
+      roomSeed !== 0 &&
+      (roomSeed >>> 0) !== this.roomSeed
+    ) {
+      this.duplicateAudioBatchCount++;
+      return false;
+    }
+    if (batchSeq !== undefined) {
+      const cleanBatch = batchSeq >>> 0;
+      if (
+        !Number.isFinite(batchSeq) ||
+        cleanBatch <= this.audioBatchSeqFloor ||
+        this.receivedAudioBatchSeqs.has(cleanBatch)
+      ) {
+        this.duplicateAudioBatchCount++;
+        return false;
+      }
+      this.receivedAudioBatchSeqs.add(cleanBatch);
+      while (this.receivedAudioBatchSeqs.has((this.audioBatchSeqFloor + 1) >>> 0)) {
+        this.audioBatchSeqFloor = (this.audioBatchSeqFloor + 1) >>> 0;
+        this.receivedAudioBatchSeqs.delete(this.audioBatchSeqFloor);
+      }
+      if (this.receivedAudioBatchSeqs.size > 256) {
+        const sorted = Array.from(this.receivedAudioBatchSeqs).sort((a, b) => a - b);
+        const trimTo = sorted[sorted.length - 128];
+        this.audioBatchSeqFloor = Math.max(this.audioBatchSeqFloor, trimTo);
+        for (const seq of sorted) {
+          if (seq <= this.audioBatchSeqFloor) {
+            this.receivedAudioBatchSeqs.delete(seq);
+          }
+        }
+      }
+    }
     const ext = this.audio as unknown as ExtendedGuestAudioHooks;
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
@@ -722,6 +849,7 @@ export class MultiplayerGuestWorld {
           break;
       }
     }
+    return true;
   }
 
   public setListenerPose(camPos: Vec3, camRight: Vec3): void {

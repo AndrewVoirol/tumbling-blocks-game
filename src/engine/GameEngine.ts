@@ -147,6 +147,9 @@ export class GameEngine {
   private running: boolean = false;
   private disposed: boolean = false;
   private lastFrameMs: number = 0;
+  private lastForegroundFrameMs: number = 0;
+  private lastBgPumpStepMs: number = 0;
+  private hostOccludedOverride: boolean = false;
   private elapsedSec: number = 0;
   private lastTelemetryEmitMs: number = 0;
   private listener: TelemetryListener | null;
@@ -229,15 +232,24 @@ export class GameEngine {
   private mpForceImmediateSnapshot: boolean = false;
   private mpLastCollapseReasonSent: string | null = null;
   private mpGuestCmdSeq: number = 0;
+  private mpLastAcceptedGuestCmdSeq: number = 0;
+  private mpActiveGuestClientId: string | null = null;
   private mpLastGuestCmdSentMs: number = 0;
   private mpLastSentGuestHoverId: number | null;
   private mpPendingPullTarget: Vec3 | null = null;
+  private mpActiveGuestPullGrab: {
+    blockId: number;
+    localPoint: Vec3;
+    worldPoint: Vec3;
+  } | null = null;
+  private mpPendingDeferredGuestCmds: GuestRemoteCommand[] = [];
   private mpExpectedPalette: Array<{
     swatchId: number;
     motif: TraceryMotif;
     rippleSeed: number;
   }> | null = null;
   private mpHostBgTimer: ReturnType<typeof setInterval> | null = null;
+  private mpHostDisconnectGraceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Host Voronoi shard & discrete spatial audio replication buffers
   private hostRawConsumeShardUploads: (() => ShardMeshAppendEvent[]) | null = null;
@@ -247,6 +259,12 @@ export class GameEngine {
   private hostAudioTapInstalled: boolean = false;
   private hostAudioTapDepth: number = 0;
   private mpOutboundAudioQueue: NetworkAudioEvent[] = [];
+  private mpAudioBatchSeq: number = 0;
+  private mpRecentAudioBatches: Array<{
+    batchSeq: number;
+    roomSeed: number;
+    events: NetworkAudioEvent[];
+  }> = [];
   private mpLastSlideAudioSentMs: number = 0;
   private mpLastSlideWasNonZero: boolean = false;
   private scratchWrench4 = new Float32Array(4);
@@ -323,12 +341,32 @@ export class GameEngine {
 
     this.attachEvents();
     this.running = true;
-    this.lastFrameMs = performance.now();
+    const bootNow = performance.now();
+    this.lastFrameMs = bootNow;
+    this.lastForegroundFrameMs = bootNow;
+    this.lastBgPumpStepMs = bootNow;
     this.emitTelemetry(true);
     this.rafId = requestAnimationFrame(this.tick);
 
     // Expose engine handle for DevTools runtime profiling & automated verification
     (window as unknown as { __VITRAIL_ENGINE__?: GameEngine }).__VITRAIL_ENGINE__ = this;
+  }
+
+  /**
+   * Explicitly toggles Host tab occlusion state (used alongside `document.hidden` to drive
+   * the `30 Hz` background physics & snapshot pump when foreground `rAF` is halted).
+   */
+  public setHostTabOccluded(occluded: boolean): void {
+    this.hostOccludedOverride = occluded;
+    if (occluded) {
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (this.lastBgPumpStepMs <= 0) {
+        this.lastBgPumpStepMs = now;
+      }
+      if (this.mpRole === 'host' && this.mpHostBgTimer === null && !this.disposed) {
+        this.startHostBackgroundPump();
+      }
+    }
   }
 
   /**
@@ -354,6 +392,9 @@ export class GameEngine {
       this.stepPhysicsAndSecondaryAcoustics(clampedDt);
     }
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.lastFrameMs = now;
+    this.lastForegroundFrameMs = now;
+    this.lastBgPumpStepMs = now;
     this.pumpMultiplayerStep(now);
   }
 
@@ -376,7 +417,7 @@ export class GameEngine {
             this.camera.position,
             this.camera.getRightVector()
           );
-        } else if (this.mpRole === 'host' && this.mpStatus.peerConnected) {
+        } else if (this.mpRole === 'host') {
           this.enqueueHostAudioEvent({
             kind: 'shardImpacts',
             impacts: impacts.slice(0, 8),
@@ -403,7 +444,7 @@ export class GameEngine {
                 camRight: this.camera.getRightVector(),
               }
             );
-          } else if (this.mpRole === 'host' && this.mpStatus.peerConnected) {
+          } else if (this.mpRole === 'host') {
             this.enqueueHostAudioEvent({
               kind: 'wobbleRock',
               tiltAngleRad: w.tiltAngleRad,
@@ -423,6 +464,8 @@ export class GameEngine {
     if (!this.running) return;
     const rawDt = (nowMs - this.lastFrameMs) / 1000;
     this.lastFrameMs = nowMs;
+    this.lastForegroundFrameMs = nowMs;
+    this.lastBgPumpStepMs = nowMs;
     const dt = Math.min(0.05, Math.max(0.001, rawDt));
     this.elapsedSec += dt;
 
@@ -541,14 +584,23 @@ export class GameEngine {
       return;
     }
     try {
-      const url = new URL(window.location.href);
+      const loc = window.location;
+      const rawHref =
+        typeof loc.href === 'string' && loc.href.length > 0
+          ? loc.href
+          : `${loc.pathname ?? '/'}${loc.search ?? ''}${loc.hash ?? ''}`;
+      const isAbsolute = /^https?:\/\//i.test(rawHref);
+      const url = new URL(rawHref, 'http://localhost');
       if (url.searchParams.has('bench')) return;
       if (code) {
         url.searchParams.set('room', code);
       } else {
         url.searchParams.delete('room');
       }
-      window.history.replaceState(null, '', url.toString());
+      const nextUrl = isAbsolute
+        ? url.toString()
+        : `${url.pathname}${url.search}${url.hash}`;
+      window.history.replaceState(null, '', nextUrl);
     } catch {
       // Ignore history security errors in sandboxed frames
     }
@@ -570,6 +622,10 @@ export class GameEngine {
       clearInterval(this.mpHostBgTimer);
       this.mpHostBgTimer = null;
     }
+    if (this.mpHostDisconnectGraceTimer !== null) {
+      clearTimeout(this.mpHostDisconnectGraceTimer);
+      this.mpHostDisconnectGraceTimer = null;
+    }
     if (this.mpClient) {
       this.mpClient.dispose();
       this.mpClient = null;
@@ -588,9 +644,21 @@ export class GameEngine {
       pingMs: null,
       errorMessage: null,
     };
+    this.mpStateSeq = 0;
+    this.mpLastSnapshotSentMs = 0;
+    this.mpForceImmediateSnapshot = false;
+    this.mpLastCollapseReasonSent = null;
+    this.mpGuestCmdSeq = 0;
+    this.mpLastAcceptedGuestCmdSeq = 0;
+    this.mpActiveGuestClientId = null;
     this.mpOutboundAudioQueue = [];
+    this.mpAudioBatchSeq = 0;
+    this.mpRecentAudioBatches = [];
     this.mpPendingPullTarget = null;
+    this.mpActiveGuestPullGrab = null;
+    this.mpPendingDeferredGuestCmds = [];
     this.mpLastSentGuestHoverId = null;
+    this.hostOccludedOverride = false;
     this.hostStagedRendererUploads = [];
     this.hostSlotLocalCentroids.clear();
     this.hostActiveShardMetas.clear();
@@ -616,17 +684,27 @@ export class GameEngine {
       clearInterval(this.mpHostBgTimer);
     }
     this.mpHostBgTimer = setInterval(() => {
-      if (!this.running || this.disposed || this.mpRole !== 'host') return;
+      if (this.disposed || this.mpRole !== 'host') return;
+      const docHidden = typeof document !== 'undefined' && Boolean(document.hidden);
+      const activeSession = this.running || this.hostOccludedOverride || docHidden;
+      if (!activeSession) return;
       const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
       const isOccludedOrStalled =
-        (typeof document !== 'undefined' && document.hidden) || now - this.lastFrameMs > 55;
+        this.hostOccludedOverride ||
+        docHidden ||
+        (this.running && now - this.lastForegroundFrameMs > 55);
       if (!isOccludedOrStalled) return;
-      const dt = Math.min(0.05, Math.max(0.008, (now - this.lastFrameMs) / 1000));
+      const prevStepMs = this.lastBgPumpStepMs > 0 ? this.lastBgPumpStepMs : now - 1000 / 30;
+      const dt = Math.min(0.05, Math.max(0.008, (now - prevStepMs) / 1000));
+      this.lastBgPumpStepMs = now;
       this.lastFrameMs = now;
       this.elapsedSec += dt;
       if (!this.benchPaused) {
         this.updateMasterGlazierAi(dt);
         this.stepPhysicsAndSecondaryAcoustics(dt);
+      }
+      if (now - this.mpLastSnapshotSentMs >= 30) {
+        this.mpForceImmediateSnapshot = true;
       }
       this.pumpMultiplayerStep(now);
       if (now - this.lastTelemetryEmitMs >= 60) {
@@ -645,7 +723,10 @@ export class GameEngine {
     this.hostStagedRendererUploads = [];
     this.hostSlotLocalCentroids.clear();
     this.hostActiveShardMetas.clear();
-    this.mpStateSeq = 0;
+    // Preserve strictly monotonic `mpStateSeq` across rematches so delayed pre-rematch `0x564d`
+    // packets (`frame.seq <= lastAcceptedSeq`) are 100% discarded by `MultiplayerGuestWorld`!
+    this.mpOutboundAudioQueue = [];
+    this.mpRecentAudioBatches = [];
     this.mpLastCollapseReasonSent = null;
     this.mpForceImmediateSnapshot = true;
   }
@@ -705,10 +786,30 @@ export class GameEngine {
   }
 
   private enqueueHostAudioEvent(ev: NetworkAudioEvent): void {
-    if (this.mpRole !== 'host' || !this.mpStatus.peerConnected) return;
-    if (this.mpOutboundAudioQueue.length < 32) {
-      this.mpOutboundAudioQueue.push(ev);
+    if (
+      this.mpRole !== 'host' ||
+      (!this.mpStatus.peerConnected && this.mpStatus.connectionState !== 'reconnecting')
+    ) {
+      return;
     }
+    if (ev.kind === 'slideFriction' && this.mpOutboundAudioQueue.length > 0) {
+      const tail = this.mpOutboundAudioQueue[this.mpOutboundAudioQueue.length - 1];
+      if (tail.kind === 'slideFriction') {
+        this.mpOutboundAudioQueue[this.mpOutboundAudioQueue.length - 1] = ev;
+        return;
+      }
+    }
+    if (this.mpOutboundAudioQueue.length >= 256) {
+      const dropIdx = this.mpOutboundAudioQueue.findIndex(
+        (item) => item.kind === 'slideFriction' || item.kind === 'wobbleRock'
+      );
+      if (dropIdx >= 0) {
+        this.mpOutboundAudioQueue.splice(dropIdx, 1);
+      } else {
+        return;
+      }
+    }
+    this.mpOutboundAudioQueue.push(ev);
   }
 
   public getOutboundAudioQueueSnapshot(): ReadonlyArray<NetworkAudioEvent> {
@@ -996,6 +1097,10 @@ export class GameEngine {
         this.emitTelemetry(true);
       },
       onPeerConnected: () => {
+        if (this.mpHostDisconnectGraceTimer !== null) {
+          clearTimeout(this.mpHostDisconnectGraceTimer);
+          this.mpHostDisconnectGraceTimer = null;
+        }
         this.sendHostRoomWelcome();
         this.mpForceImmediateSnapshot = true;
         this.pumpMultiplayerStep(
@@ -1003,10 +1108,47 @@ export class GameEngine {
         );
         overrides?.onPeerConnected?.();
       },
-      onPeerDisconnected: () => {
+      onTransportFailover: (nextTransport, reason) => {
+        if (this.mpHostDisconnectGraceTimer !== null) {
+          clearTimeout(this.mpHostDisconnectGraceTimer);
+          this.mpHostDisconnectGraceTimer = null;
+        }
+        this.sendHostRoomWelcome();
+        this.mpForceImmediateSnapshot = true;
+        this.pumpMultiplayerStep(
+          typeof performance !== 'undefined' ? performance.now() : Date.now()
+        );
+        overrides?.onTransportFailover?.(nextTransport, reason);
+      },
+      onRemotePeerBye: (remoteClientId) => {
+        if (this.mpHostDisconnectGraceTimer !== null) {
+          clearTimeout(this.mpHostDisconnectGraceTimer);
+          this.mpHostDisconnectGraceTimer = null;
+        }
         if (this.physics.currentPlayer === 1 && this.physics.isPointerDraggingBlock) {
           this.physics.endGrab(false);
+          this.mpForceImmediateSnapshot = true;
         }
+        overrides?.onRemotePeerBye?.(remoteClientId);
+      },
+      onPeerDisconnected: () => {
+        if (this.mpHostDisconnectGraceTimer !== null) {
+          clearTimeout(this.mpHostDisconnectGraceTimer);
+        }
+        // Grace window across transient WebRTC -> WS relay failover so mid-drag Guest pulls survive seamlessly
+        this.mpHostDisconnectGraceTimer = setTimeout(() => {
+          this.mpHostDisconnectGraceTimer = null;
+          if (
+            !this.disposed &&
+            this.mpRole === 'host' &&
+            !this.mpStatus.peerConnected &&
+            this.physics.currentPlayer === 1 &&
+            this.physics.isPointerDraggingBlock
+          ) {
+            this.physics.endGrab(false);
+            this.mpForceImmediateSnapshot = true;
+          }
+        }, 1500);
         overrides?.onPeerDisconnected?.();
       },
       onControlMessage: (msg) => {
@@ -1064,12 +1206,18 @@ export class GameEngine {
         this.emitTelemetry(true);
       },
       onPeerConnected: () => {
-        client.sendControl({ type: 'request_resync', lastSeq: 0 });
+        this.triggerGuestResyncAndPullRecovery();
         overrides?.onPeerConnected?.();
+      },
+      onTransportFailover: (nextTransport, reason) => {
+        this.triggerGuestResyncAndPullRecovery();
+        overrides?.onTransportFailover?.(nextTransport, reason);
       },
       onPeerDisconnected: () => {
         this.audio.updateSlideFriction(0, 0);
-        this.guestWorld?.setOptimisticGuestPullAnchor(null);
+        if (this.mpStatus.connectionState !== 'reconnecting') {
+          this.guestWorld?.setOptimisticGuestPullAnchor(null);
+        }
         overrides?.onPeerDisconnected?.();
       },
       onControlMessage: (msg) => {
@@ -1084,6 +1232,49 @@ export class GameEngine {
     this.mpStatus = client.getStatus();
     this.emitTelemetry(true);
     return true;
+  }
+
+  private triggerGuestResyncAndPullRecovery(): void {
+    if (this.mpRole !== 'guest' || !this.mpClient || !this.guestWorld) return;
+    const hadWelcome = this.guestWorld.hasCompletedInitialWelcome();
+    this.mpClient.sendControl({
+      type: 'request_resync',
+      lastSeq: this.guestWorld.getLastAcceptedSeq(),
+      lastAudioBatchSeq: hadWelcome ? this.guestWorld.getLastAcceptedAudioBatchSeq() : undefined,
+    });
+
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (this.mpPendingDeferredGuestCmds.length > 0) {
+      const queued = this.mpPendingDeferredGuestCmds;
+      this.mpPendingDeferredGuestCmds = [];
+      for (let i = 0; i < queued.length; i++) {
+        this.sendGuestRemoteCommand(queued[i], now);
+      }
+    }
+
+    if (
+      this.interactionMode === 'block' &&
+      this.mpActiveGuestPullGrab &&
+      this.physics.currentPlayer === 1 &&
+      this.physics.turnPhase !== 'COLLAPSED' &&
+      this.physics.turnPhase !== 'SETTLING'
+    ) {
+      const grab = this.mpActiveGuestPullGrab;
+      this.sendGuestRemoteCommand(
+        {
+          kind: 'begin_pull',
+          blockId: grab.blockId,
+          localPoint: grab.localPoint,
+          worldPoint: grab.worldPoint,
+        },
+        now
+      );
+      if (this.mpPendingPullTarget) {
+        const latestTarget = this.mpPendingPullTarget;
+        this.mpPendingPullTarget = null;
+        this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: latestTarget }, now);
+      }
+    }
   }
 
   public leaveOnlineRoom(nextMode: GameMode = 'solo', players: number = 2): void {
@@ -1105,6 +1296,12 @@ export class GameEngine {
 
   private executeHostRematchReset(): void {
     if (this.mpRole !== 'host' || !this.mpClient) return;
+    // Cancel any active Host pointer drag before rebuilding the authoritative rematch tower
+    this.handlePointerCancel();
+    if (this.mpHostDisconnectGraceTimer !== null) {
+      clearTimeout(this.mpHostDisconnectGraceTimer);
+      this.mpHostDisconnectGraceTimer = null;
+    }
     const retiredIds = Array.from(this.hostActiveShardMetas.keys());
     const nextSeed = generateRoomSeed();
     this.mpRoomSeed = nextSeed;
@@ -1210,6 +1407,8 @@ export class GameEngine {
       collapseReason: this.physics.collapseReason,
       activeShardMetas: [],
       retiredShardIds: explicitRetiredIds,
+      minSnapshotSeq: this.mpStateSeq,
+      currentAudioBatchSeq: this.mpAudioBatchSeq,
     });
     if (allActiveShards.length > 0) {
       this.sendChunkedShardSpawns(allActiveShards, []);
@@ -1328,7 +1527,9 @@ export class GameEngine {
     this.syncHostShardMetasAndBroadcast();
 
     if (!this.mpStatus.peerConnected) {
-      this.mpOutboundAudioQueue = [];
+      if (this.mpStatus.connectionState !== 'reconnecting') {
+        this.mpOutboundAudioQueue = [];
+      }
       return;
     }
 
@@ -1343,7 +1544,22 @@ export class GameEngine {
     if (this.mpOutboundAudioQueue.length > 0) {
       const batch = this.mpOutboundAudioQueue;
       this.mpOutboundAudioQueue = [];
-      this.mpClient.sendControl({ type: 'audio_batch', events: batch });
+      this.mpAudioBatchSeq = (this.mpAudioBatchSeq + 1) >>> 0;
+      const batchSeq = this.mpAudioBatchSeq;
+      this.mpRecentAudioBatches.push({
+        batchSeq,
+        roomSeed: this.mpRoomSeed,
+        events: batch,
+      });
+      if (this.mpRecentAudioBatches.length > 128) {
+        this.mpRecentAudioBatches.shift();
+      }
+      this.mpClient.sendControl({
+        type: 'audio_batch',
+        batchSeq,
+        roomSeed: this.mpRoomSeed,
+        events: batch,
+      });
     }
 
     // Stream compact `< 4 KB` binary snapshots at `30 Hz` (`~32 ms` cadence) or immediately on discrete state transitions
@@ -1358,8 +1574,21 @@ export class GameEngine {
   private handleHostControlMessage(msg: MultiplayerControlMessage): void {
     if (this.mpRole !== 'host' || !this.physics) return;
     switch (msg.type) {
-      case 'hello':
-      case 'request_resync': {
+      case 'hello': {
+        if (msg.role === 'guest') {
+          if (
+            this.mpActiveGuestClientId !== null &&
+            this.mpActiveGuestClientId !== msg.clientId &&
+            this.physics.currentPlayer === 1 &&
+            this.physics.isPointerDraggingBlock
+          ) {
+            this.physics.endGrab(false);
+          }
+          if (this.mpActiveGuestClientId !== msg.clientId) {
+            this.mpActiveGuestClientId = msg.clientId;
+            this.mpLastAcceptedGuestCmdSeq = 0;
+          }
+        }
         this.sendHostRoomWelcome();
         this.mpForceImmediateSnapshot = true;
         this.pumpMultiplayerStep(
@@ -1367,7 +1596,47 @@ export class GameEngine {
         );
         break;
       }
+      case 'request_resync': {
+        this.sendHostRoomWelcome();
+        if (typeof msg.lastAudioBatchSeq === 'number' && this.mpClient) {
+          const watermark = msg.lastAudioBatchSeq >>> 0;
+          for (let i = 0; i < this.mpRecentAudioBatches.length; i++) {
+            const entry = this.mpRecentAudioBatches[i];
+            if (entry.roomSeed === this.mpRoomSeed && entry.batchSeq > watermark) {
+              this.mpClient.sendControl({
+                type: 'audio_batch',
+                batchSeq: entry.batchSeq,
+                roomSeed: entry.roomSeed,
+                events: entry.events,
+              });
+            }
+          }
+        }
+        this.mpForceImmediateSnapshot = true;
+        this.pumpMultiplayerStep(
+          typeof performance !== 'undefined' ? performance.now() : Date.now()
+        );
+        break;
+      }
       case 'guest_cmd': {
+        if (
+          this.physics.currentPlayer !== 1 ||
+          this.physics.turnPhase === 'COLLAPSED' ||
+          this.physics.turnPhase === 'SETTLING'
+        ) {
+          break;
+        }
+        if (
+          msg.roomSeed !== undefined &&
+          msg.roomSeed !== 0 &&
+          (msg.roomSeed >>> 0) !== (this.mpRoomSeed >>> 0)
+        ) {
+          break;
+        }
+        if (!Number.isFinite(msg.seq) || msg.seq <= this.mpLastAcceptedGuestCmdSeq) {
+          break;
+        }
+        this.mpLastAcceptedGuestCmdSeq = msg.seq >>> 0;
         this.executeAuthoritativeGuestCommand(msg.cmd);
         break;
       }
@@ -1380,7 +1649,7 @@ export class GameEngine {
 
   /**
    * Authoritative Host command gate: strictly enforces turn ownership (`currentPlayer === 1`)
-   * before applying any Guest pointer/keyboard action to the MuJoCo simulation.
+   * and single-owner pointer mutual exclusion before applying any Guest action to MuJoCo.
    */
   private executeAuthoritativeGuestCommand(cmd: GuestRemoteCommand): void {
     if (this.mpRole !== 'host' || !this.physics) return;
@@ -1401,14 +1670,23 @@ export class GameEngine {
         break;
       }
       case 'tap_block': {
-        if (this.physics.turnPhase === 'SELECT_BLOCK') {
+        if (
+          this.physics.turnPhase === 'SELECT_BLOCK' &&
+          !this.physics.isPointerDraggingBlock &&
+          this.physics.activeBlockId === null
+        ) {
           this.physics.tapNudgeBlock(cmd.blockId, cmd.localNormal, cmd.localPoint);
           this.mpForceImmediateSnapshot = true;
         }
         break;
       }
       case 'begin_pull': {
-        if (this.physics.turnPhase === 'SELECT_BLOCK') {
+        if (
+          this.physics.turnPhase === 'SELECT_BLOCK' &&
+          !this.physics.isPointerDraggingBlock &&
+          this.physics.activeBlockId === null &&
+          !(this.interactionMode === 'block' && this.activePointerId !== null)
+        ) {
           const started = this.physics.startGrabBlock(
             cmd.blockId,
             cmd.localPoint,
@@ -1475,17 +1753,38 @@ export class GameEngine {
     }
   }
 
+  private clearGuestLocalBlockInteraction(): void {
+    this.mpPendingPullTarget = null;
+    this.mpActiveGuestPullGrab = null;
+    this.mpPendingDeferredGuestCmds = [];
+    this.guestWorld?.setOptimisticGuestHover(null);
+    this.guestWorld?.setOptimisticGuestPullAnchor(null);
+    if (this.interactionMode !== 'orbit' && this.interactionMode !== 'none') {
+      this.interactionMode = 'none';
+      this.pendingTapHit = null;
+      this.activePointerId = null;
+    }
+  }
+
   private handleGuestControlMessage(msg: MultiplayerControlMessage): void {
     if (this.mpRole !== 'guest' || !this.guestWorld) return;
     switch (msg.type) {
       case 'room_welcome': {
-        this.mpRoomSeed = msg.roomSeed >>> 0;
+        const prevSeed = this.guestWorld.roomSeed;
+        const hadWelcome = this.guestWorld.hasCompletedInitialWelcome();
+        const nextSeed = msg.roomSeed >>> 0;
+        if (hadWelcome && nextSeed !== prevSeed) {
+          this.clearGuestLocalBlockInteraction();
+        }
+        this.mpRoomSeed = nextSeed;
         this.guestWorld.applyRoomWelcome({
           roomSeed: msg.roomSeed,
           initialLayers: msg.initialLayers,
           collapseReason: msg.collapseReason,
           activeShardMetas: msg.activeShardMetas,
           retiredShardIds: msg.retiredShardIds,
+          minSnapshotSeq: msg.minSnapshotSeq,
+          currentAudioBatchSeq: msg.currentAudioBatchSeq,
         });
         this.emitTelemetry(true);
         break;
@@ -1501,7 +1800,7 @@ export class GameEngine {
       }
       case 'audio_batch': {
         this.guestWorld.setListenerPose(this.camera.position, this.camera.getRightVector());
-        this.guestWorld.replayNetworkAudioEvents(msg.events);
+        this.guestWorld.replayNetworkAudioEvents(msg.events, msg.batchSeq, msg.roomSeed);
         break;
       }
     }
@@ -1509,23 +1808,26 @@ export class GameEngine {
 
   private handleGuestStateFrame(frame: MultiplayerStateFrame): void {
     if (this.mpRole !== 'guest' || !this.guestWorld) return;
+    const prevSeed = this.guestWorld.roomSeed;
     const prevPhase = this.guestWorld.turnPhase;
     const prevPlayer = this.guestWorld.currentPlayer;
     const applied = this.guestWorld.applyNetworkStateFrame(frame);
     if (!applied) return;
     this.mpRoomSeed = this.guestWorld.roomSeed;
 
+    if (prevSeed !== this.guestWorld.roomSeed) {
+      this.clearGuestLocalBlockInteraction();
+      this.updateCursorStyle();
+      this.emitTelemetry(true);
+      return;
+    }
+
     if (
       prevPhase !== this.guestWorld.turnPhase ||
       prevPlayer !== this.guestWorld.currentPlayer
     ) {
       if (this.guestWorld.currentPlayer !== 1) {
-        this.guestWorld.setOptimisticGuestHover(null);
-        this.guestWorld.setOptimisticGuestPullAnchor(null);
-        if (this.interactionMode !== 'orbit' && this.interactionMode !== 'none') {
-          this.interactionMode = 'none';
-          this.pendingTapHit = null;
-        }
+        this.clearGuestLocalBlockInteraction();
       }
       this.updateCursorStyle();
       this.emitTelemetry(true);
@@ -1533,13 +1835,27 @@ export class GameEngine {
   }
 
   private sendGuestRemoteCommand(cmd: GuestRemoteCommand, nowOverrideMs?: number): void {
-    if (this.mpRole !== 'guest' || !this.mpClient || !this.mpStatus.peerConnected) return;
+    if (this.mpRole !== 'guest' || !this.mpClient) return;
+    if (!this.mpStatus.peerConnected) {
+      if (
+        this.mpStatus.connectionState === 'reconnecting' &&
+        (cmd.kind === 'end_pull' ||
+          cmd.kind === 'confirm_placement' ||
+          cmd.kind === 'tap_block')
+      ) {
+        if (this.mpPendingDeferredGuestCmds.length < 8) {
+          this.mpPendingDeferredGuestCmds.push(cmd);
+        }
+      }
+      return;
+    }
     this.mpGuestCmdSeq = (this.mpGuestCmdSeq + 1) >>> 0;
     this.mpLastGuestCmdSentMs =
       nowOverrideMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
     this.mpClient.sendControl({
       type: 'guest_cmd',
       seq: this.mpGuestCmdSeq,
+      roomSeed: this.mpRoomSeed,
       cmd,
     });
   }
@@ -1555,8 +1871,11 @@ export class GameEngine {
       );
     }
     if (this.mpRole === 'guest') {
+      const linkReadyOrMidDragFailover =
+        this.mpStatus.peerConnected ||
+        (this.mpStatus.connectionState === 'reconnecting' && this.interactionMode === 'block');
       return (
-        this.mpStatus.peerConnected &&
+        linkReadyOrMidDragFailover &&
         this.physics.currentPlayer === 1 &&
         this.physics.turnPhase !== 'COLLAPSED' &&
         this.physics.turnPhase !== 'SETTLING'
@@ -3536,18 +3855,34 @@ export class GameEngine {
 
     if (this.interactionMode === 'block_pending' && this.pointerMovedDist >= 5.0 && this.pendingTapHit) {
       if (this.mpRole === 'guest') {
+        const localPt: Vec3 = [...this.pendingTapHit.hit.localPoint];
+        const worldPt: Vec3 = [...this.pendingTapHit.hit.worldPoint];
+        this.mpActiveGuestPullGrab = {
+          blockId: this.pendingTapHit.blockId,
+          localPoint: localPt,
+          worldPoint: worldPt,
+        };
         this.sendGuestRemoteCommand(
           {
             kind: 'begin_pull',
             blockId: this.pendingTapHit.blockId,
-            localPoint: this.pendingTapHit.hit.localPoint,
-            worldPoint: this.pendingTapHit.hit.worldPoint,
+            localPoint: localPt,
+            worldPoint: worldPt,
           },
           now
         );
-        this.guestWorld?.setOptimisticGuestPullAnchor(this.pendingTapHit.hit.worldPoint);
+        this.guestWorld?.setOptimisticGuestPullAnchor(worldPt);
         this.interactionMode = 'block';
         this.emitTelemetry(true);
+      } else if (
+        this.mpRole === 'host' &&
+        (this.physics.currentPlayer !== 0 ||
+          this.physics.turnPhase !== 'SELECT_BLOCK' ||
+          this.physics.isPointerDraggingBlock ||
+          this.physics.activeBlockId !== null)
+      ) {
+        this.interactionMode = 'none';
+        this.pendingTapHit = null;
       } else {
         const started = this.physics.startGrabBlock(
           this.pendingTapHit.blockId,
@@ -3569,7 +3904,7 @@ export class GameEngine {
         const resolvedTop = this.resolveTopPlacementRay(origin, dir, 1.35);
         if (this.physics.isExtractionLiftReady && resolvedTop) {
           if (this.mpRole === 'guest') {
-            if (now - this.mpLastGuestCmdSentMs >= 15) {
+            if (this.mpStatus.peerConnected && now - this.mpLastGuestCmdSentMs >= 15) {
               this.sendGuestRemoteCommand(
                 {
                   kind: 'nudge_placement',
@@ -3592,7 +3927,7 @@ export class GameEngine {
         if (planePt) {
           if (this.mpRole === 'guest') {
             this.guestWorld?.setOptimisticGuestPullAnchor(planePt);
-            if (now - this.mpLastGuestCmdSentMs >= 15) {
+            if (this.mpStatus.peerConnected && now - this.mpLastGuestCmdSentMs >= 15) {
               this.mpPendingPullTarget = null;
               this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: planePt }, now);
             } else {
@@ -3641,7 +3976,10 @@ export class GameEngine {
 
     if (this.interactionMode === 'place_top') {
       const resolvedTop = this.resolveTopPlacementRay(origin, dir, 1.05);
-      if (this.pointerMovedDist < 18.0 || resolvedTop !== null) {
+      if (
+        (this.pointerMovedDist < 18.0 || resolvedTop !== null) &&
+        this.canLocalPlayerManipulateBlocks()
+      ) {
         const rOrig = resolvedTop ? resolvedTop.synthOrigin : origin;
         const rDir = resolvedTop ? resolvedTop.synthDir : dir;
         if (this.mpRole === 'guest') {
@@ -3681,6 +4019,7 @@ export class GameEngine {
       }
     } else if (this.interactionMode === 'block') {
       if (this.mpRole === 'guest') {
+        this.mpActiveGuestPullGrab = null;
         this.guestWorld?.setOptimisticGuestPullAnchor(null);
         if (this.mpPendingPullTarget) {
           const finalTarget = this.mpPendingPullTarget;
@@ -3696,6 +4035,8 @@ export class GameEngine {
           this.physics.isExtractionLiftReady &&
           resolvedTop !== null;
         this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: overTop });
+      } else if (this.mpRole === 'host' && this.physics.currentPlayer !== 0) {
+        // Host lost turn ownership (e.g. rematch or turn handoff); never terminate Guest's pull
       } else if (this.physics.turnPhase === 'EXTRACTED') {
         const resolvedTop = this.resolveTopPlacementRay(origin, dir, 0.82);
         const overTop = this.physics.isExtractionLiftReady && resolvedTop !== null;
@@ -3787,10 +4128,11 @@ export class GameEngine {
 
     if (this.interactionMode === 'block') {
       if (this.mpRole === 'guest') {
+        this.mpActiveGuestPullGrab = null;
         this.mpPendingPullTarget = null;
         this.guestWorld?.setOptimisticGuestPullAnchor(null);
         this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: false });
-      } else {
+      } else if (this.mpRole !== 'host' || this.physics.currentPlayer === 0) {
         this.physics.endGrab(false);
         this.mpForceImmediateSnapshot = true;
       }

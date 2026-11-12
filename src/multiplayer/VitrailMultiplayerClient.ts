@@ -13,6 +13,9 @@ import {
 
 export const DEFAULT_PEERJS_SIGNAL_URL = 'wss://0.peerjs.com/peerjs';
 
+/** Default WebRTC ICE/DataChannel open deadline (`2.8 s`, strictly `<= 3.2 s` so total WS relay fallback finishes `<= 4.0 s`) */
+export const DEFAULT_WEBRTC_HANDSHAKE_TIMEOUT_MS = 2800;
+
 export const DEFAULT_PUBLIC_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
@@ -24,18 +27,43 @@ export interface VitrailMultiplayerClientOptions {
   roomSeed?: number;
   /** Optional explicit WebSocket room relay URL (`ws://.../__vitrail_mp` or Cloudflare Worker URL) */
   relayUrl?: string | null;
+  /** Optional secondary WebSocket relay URL dialed if primary relay fails or WebRTC ICE stalls/fails */
+  fallbackRelayUrl?: string | null;
   /** Optional override for PeerJS signaling WebSocket endpoint (`wss://0.peerjs.com/peerjs`) */
   peerJsUrl?: string | null;
   /** Disable PeerJS public fallback (e.g. in isolated local relay unit tests) */
   enablePeerJsFallback?: boolean;
   /** Disable WebRTC upgrade over relay (e.g. to force pure WS relay transport) */
   enableWebRtcUpgrade?: boolean;
+  /** Force pure WebSocket relay transport (`enableWebRtcUpgrade=false` & `enablePeerJsFallback=false`) */
+  forceRelay?: boolean;
+  /** Maximum time (`ms`) to wait for WebRTC `ctrl` DataChannel to open before tearing down `pc` and falling back to WS relay (default `2800 ms`, capped `<= 3200 ms`) */
+  webrtcHandshakeTimeoutMs?: number;
+  /** Optional HTTP(S) endpoint returning `{ iceServers: RTCIceServer[] }` short-lived TURN credentials */
+  iceEndpointUrl?: string | null;
   iceServers?: RTCIceServer[];
   onControlMessage?: (msg: MultiplayerControlMessage) => void;
   onStateFrame?: (frame: MultiplayerStateFrame, byteLength: number) => void;
   onStatusChange?: (status: MultiplayerStatusSnapshot) => void;
   onPeerConnected?: () => void;
   onPeerDisconnected?: () => void;
+  /** Fired when an active `webrtc-p2p` session downgrades seamlessly onto an already-open `ws-relay` socket */
+  onTransportFailover?: (nextTransport: MultiplayerTransportKind, reason: string) => void;
+  /** Optional notification when explicit `peer_bye` arrives from the remote peer */
+  onRemotePeerBye?: (remoteClientId: string) => void;
+}
+
+export interface BrowserLocationLike {
+  protocol?: string;
+  host?: string;
+  hostname?: string;
+  port?: string;
+  search?: string;
+}
+
+export interface ResolvedRelayEndpoints {
+  primaryRelayUrl: string | null;
+  fallbackRelayUrl: string | null;
 }
 
 interface PeerJsWireMessage {
@@ -76,34 +104,321 @@ function nowMs(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
 
-function resolveAutoRelayUrl(): string | null {
-  const metaEnv = (
+function readViteMetaEnv(): Record<string, string | boolean | undefined> | undefined {
+  return (
     import.meta as unknown as { env?: Record<string, string | boolean | undefined> }
   ).env;
-  const configured = metaEnv?.VITE_MP_RELAY_URL;
-  if (typeof configured === 'string' && configured.trim().length > 0) {
-    return configured.trim();
-  }
-  if (typeof window === 'undefined' || !window.location) {
-    return null;
-  }
-  const host = window.location.hostname;
-  const port = window.location.port;
-  const isLocalOrLan =
-    Boolean(metaEnv?.DEV) ||
-    host === 'localhost' ||
-    host === '127.0.0.1' ||
-    host === '[::1]' ||
-    host.endsWith('.local') ||
-    port === '5173' ||
-    port === '4173' ||
-    /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(host);
+}
 
-  if (!isLocalOrLan) {
+function parseBooleanFlag(val: unknown): boolean | undefined {
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'string') {
+    const clean = val.trim().toLowerCase();
+    if (clean === '1' || clean === 'true' || clean === 'yes' || clean === 'on') return true;
+    if (clean === '0' || clean === 'false' || clean === 'no' || clean === 'off') return false;
+  }
+  return undefined;
+}
+
+/**
+ * Determines whether forced WebSocket relay mode is active via explicit client options,
+ * browser URL query parameters (`?forceRelay=1`, `?mpRelay=1`, `?transport=relay`),
+ * or `VITE_MP_FORCE_RELAY=1`.
+ */
+export function isForcedRelayEnabled(
+  options?: Pick<VitrailMultiplayerClientOptions, 'forceRelay'>,
+  envOverride?: Record<string, unknown>,
+  searchOverride?: string | { search?: string }
+): boolean {
+  if (options?.forceRelay !== undefined) {
+    return Boolean(options.forceRelay);
+  }
+
+  const search =
+    searchOverride !== undefined
+      ? typeof searchOverride === 'string'
+        ? searchOverride
+        : searchOverride.search ?? ''
+      : typeof window !== 'undefined' && window.location
+        ? window.location.search ?? ''
+        : '';
+
+  if (search) {
+    try {
+      const params = new URLSearchParams(search);
+      const forceParam = parseBooleanFlag(params.get('forceRelay'));
+      if (forceParam !== undefined) return forceParam;
+      const mpRelayParam = parseBooleanFlag(params.get('mpRelay'));
+      if (mpRelayParam !== undefined) return mpRelayParam;
+      const transportParam = params.get('transport')?.trim().toLowerCase();
+      if (
+        transportParam === 'relay' ||
+        transportParam === 'ws' ||
+        transportParam === 'ws-relay'
+      ) {
+        return true;
+      }
+    } catch {
+      // Ignore malformed search query
+    }
+  }
+
+  const env = envOverride ?? readViteMetaEnv();
+  const envForce = parseBooleanFlag(env?.VITE_MP_FORCE_RELAY);
+  return envForce === true;
+}
+
+/**
+ * Resolves primary and fallback WebSocket relay endpoints:
+ * - Explicit `options.relayUrl` or `?relay=<url>` takes top precedence.
+ * - On `localhost` / `127.0.0.1` / `[::1]` / LAN / Vite `DEV`, local `ws(s)://<host>/__vitrail_mp`
+ *   is ALWAYS tried first even when `.env.production` sets `VITE_MP_RELAY_URL`, seamlessly falling
+ *   back to `VITE_MP_RELAY_URL` if local `/__vitrail_mp` is absent (e.g. static localhost server).
+ * - On production origins, uses `VITE_MP_RELAY_URL`.
+ */
+export function resolveRelayEndpoints(
+  options?: Pick<VitrailMultiplayerClientOptions, 'relayUrl' | 'fallbackRelayUrl'>,
+  envOverride?: Record<string, unknown>,
+  locationOverride?: BrowserLocationLike | null
+): ResolvedRelayEndpoints {
+  const env = envOverride ?? readViteMetaEnv();
+  const configuredRaw = env?.VITE_MP_RELAY_URL;
+  const configuredEnv =
+    typeof configuredRaw === 'string' && configuredRaw.trim().length > 0
+      ? configuredRaw.trim()
+      : null;
+
+  const normalizeOpt = (v: string | null | undefined): string | null =>
+    typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
+
+  if (options?.relayUrl !== undefined) {
+    return {
+      primaryRelayUrl: normalizeOpt(options.relayUrl),
+      fallbackRelayUrl:
+        options.fallbackRelayUrl !== undefined ? normalizeOpt(options.fallbackRelayUrl) : null,
+    };
+  }
+
+  const loc: BrowserLocationLike | null =
+    locationOverride !== undefined
+      ? locationOverride
+      : typeof window !== 'undefined' && window.location
+        ? window.location
+        : null;
+
+  if (loc?.search) {
+    try {
+      const params = new URLSearchParams(loc.search);
+      const qRelay = params.get('relay');
+      if (qRelay !== null) {
+        const trimmed = qRelay.trim();
+        const lower = trimmed.toLowerCase();
+        if (trimmed === '' || lower === '0' || lower === 'none' || lower === 'off') {
+          return {
+            primaryRelayUrl: null,
+            fallbackRelayUrl: normalizeOpt(options?.fallbackRelayUrl),
+          };
+        }
+        return {
+          primaryRelayUrl: trimmed,
+          fallbackRelayUrl:
+            options?.fallbackRelayUrl !== undefined
+              ? normalizeOpt(options.fallbackRelayUrl)
+              : configuredEnv && configuredEnv !== trimmed
+                ? configuredEnv
+                : null,
+        };
+      }
+    } catch {
+      // Ignore malformed search query
+    }
+  }
+
+  if (loc && loc.hostname && loc.host) {
+    const host = loc.hostname;
+    const port = loc.port ?? '';
+    const isLocalOrLan =
+      Boolean(env?.DEV) ||
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '[::1]' ||
+      host.endsWith('.local') ||
+      port === '5173' ||
+      port === '4173' ||
+      /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(host);
+
+    if (isLocalOrLan) {
+      const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+      const localRelay = `${proto}//${loc.host}/__vitrail_mp`;
+      const fallback =
+        options?.fallbackRelayUrl !== undefined
+          ? normalizeOpt(options.fallbackRelayUrl)
+          : configuredEnv && configuredEnv !== localRelay
+            ? configuredEnv
+            : null;
+      return {
+        primaryRelayUrl: localRelay,
+        fallbackRelayUrl: fallback,
+      };
+    }
+  }
+
+  return {
+    primaryRelayUrl: configuredEnv,
+    fallbackRelayUrl:
+      options?.fallbackRelayUrl !== undefined ? normalizeOpt(options.fallbackRelayUrl) : null,
+  };
+}
+
+/**
+ * Parses `VITE_MP_TURN_URLS` (comma/semicolon/whitespace separated `turn:`/`turns:`/`stun:` URLs)
+ * plus optional `VITE_MP_TURN_USERNAME` and `VITE_MP_TURN_CREDENTIAL` alongside `DEFAULT_PUBLIC_ICE_SERVERS`.
+ */
+export function parseConfiguredIceServers(
+  envOverride?: Record<string, unknown>
+): RTCIceServer[] {
+  const servers: RTCIceServer[] = DEFAULT_PUBLIC_ICE_SERVERS.map((s) => ({ ...s }));
+  const seenStun = new Set<string>(
+    DEFAULT_PUBLIC_ICE_SERVERS.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]))
+  );
+
+  const env = envOverride ?? readViteMetaEnv();
+  const rawUrls = typeof env?.VITE_MP_TURN_URLS === 'string' ? env.VITE_MP_TURN_URLS.trim() : '';
+  if (!rawUrls) {
+    return servers;
+  }
+
+  const tokens = rawUrls
+    .split(/[,;\s]+/)
+    .map((u) => u.trim())
+    .filter((u) => /^(stuns?|turns?):/i.test(u));
+
+  const stunUrls: string[] = [];
+  const turnUrls: string[] = [];
+  for (const u of tokens) {
+    if (/^turns?:/i.test(u)) {
+      turnUrls.push(u);
+    } else if (!seenStun.has(u)) {
+      seenStun.add(u);
+      stunUrls.push(u);
+    }
+  }
+
+  for (const sUrl of stunUrls) {
+    servers.push({ urls: sUrl });
+  }
+
+  const username =
+    typeof env?.VITE_MP_TURN_USERNAME === 'string' ? env.VITE_MP_TURN_USERNAME.trim() : '';
+  const credential =
+    typeof env?.VITE_MP_TURN_CREDENTIAL === 'string' ? env.VITE_MP_TURN_CREDENTIAL.trim() : '';
+
+  // W3C WebRTC §4.2.2 requires TURN/TURNS entries to supply both `username` and `credential`
+  if (turnUrls.length > 0 && username.length > 0 && credential.length > 0) {
+    servers.push({
+      urls: turnUrls.length === 1 ? turnUrls[0] : turnUrls,
+      username,
+      credential,
+    });
+  }
+
+  return servers;
+}
+
+export function deriveRelayIceEndpointUrl(
+  relayBaseUrl: string | null,
+  explicitIceUrl?: string | null,
+  envOverride?: Record<string, unknown>
+): string | null {
+  if (typeof explicitIceUrl === 'string' && explicitIceUrl.trim().length > 0) {
+    return explicitIceUrl.trim();
+  }
+  const env = envOverride ?? readViteMetaEnv();
+  const envIce = env?.VITE_MP_ICE_URL;
+  if (typeof envIce === 'string' && envIce.trim().length > 0) {
+    return envIce.trim();
+  }
+  if (!relayBaseUrl) return null;
+  try {
+    const u = new URL(relayBaseUrl);
+    u.protocol = u.protocol === 'wss:' || u.protocol === 'https:' ? 'https:' : 'http:';
+    u.pathname = '/__vitrail_mp/ice';
+    u.search = '';
+    return u.toString();
+  } catch {
     return null;
   }
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/__vitrail_mp`;
+}
+
+export type MinimalFetchFn = (
+  url: string,
+  init?: RequestInit
+) => Promise<{ ok: boolean; json: () => Promise<unknown> }>;
+
+export async function fetchDynamicTurnIceServers(
+  iceEndpointUrl: string,
+  timeoutMsOrFetch: number | MinimalFetchFn = 1200,
+  timeoutMsOverride: number = 1200
+): Promise<RTCIceServer[]> {
+  const customFetch = typeof timeoutMsOrFetch === 'function' ? timeoutMsOrFetch : null;
+  const timeoutMs =
+    typeof timeoutMsOrFetch === 'number' ? timeoutMsOrFetch : timeoutMsOverride;
+  const fetchFn: MinimalFetchFn | null =
+    customFetch ??
+    (typeof fetch === 'function' ? (fetch.bind(globalThis) as MinimalFetchFn) : null);
+  if (!fetchFn) return [];
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {
+          // Ignore
+        }
+      }, timeoutMs)
+    : null;
+  try {
+    const res = await fetchFn(iceEndpointUrl, {
+      method: 'GET',
+      signal: controller?.signal,
+    });
+    if (!res.ok) return [];
+    const payload = (await res.json()) as {
+      iceServers?: RTCIceServer[];
+      urls?: string | string[];
+      username?: string;
+      credential?: string;
+    };
+    const candidates: RTCIceServer[] = Array.isArray(payload.iceServers)
+      ? payload.iceServers
+      : payload.urls
+        ? [
+            {
+              urls: payload.urls,
+              username: payload.username,
+              credential: payload.credential,
+            },
+          ]
+        : [];
+    return candidates.filter((entry) => {
+      if (!entry || !entry.urls) return false;
+      const list = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
+      const hasTurn = list.some((u) => typeof u === 'string' && /^turns?:/i.test(u));
+      if (hasTurn) {
+        return (
+          typeof entry.username === 'string' &&
+          entry.username.length > 0 &&
+          typeof entry.credential === 'string' &&
+          entry.credential.length > 0
+        );
+      }
+      return list.length > 0;
+    });
+  } catch {
+    return [];
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }
 
 function buildRelayRoomSocketUrl(
@@ -172,6 +487,10 @@ export class VitrailMultiplayerClient {
   private relayConnected: boolean = false;
   private relayPeerPresent: boolean = false;
   private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private primaryRelayBaseUrl: string | null = null;
+  private fallbackRelayBaseUrl: string | null = null;
+  private activeRelayBaseUrl: string | null = null;
+  private forcedRelayMode: boolean = false;
 
   // PeerJS public signaling WebSocket state
   private peerJsWs: WebSocket | null = null;
@@ -183,11 +502,17 @@ export class VitrailMultiplayerClient {
   private peerJsHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private peerJsOfferRetryTimer: ReturnType<typeof setInterval> | null = null;
   private peerJsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private peerJsFallbackDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 
   // WebRTC RTCPeerConnection + Dual DataChannels
   private pc: RTCPeerConnection | null = null;
   private ctrlChannel: RTCDataChannel | null = null;
   private stateChannel: RTCDataChannel | null = null;
+  private webrtcHandshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly webrtcHandshakeTimeoutMs: number;
+  private webrtcUpgradeSuppressed: boolean = false;
+  private lastFailoverReason: string = '';
+  private resolvedIceServers: RTCIceServer[];
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private activeConnectionId: string = '';
   private remoteClientId: string | null = null;
@@ -211,6 +536,44 @@ export class VitrailMultiplayerClient {
       this.role === 'host'
         ? this.hostTargetPeerId
         : `vitrail-v1-${this.roomCode}-g-${randomAlphaNum(6)}`;
+
+    this.forcedRelayMode = isForcedRelayEnabled(options);
+    const endpoints = resolveRelayEndpoints(options);
+    this.primaryRelayBaseUrl = endpoints.primaryRelayUrl;
+    this.fallbackRelayBaseUrl = endpoints.fallbackRelayUrl;
+
+    const rawTimeout = options.webrtcHandshakeTimeoutMs ?? DEFAULT_WEBRTC_HANDSHAKE_TIMEOUT_MS;
+    this.webrtcHandshakeTimeoutMs = Math.max(50, Math.min(3200, Math.round(rawTimeout)));
+
+    this.resolvedIceServers = options.iceServers
+      ? options.iceServers.map((s) => ({ ...s }))
+      : parseConfiguredIceServers();
+  }
+
+  public isForcedRelay(): boolean {
+    return this.forcedRelayMode;
+  }
+
+  public getResolvedIceServers(): ReadonlyArray<RTCIceServer> {
+    return this.resolvedIceServers;
+  }
+
+  private canUpgradeWebRtc(): boolean {
+    if (this.forcedRelayMode || this.webrtcUpgradeSuppressed) {
+      return false;
+    }
+    return (this.options.enableWebRtcUpgrade ?? true) && typeof RTCPeerConnection !== 'undefined';
+  }
+
+  private isPeerJsAllowed(): boolean {
+    if (this.forcedRelayMode) {
+      return false;
+    }
+    if (this.options.enablePeerJsFallback !== undefined) {
+      return Boolean(this.options.enablePeerJsFallback);
+    }
+    const explicitRelay = this.options.relayUrl;
+    return explicitRelay === undefined || explicitRelay === null;
   }
 
   public getStatus(): MultiplayerStatusSnapshot {
@@ -230,17 +593,42 @@ export class VitrailMultiplayerClient {
   public connect(): void {
     if (this.disposed) return;
     this.errorMessage = null;
+    this.webrtcUpgradeSuppressed = false;
     this.updateStatus(this.role === 'host' ? 'waiting_peer' : 'connecting');
 
-    const explicitRelay = this.options.relayUrl;
-    const autoRelay = explicitRelay !== undefined ? explicitRelay : resolveAutoRelayUrl();
-    const allowPeerJs =
-      this.options.enablePeerJsFallback ?? (explicitRelay === undefined || explicitRelay === null);
+    const primaryRelay = this.primaryRelayBaseUrl;
+    const secondaryRelay = this.fallbackRelayBaseUrl;
+    const allowPeerJs = this.isPeerJsAllowed();
 
-    if (autoRelay) {
-      this.connectRelaySocket(autoRelay, allowPeerJs);
+    // Non-blocking dynamic TURN credential probe when an explicit ICE endpoint or unauthenticated TURN env is configured
+    if (!this.options.iceServers && !this.forcedRelayMode) {
+      const env = readViteMetaEnv();
+      const shouldProbeIce =
+        Boolean(this.options.iceEndpointUrl) ||
+        Boolean(env?.VITE_MP_ICE_URL) ||
+        Boolean(env?.VITE_MP_TURN_URLS && (!env?.VITE_MP_TURN_USERNAME || !env?.VITE_MP_TURN_CREDENTIAL));
+      if (shouldProbeIce) {
+        const iceUrl = deriveRelayIceEndpointUrl(
+          primaryRelay ?? secondaryRelay,
+          this.options.iceEndpointUrl,
+          env
+        );
+        if (iceUrl) {
+          void fetchDynamicTurnIceServers(iceUrl).then((extra) => {
+            if (!this.disposed && extra.length > 0) {
+              this.resolvedIceServers = [...this.resolvedIceServers, ...extra];
+            }
+          });
+        }
+      }
+    }
+
+    if (primaryRelay) {
+      this.connectRelaySocket(primaryRelay, allowPeerJs, secondaryRelay);
     } else if (allowPeerJs) {
       this.connectPeerJsSignaling();
+    } else if (secondaryRelay) {
+      this.connectRelaySocket(secondaryRelay, false, null);
     } else {
       this.errorMessage = 'No multiplayer relay or signaling endpoint configured.';
       this.updateStatus('error');
@@ -301,6 +689,7 @@ export class VitrailMultiplayerClient {
     const relayReady = this.relayConnected && this.relayPeerPresent;
     const nowConnected = p2pReady || relayReady;
 
+    const prevTransport = this.transport;
     this.transport = p2pReady ? 'webrtc-p2p' : relayReady ? 'ws-relay' : 'none';
 
     const wasConnected = this.peerConnected;
@@ -330,6 +719,18 @@ export class VitrailMultiplayerClient {
       });
       this.sendPing();
       this.options.onPeerConnected?.();
+    } else if (wasConnected && nowConnected && prevTransport === 'webrtc-p2p' && this.transport === 'ws-relay') {
+      // Seamless transport downgrade (`webrtc-p2p -> ws-relay`) while `relayReady` stayed true:
+      // Immediately announce presence and trigger full state/audio resync with zero interruption!
+      this.sendControl({
+        type: 'hello',
+        protocol: 1,
+        role: this.role,
+        clientId: this.clientId,
+        roomCode: this.roomCode,
+      });
+      this.sendPing();
+      this.options.onTransportFailover?.('ws-relay', this.lastFailoverReason || 'webrtc-downgrade');
     } else if (wasConnected && !nowConnected) {
       this.options.onPeerDisconnected?.();
     }
@@ -339,9 +740,36 @@ export class VitrailMultiplayerClient {
   // 1. WebSocket Room Relay (`/___vitrail_mp` & Cloudflare Durable Object Relay)
   // ============================================================================
 
-  private connectRelaySocket(baseUrl: string, fallbackToPeerJsOnError: boolean): void {
+  private getPreferredFallbackRelayUrl(): string | null {
+    return this.activeRelayBaseUrl ?? this.fallbackRelayBaseUrl ?? this.primaryRelayBaseUrl;
+  }
+
+  private ensureRelaySocketConnectedImmediate(): void {
+    if (this.disposed || typeof WebSocket === 'undefined') return;
+    if (this.relayWs && (this.relayWs.readyState === WebSocket.OPEN || this.relayWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const targetUrl = this.getPreferredFallbackRelayUrl();
+    if (!targetUrl) return;
+    if (this.relayReconnectTimer !== null) {
+      clearTimeout(this.relayReconnectTimer);
+      this.relayReconnectTimer = null;
+    }
+    this.connectRelaySocket(
+      targetUrl,
+      false,
+      targetUrl === this.primaryRelayBaseUrl ? this.fallbackRelayBaseUrl : null
+    );
+  }
+
+  private connectRelaySocket(
+    baseUrl: string,
+    fallbackToPeerJsOnError: boolean,
+    nextFallbackRelayUrl: string | null = null
+  ): void {
     if (this.disposed || typeof WebSocket === 'undefined') return;
     this.cleanupRelaySocket();
+    this.activeRelayBaseUrl = baseUrl;
 
     const wsUrl = buildRelayRoomSocketUrl(baseUrl, this.roomCode, this.role, this.clientId);
     let openedOnce = false;
@@ -349,7 +777,9 @@ export class VitrailMultiplayerClient {
     try {
       ws = new WebSocket(wsUrl);
     } catch {
-      if (fallbackToPeerJsOnError) {
+      if (nextFallbackRelayUrl && nextFallbackRelayUrl !== baseUrl) {
+        this.connectRelaySocket(nextFallbackRelayUrl, fallbackToPeerJsOnError, null);
+      } else if (fallbackToPeerJsOnError) {
         this.connectPeerJsSignaling();
       } else {
         this.errorMessage = 'Failed to open WebSocket room relay.';
@@ -386,8 +816,14 @@ export class VitrailMultiplayerClient {
 
       if (this.disposed) return;
 
+      if (!openedOnce && nextFallbackRelayUrl && nextFallbackRelayUrl !== baseUrl) {
+        // Localhost static preview without Vite `/__vitrail_mp` -> seamlessly switch to configured Durable Object WS relay!
+        this.connectRelaySocket(nextFallbackRelayUrl, fallbackToPeerJsOnError, null);
+        return;
+      }
+
       if (!openedOnce && fallbackToPeerJsOnError && !this.peerJsWs) {
-        // Same-origin static host without `/__vitrail_mp` -> seamlessly switch to public PeerJS P2P!
+        // Static host without relay -> switch to public PeerJS P2P!
         this.connectPeerJsSignaling();
         return;
       }
@@ -396,9 +832,9 @@ export class VitrailMultiplayerClient {
         this.relayReconnectTimer = setTimeout(() => {
           this.relayReconnectTimer = null;
           if (!this.disposed) {
-            this.connectRelaySocket(baseUrl, fallbackToPeerJsOnError);
+            this.connectRelaySocket(baseUrl, fallbackToPeerJsOnError, null);
           }
-        }, 1200);
+        }, 600);
       } else if (!fallbackToPeerJsOnError) {
         this.errorMessage = 'Room relay connection closed.';
         this.updateStatus('error');
@@ -419,9 +855,9 @@ export class VitrailMultiplayerClient {
       if (
         peerHere &&
         this.role === 'guest' &&
-        (this.options.enableWebRtcUpgrade ?? true) &&
-        typeof RTCPeerConnection !== 'undefined' &&
-        this.ctrlChannel?.readyState !== 'open'
+        this.canUpgradeWebRtc() &&
+        this.ctrlChannel?.readyState !== 'open' &&
+        !this.pc
       ) {
         void this.initiateWebRtcOffer('relay');
       }
@@ -431,14 +867,11 @@ export class VitrailMultiplayerClient {
       if (meta.role && meta.role !== this.role) {
         // Tear down any orphaned WebRTC DataChannel from a previous peer tab session before resyncing
         this.closePeerConnection();
+        this.webrtcUpgradeSuppressed = false;
         this.remoteClientId = null;
         this.relayPeerPresent = true;
         this.updateStatus();
-        if (
-          this.role === 'guest' &&
-          (this.options.enableWebRtcUpgrade ?? true) &&
-          typeof RTCPeerConnection !== 'undefined'
-        ) {
+        if (this.role === 'guest' && this.canUpgradeWebRtc()) {
           void this.initiateWebRtcOffer('relay');
         }
       }
@@ -459,8 +892,17 @@ export class VitrailMultiplayerClient {
   // ============================================================================
 
   private connectPeerJsSignaling(): void {
-    if (this.disposed || typeof WebSocket === 'undefined') return;
+    if (this.disposed || typeof WebSocket === 'undefined' || this.forcedRelayMode) return;
     this.cleanupPeerJsSocket();
+
+    const fallbackRelay = this.getPreferredFallbackRelayUrl();
+    if (fallbackRelay) {
+      this.peerJsFallbackDeadlineTimer = setTimeout(() => {
+        this.peerJsFallbackDeadlineTimer = null;
+        if (this.disposed || this.ctrlChannel?.readyState === 'open') return;
+        this.handleWebRtcDisconnectOrFailover('peerjs-handshake-timeout');
+      }, this.webrtcHandshakeTimeoutMs);
+    }
 
     const baseUrl = this.options.peerJsUrl || DEFAULT_PEERJS_SIGNAL_URL;
     const wsUrl = buildPeerJsSocketUrl(baseUrl, this.localPeerId, this.peerJsToken);
@@ -469,8 +911,12 @@ export class VitrailMultiplayerClient {
     try {
       ws = new WebSocket(wsUrl);
     } catch {
-      this.errorMessage = 'Unable to reach public signaling server.';
-      this.updateStatus('error');
+      if (fallbackRelay) {
+        this.ensureRelaySocketConnectedImmediate();
+      } else {
+        this.errorMessage = 'Unable to reach public signaling server.';
+        this.updateStatus('error');
+      }
       return;
     }
 
@@ -514,7 +960,12 @@ export class VitrailMultiplayerClient {
       }
       if (this.disposed) return;
 
-      if (this.connectionState !== 'error') {
+      if (this.ctrlChannel?.readyState !== 'open' && this.getPreferredFallbackRelayUrl()) {
+        this.ensureRelaySocketConnectedImmediate();
+        return;
+      }
+
+      if (this.connectionState !== 'error' && !this.forcedRelayMode && !this.webrtcUpgradeSuppressed) {
         this.peerJsReconnectTimer = setTimeout(() => {
           this.peerJsReconnectTimer = null;
           if (!this.disposed) {
@@ -530,13 +981,24 @@ export class VitrailMultiplayerClient {
       case 'OPEN': {
         this.peerJsOpen = true;
         this.updateStatus();
-        if (this.role === 'guest' && this.ctrlChannel?.readyState !== 'open') {
+        if (
+          this.role === 'guest' &&
+          this.ctrlChannel?.readyState !== 'open' &&
+          this.canUpgradeWebRtc()
+        ) {
           void this.initiateWebRtcOffer('peerjs');
           if (this.peerJsOfferRetryTimer !== null) {
             clearInterval(this.peerJsOfferRetryTimer);
           }
+          const retryCadenceMs = this.getPreferredFallbackRelayUrl()
+            ? Math.max(this.webrtcHandshakeTimeoutMs + 400, 2600)
+            : 2600;
           this.peerJsOfferRetryTimer = setInterval(() => {
-            if (this.disposed || this.ctrlChannel?.readyState === 'open') {
+            if (
+              this.disposed ||
+              this.ctrlChannel?.readyState === 'open' ||
+              !this.canUpgradeWebRtc()
+            ) {
               if (this.peerJsOfferRetryTimer !== null) {
                 clearInterval(this.peerJsOfferRetryTimer);
                 this.peerJsOfferRetryTimer = null;
@@ -546,7 +1008,7 @@ export class VitrailMultiplayerClient {
             if (this.peerJsOpen) {
               void this.initiateWebRtcOffer('peerjs');
             }
-          }, 2600);
+          }, retryCadenceMs);
         }
         break;
       }
@@ -562,7 +1024,7 @@ export class VitrailMultiplayerClient {
         break;
       }
       case 'OFFER': {
-        if (this.role === 'host' && msg.src && msg.payload?.sdp) {
+        if (this.role === 'host' && msg.src && msg.payload?.sdp && this.canUpgradeWebRtc()) {
           this.remoteGuestPeerId = msg.src;
           this.activeConnectionId = msg.payload.connectionId ?? `dc_${randomAlphaNum(8)}`;
           void this.acceptWebRtcOffer(msg.payload.sdp, 'peerjs', msg.src);
@@ -582,22 +1044,53 @@ export class VitrailMultiplayerClient {
         break;
       }
       case 'EXPIRE': {
-        // Host has not opened room yet or hasn't answered yet; retry timer handles re-offer cleanly
+        // Host has not opened room yet or hasn't answered yet; retry or fallback deadline handles cleanly
         break;
       }
       case 'LEAVE': {
         if (msg.src && (msg.src === this.remoteGuestPeerId || msg.src === this.hostTargetPeerId)) {
-          this.closePeerConnection();
-          this.updateStatus();
+          this.handleWebRtcDisconnectOrFailover('peerjs-leave');
         }
         break;
       }
       case 'ERROR': {
-        this.errorMessage = msg.payload?.msg ?? 'Signaling error';
-        this.updateStatus('error');
+        if (this.getPreferredFallbackRelayUrl()) {
+          this.handleWebRtcDisconnectOrFailover('peerjs-error');
+        } else {
+          this.errorMessage = msg.payload?.msg ?? 'Signaling error';
+          this.updateStatus('error');
+        }
         break;
       }
     }
+  }
+
+  private handleWebRtcDisconnectOrFailover(reason: string): void {
+    if (this.disposed) return;
+    this.lastFailoverReason = reason;
+    if (
+      reason.startsWith('ice-') ||
+      reason.startsWith('pc-') ||
+      reason.includes('timeout') ||
+      reason.includes('error') ||
+      reason.includes('close') ||
+      reason.includes('throw')
+    ) {
+      if (this.getPreferredFallbackRelayUrl() || this.relayConnected) {
+        this.webrtcUpgradeSuppressed = true;
+      }
+    }
+    if (this.peerJsOfferRetryTimer !== null) {
+      clearInterval(this.peerJsOfferRetryTimer);
+      this.peerJsOfferRetryTimer = null;
+    }
+    if (this.peerJsFallbackDeadlineTimer !== null) {
+      clearTimeout(this.peerJsFallbackDeadlineTimer);
+      this.peerJsFallbackDeadlineTimer = null;
+    }
+    this.closePeerConnection();
+    this.ensureRelaySocketConnectedImmediate();
+    this.updateStatus();
   }
 
   private createFreshPeerConnection(
@@ -609,9 +1102,19 @@ export class VitrailMultiplayerClient {
     this.pcRemoteClientId = this.remoteClientId;
 
     const pc = new RTCPeerConnection({
-      iceServers: this.options.iceServers ?? DEFAULT_PUBLIC_ICE_SERVERS,
+      iceServers: this.resolvedIceServers,
     });
     this.pc = pc;
+
+    // Enforce strict <= 3.2 s ICE/DataChannel open deadline so stalled symmetric-NAT handshakes
+    // tear down `pc` and guarantee <= 4.0 s fallback to the WebSocket room relay.
+    this.webrtcHandshakeTimer = setTimeout(() => {
+      if (this.disposed || this.pc !== pc) return;
+      this.webrtcHandshakeTimer = null;
+      if (this.ctrlChannel?.readyState !== 'open') {
+        this.handleWebRtcDisconnectOrFailover('ice-handshake-timeout');
+      }
+    }, this.webrtcHandshakeTimeoutMs);
 
     const ctrl = pc.createDataChannel('ctrl', {
       negotiated: true,
@@ -632,6 +1135,14 @@ export class VitrailMultiplayerClient {
 
     ctrl.onopen = () => {
       if (this.disposed || this.ctrlChannel !== ctrl) return;
+      if (this.webrtcHandshakeTimer !== null) {
+        clearTimeout(this.webrtcHandshakeTimer);
+        this.webrtcHandshakeTimer = null;
+      }
+      if (this.peerJsFallbackDeadlineTimer !== null) {
+        clearTimeout(this.peerJsFallbackDeadlineTimer);
+        this.peerJsFallbackDeadlineTimer = null;
+      }
       if (this.peerJsOfferRetryTimer !== null) {
         clearInterval(this.peerJsOfferRetryTimer);
         this.peerJsOfferRetryTimer = null;
@@ -645,13 +1156,28 @@ export class VitrailMultiplayerClient {
     };
 
     ctrl.onclose = () => {
-      if (this.ctrlChannel !== ctrl) return;
-      this.updateStatus();
+      if (this.disposed || this.ctrlChannel !== ctrl) return;
+      this.handleWebRtcDisconnectOrFailover('ctrl-close');
+    };
+
+    ctrl.onerror = () => {
+      if (this.disposed || this.ctrlChannel !== ctrl) return;
+      this.handleWebRtcDisconnectOrFailover('ctrl-error');
     };
 
     state.onmessage = (ev: MessageEvent) => {
       if (this.disposed || this.stateChannel !== state) return;
       this.handleIncomingTransportPayload(ev.data, 'webrtc');
+    };
+
+    state.onclose = () => {
+      if (this.disposed || this.stateChannel !== state) return;
+      this.handleWebRtcDisconnectOrFailover('state-close');
+    };
+
+    state.onerror = () => {
+      if (this.disposed || this.stateChannel !== state) return;
+      this.handleWebRtcDisconnectOrFailover('state-error');
     };
 
     pc.onicecandidate = (ev: RTCPeerConnectionIceEvent) => {
@@ -693,8 +1219,7 @@ export class VitrailMultiplayerClient {
         pc.connectionState === 'disconnected' ||
         pc.connectionState === 'closed'
       ) {
-        this.closePeerConnection();
-        this.updateStatus();
+        this.handleWebRtcDisconnectOrFailover(`pc-${pc.connectionState}`);
       }
     };
 
@@ -705,8 +1230,7 @@ export class VitrailMultiplayerClient {
         pc.iceConnectionState === 'disconnected' ||
         pc.iceConnectionState === 'closed'
       ) {
-        this.closePeerConnection();
-        this.updateStatus();
+        this.handleWebRtcDisconnectOrFailover(`ice-${pc.iceConnectionState}`);
       }
     };
 
@@ -714,7 +1238,7 @@ export class VitrailMultiplayerClient {
   }
 
   private async initiateWebRtcOffer(via: 'peerjs' | 'relay'): Promise<void> {
-    if (this.disposed || typeof RTCPeerConnection === 'undefined') return;
+    if (this.disposed || !this.canUpgradeWebRtc()) return;
     try {
       this.activeConnectionId = `dc_${randomAlphaNum(8)}`;
       const pc = this.createFreshPeerConnection(via, this.hostTargetPeerId);
@@ -765,7 +1289,7 @@ export class VitrailMultiplayerClient {
     via: 'peerjs' | 'relay',
     peerJsSrc?: string
   ): Promise<void> {
-    if (this.disposed || typeof RTCPeerConnection === 'undefined') return;
+    if (this.disposed || !this.canUpgradeWebRtc()) return;
     try {
       const pc = this.createFreshPeerConnection(via, peerJsSrc);
       await pc.setRemoteDescription(offer);
@@ -891,7 +1415,7 @@ export class VitrailMultiplayerClient {
     }
 
     if (parsed.type === 'rtc_signal' && source === 'relay') {
-      if (parsed.from === this.role) return;
+      if (parsed.from === this.role || !this.canUpgradeWebRtc()) return;
       if (parsed.signalType === 'offer' && this.role === 'host' && parsed.sdp) {
         void this.acceptWebRtcOffer(parsed.sdp, 'relay');
       } else if (parsed.signalType === 'answer' && this.role === 'guest' && parsed.sdp) {
@@ -926,6 +1450,7 @@ export class VitrailMultiplayerClient {
           this.relayPeerPresent = false;
         }
         this.updateStatus();
+        this.options.onRemotePeerBye?.(parsed.clientId);
       } else if (this.pcRemoteClientId === parsed.clientId) {
         this.closePeerConnection();
         this.updateStatus();
@@ -936,6 +1461,9 @@ export class VitrailMultiplayerClient {
     if (parsed.type === 'hello') {
       if (parsed.role !== this.role) {
         const prevClientId = this.remoteClientId;
+        if (prevClientId !== null && prevClientId !== parsed.clientId) {
+          this.webrtcUpgradeSuppressed = false;
+        }
         this.remoteClientId = parsed.clientId;
         if (source === 'webrtc') {
           this.pcRemoteClientId = parsed.clientId;
@@ -977,7 +1505,7 @@ export class VitrailMultiplayerClient {
         this.ctrlChannel.send(raw);
         return true;
       } catch {
-        // Fall through to relay if available
+        this.handleWebRtcDisconnectOrFailover('send-throw');
       }
     }
     if (this.relayWs?.readyState === WebSocket.OPEN) {
@@ -1008,7 +1536,7 @@ export class VitrailMultiplayerClient {
           this.stateChannel.send(buffer);
           return true;
         } catch {
-          // Fall through to relay if available
+          this.handleWebRtcDisconnectOrFailover('send-throw');
         }
       } else {
         return false;
@@ -1050,11 +1578,16 @@ export class VitrailMultiplayerClient {
   }
 
   private closePeerConnection(): void {
+    if (this.webrtcHandshakeTimer !== null) {
+      clearTimeout(this.webrtcHandshakeTimer);
+      this.webrtcHandshakeTimer = null;
+    }
     if (this.ctrlChannel) {
       try {
         this.ctrlChannel.onopen = null;
         this.ctrlChannel.onmessage = null;
         this.ctrlChannel.onclose = null;
+        this.ctrlChannel.onerror = null;
         this.ctrlChannel.close();
       } catch {
         // Ignore
@@ -1064,6 +1597,8 @@ export class VitrailMultiplayerClient {
     if (this.stateChannel) {
       try {
         this.stateChannel.onmessage = null;
+        this.stateChannel.onclose = null;
+        this.stateChannel.onerror = null;
         this.stateChannel.close();
       } catch {
         // Ignore
@@ -1107,6 +1642,10 @@ export class VitrailMultiplayerClient {
   }
 
   private cleanupPeerJsSocket(): void {
+    if (this.peerJsFallbackDeadlineTimer !== null) {
+      clearTimeout(this.peerJsFallbackDeadlineTimer);
+      this.peerJsFallbackDeadlineTimer = null;
+    }
     if (this.peerJsReconnectTimer !== null) {
       clearTimeout(this.peerJsReconnectTimer);
       this.peerJsReconnectTimer = null;

@@ -167,10 +167,13 @@ export type MultiplayerControlMessage =
       collapseReason: string | null;
       activeShardMetas: SerializedShardMeta[];
       retiredShardIds: number[];
+      minSnapshotSeq?: number;
+      currentAudioBatchSeq?: number;
     }
   | {
       type: 'request_resync';
       lastSeq: number;
+      lastAudioBatchSeq?: number;
     }
   | {
       type: 'shard_spawn';
@@ -183,11 +186,14 @@ export type MultiplayerControlMessage =
     }
   | {
       type: 'audio_batch';
+      batchSeq?: number;
+      roomSeed?: number;
       events: NetworkAudioEvent[];
     }
   | {
       type: 'guest_cmd';
       seq: number;
+      roomSeed?: number;
       cmd: GuestRemoteCommand;
     }
   | {
