@@ -1,10 +1,21 @@
 import { ensureMujocoInitialized } from './mujocoRuntime';
-import { BlockCriticalityCandidate, MujocoPhysicsEngine } from './MujocoPhysicsEngine';
+import {
+  AdversarialPlacementPlan,
+  BlockCriticalityCandidate,
+  MujocoPhysicsEngine,
+  SceneRaycastHit,
+  SceneRaycastOptions,
+} from './MujocoPhysicsEngine';
 import { INITIAL_LAYERS, TraceryMotif } from './constants';
 import { Quat, Vec3 } from '../math/vecMat';
 import { GlassAudioEngine } from '../audio/GlassAudioEngine';
 
-export type { BlockCriticalityCandidate };
+export type {
+  AdversarialPlacementPlan,
+  BlockCriticalityCandidate,
+  SceneRaycastHit,
+  SceneRaycastOptions,
+};
 
 export type GameMode = 'solo' | 'party' | 'sandbox';
 

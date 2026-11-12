@@ -25,6 +25,10 @@ export interface MujocoCalibratedConfig {
   readonly impratio: number;
   /** MuJoCo 4.0 native island sleep tolerance */
   readonly sleepTolerance: number;
+  /** MuJoCo 4.0 time integrator (`'implicitfast'` provides unconditionally L-stable rotational shard damping) */
+  readonly integrator?: 'Euler' | 'implicitfast';
+  /** Passive implicit rotational damping rate `b_rot / I_eff` (1/s) applied to active Voronoi shards under `implicitfast` */
+  readonly shardRotationalDampingRate?: number;
 
   /** Block-on-block polished cathedral soda-lime glass static friction: `[sliding, torsional_m, rolling_m]` */
   readonly glassFriction: readonly [number, number, number];
@@ -74,6 +78,8 @@ export const MUJOCO_CALIBRATED_CONFIG: MujocoCalibratedConfig = {
   lsIterations: 12,
   impratio: 4.5,
   sleepTolerance: 0.003,
+  integrator: 'Euler',
+  shardRotationalDampingRate: 1.8,
 
   // Elliptic condim=4/6 glass-on-glass & glass-on-oak tribology:
   // torsional radius ~3.6 mm (`0.0036 m`) resists off-axis block spin even on 1 bevel edge,

@@ -28,6 +28,7 @@ function getOptimalThreadCount(): number {
     typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
       ? navigator.hardwareConcurrency
       : 6;
+  if (hw <= 2) return 1;
   // 4 WASM pthreads hits the sweet spot on Apple Silicon iPad Pro / Mac without pthread barrier contention
   return Math.max(2, Math.min(4, hw - 2));
 }
@@ -45,12 +46,12 @@ export async function ensureMujocoInitialized(
   if (runtimePromise) return runtimePromise;
 
   runtimePromise = (async () => {
-    const useMt = preferMultiThreaded && canUseSharedArrayBuffer();
+    const threadCount = getOptimalThreadCount();
+    const useMt = preferMultiThreaded && canUseSharedArrayBuffer() && threadCount > 1;
     if (useMt) {
       try {
         const mod = await import('@mujoco/mujoco/mt');
         const mj = await mod.default();
-        const threadCount = getOptimalThreadCount();
         loadedRuntime = { mj, mode: 'mt', threadCount };
         return loadedRuntime;
       } catch {

@@ -5,17 +5,20 @@ import {
   BLOCK_HALF_Z,
   BLOCK_HEIGHT,
   BLOCK_WIDTH,
+  STAINED_GLASS_PALETTE,
   TABLE_RADIUS,
   TABLE_THICKNESS,
   TARGET_BLOCK_MASS_KG,
+  TraceryMotif,
 } from './constants';
 import {
   M_PER_DM,
   MUJOCO_CALIBRATED_CONFIG,
   MujocoCalibratedConfig,
 } from './mujocoCalibratedParams';
+import type { GlassBlockState, TopPlacementSlot, TopSupportFrame } from './PhysicsWorld';
 import { fractureBlockVoronoi } from './voronoiFracture';
-import { quatFromAxisAngle, Quat, Vec3 } from '../math/vecMat';
+import { quatFromAxisAngle, quatRotateVec3, Quat, Vec3 } from '../math/vecMat';
 
 /**
  * MuJoCo Collision Bitmasks (`contype` & `conaffinity`):
@@ -47,6 +50,18 @@ export const MJ_CONTYPE_PARKING = 0x10;
 export const MJ_CONAFFINITY_PARKING = 0x10;
 export const MJ_PARKING_SHELF_TOP_Y_M = -50.0;
 
+/**
+ * MuJoCo `geom_group` assignments (`0..5`) for zero-cost C++ BVH filtering in `mj_ray`:
+ * - Group 0: Active intact glass blocks (`g_blk_*`)
+ * - Group 1: Active Voronoi glass shards (`g_shd_*`)
+ * - Group 2: Static oak tabletop (`oak_table`)
+ * - Group 3: Parked pool bodies (`contype === 0`), `parking_shelf`, and duplicate `oak_table_shard`
+ */
+export const MJ_GEOM_GROUP_BLOCK = 0;
+export const MJ_GEOM_GROUP_SHARD = 1;
+export const MJ_GEOM_GROUP_TABLE = 2;
+export const MJ_GEOM_GROUP_PARKED = 3;
+
 export interface InitialBlockSpec {
   id: number;
   layer: number;
@@ -54,6 +69,170 @@ export interface InitialBlockSpec {
   isLoose: boolean;
   posDm: Vec3;
   quat: Quat;
+}
+
+/**
+ * Pure deterministic generator of nominal regulation tower block poses (`7.5 x 2.5 x 1.5 cm` in Vitrail dm).
+ * Shared by `buildMujocoTowerXml` and `MujocoWorkerBridge.rebuildTower` for synchronous nominal state resets.
+ */
+export function computeInitialBlockSpecs(towerLayers: number): InitialBlockSpec[] {
+  const specs: InitialBlockSpec[] = [];
+  let id = 0;
+  for (let layer = 0; layer < towerLayers; layer++) {
+    const isOdd = layer % 2 === 1;
+    const yaw = isOdd ? Math.PI * 0.5 : 0.0;
+    const centerIsLoose = layer % 2 === 0;
+
+    for (let slot = 0; slot < 3; slot++) {
+      const offset = (slot - 1) * BLOCK_WIDTH;
+      const jx = Math.sin(id * 12.9898) * 0.0022;
+      const jz = Math.cos(id * 78.233) * 0.0022;
+      const jYaw = Math.sin(id * 39.17) * 0.0032;
+
+      const pxDm = (isOdd ? offset : 0) + jx;
+      const pyDm = (layer + 0.5) * BLOCK_HEIGHT;
+      const pzDm = (isOdd ? 0 : offset) + jz;
+      const quat = quatFromAxisAngle([0, 1, 0], yaw + jYaw);
+      const isLoose = centerIsLoose ? slot === 1 : slot === (layer % 4 === 1 ? 0 : 2);
+
+      specs.push({
+        id,
+        layer,
+        slot,
+        isLoose,
+        posDm: [pxDm, pyDm, pzDm],
+        quat,
+      });
+      id++;
+    }
+  }
+  return specs;
+}
+
+function mulberry32Tower(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Deterministic generator of nominal `GlassBlockState[]` matching `MujocoPhysicsEngine.rebuildTower`
+ * bit-for-bit (`mulberry32` palette, motif, rippleSeed, loose-slot pattern, and poses).
+ */
+export function buildNominalGlassBlocks(
+  towerLayers: number,
+  towerSeed: number,
+  glassStaticFriction: number = MUJOCO_CALIBRATED_CONFIG.glassFriction[0],
+  specs: InitialBlockSpec[] = computeInitialBlockSpecs(towerLayers),
+  blockBodyIds?: Int32Array,
+  blockGeomIds?: Int32Array
+): GlassBlockState[] {
+  const paletteLen = STAINED_GLASS_PALETTE.length;
+  const normSeed = towerSeed >>> 0;
+  const seedRng =
+    normSeed !== 0
+      ? mulberry32Tower((normSeed ^ Math.imul(towerLayers, 0x9e3779b9)) >>> 0)
+      : null;
+  let prevRowSwatch0 = -1;
+  let prevRowSwatch1 = -1;
+
+  const blocks: GlassBlockState[] = new Array(specs.length);
+  for (let i = 0; i < specs.length; i++) {
+    const spec = specs[i];
+    const bodyId = blockBodyIds ? blockBodyIds[spec.id] : 0;
+    const geomId = blockGeomIds ? blockGeomIds[spec.id] : 0;
+    let swatchId: number;
+    let motif: TraceryMotif;
+    let rippleSeed: number;
+    if (seedRng) {
+      if (spec.slot === 0) {
+        prevRowSwatch0 = -1;
+        prevRowSwatch1 = -1;
+      }
+      swatchId = Math.floor(seedRng() * paletteLen) % paletteLen;
+      if (spec.slot === 2 && swatchId === prevRowSwatch0 && swatchId === prevRowSwatch1) {
+        swatchId = (swatchId + 1) % paletteLen;
+      }
+      if (spec.slot === 0) prevRowSwatch0 = swatchId;
+      if (spec.slot === 1) prevRowSwatch1 = swatchId;
+      motif = (Math.floor(seedRng() * 4) & 3) as TraceryMotif;
+      rippleSeed = +(0.25 + seedRng() * 96.0).toFixed(5);
+    } else {
+      swatchId = (spec.layer * 3 + spec.slot * 2 + Math.floor(spec.layer / 2)) % paletteLen;
+      motif = 0;
+      rippleSeed = (spec.id + 1) * 1.6180339;
+    }
+
+    blocks[i] = {
+      id: spec.id,
+      bodyHandle: bodyId,
+      colliderHandle: geomId,
+      swatchId,
+      motif,
+      rippleSeed,
+      initialLayer: spec.layer,
+      assignedLayer: spec.layer,
+      assignedSlot: spec.slot,
+      isLooseSlot: spec.isLoose,
+      position: [...spec.posDm],
+      rotation: [...spec.quat],
+      prePos: [...spec.posDm],
+      preQuat: [...spec.quat],
+      linVel: [0, 0, 0],
+      angVel: [0, 0, 0],
+      currentFriction: glassStaticFriction,
+      isMicroDamped: false,
+      damage: 0,
+      crackLocalOrigin: [0, 0, 0],
+      shattered: false,
+      extracted: false,
+      isLegalTarget: spec.layer < towerLayers - 1,
+    };
+  }
+  return blocks;
+}
+
+/**
+ * Deterministic generator of nominal `topSupportFrame` and `openTopSlots` for a freshly built `towerLayers` stack.
+ */
+export function buildNominalTopSupportFrameAndSlots(towerLayers: number): {
+  topSupportFrame: TopSupportFrame;
+  openTopSlots: TopPlacementSlot[];
+} {
+  const targetLayer = Math.max(1, Math.min(32, Math.round(towerLayers)));
+  const isOdd = targetLayer % 2 === 1;
+  const yawRad = isOdd ? Math.PI * 0.5 : 0.0;
+  const defaultRotation = quatFromAxisAngle([0, 1, 0], yawRad);
+  const lengthAxis = quatRotateVec3(defaultRotation, [1, 0, 0]);
+  const spacingAxis = quatRotateVec3(defaultRotation, [0, 0, 1]);
+  const surfY = targetLayer * BLOCK_HEIGHT;
+  const layerY = surfY + BLOCK_HALF_Y + 0.002;
+  const topSupportFrame: TopSupportFrame = {
+    targetLayer,
+    surfaceCenter: [0, surfY, 0],
+    layerCenter: [0, layerY, 0],
+    upNormal: [0, 1, 0],
+    tiltQuat: [0, 0, 0, 1],
+    defaultYawRad: yawRad,
+    defaultRotation,
+    lengthAxis,
+    spacingAxis,
+  };
+  const openTopSlots: TopPlacementSlot[] = [0, 1, 2].map((slotIndex) => {
+    const uOffset = (slotIndex - 1) * BLOCK_WIDTH;
+    return {
+      layer: targetLayer,
+      slotIndex,
+      position: [spacingAxis[0] * uOffset, layerY, spacingAxis[2] * uOffset],
+      rotation: [...defaultRotation],
+      yawRad,
+    };
+  });
+  return { topSupportFrame, openTopSlots };
 }
 
 export interface MujocoTowerIndexMap {
@@ -249,58 +428,33 @@ export function buildMujocoTowerXml(
   let nextGeomId = 3;
   let nextFreeJointIdx = 0;
 
-  const initialBlocks: InitialBlockSpec[] = [];
+  const initialBlocks = computeInitialBlockSpecs(towerLayers);
   const bodyXmlChunks: string[] = [];
 
-  let id = 0;
-  for (let layer = 0; layer < towerLayers; layer++) {
-    const isOdd = layer % 2 === 1;
-    const yaw = isOdd ? Math.PI * 0.5 : 0.0;
-    const centerIsLoose = layer % 2 === 0;
+  for (let i = 0; i < initialBlocks.length; i++) {
+    const spec = initialBlocks[i];
+    const id = spec.id;
+    const meshName = spec.isLoose && spec.layer < towerLayers - 1 ? 'brick_loose' : 'brick_std';
 
-    for (let slot = 0; slot < 3; slot++) {
-      const offset = (slot - 1) * BLOCK_WIDTH;
-      const jx = Math.sin(id * 12.9898) * 0.0022;
-      const jz = Math.cos(id * 78.233) * 0.0022;
-      const jYaw = Math.sin(id * 39.17) * 0.0032;
+    blockBodyIds[id] = nextBodyId++;
+    blockGeomIds[id] = nextGeomId++;
+    blockQposAdr[id] = nextFreeJointIdx * 7;
+    blockDofAdr[id] = nextFreeJointIdx * 6;
+    nextFreeJointIdx++;
 
-      const pxDm = (isOdd ? offset : 0) + jx;
-      const pyDm = (layer + 0.5) * BLOCK_HEIGHT;
-      const pzDm = (isOdd ? 0 : offset) + jz;
-      const quat = quatFromAxisAngle([0, 1, 0], yaw + jYaw);
-      const isLoose = centerIsLoose ? slot === 1 : slot === (layer % 4 === 1 ? 0 : 2);
-      const meshName = isLoose && layer < towerLayers - 1 ? 'brick_loose' : 'brick_std';
+    const pxM = spec.posDm[0] * M_PER_DM;
+    const pyM = spec.posDm[1] * M_PER_DM;
+    const pzM = spec.posDm[2] * M_PER_DM;
+    // MuJoCo quaternion convention is [w, x, y, z]
+    const qStr = `${spec.quat[3].toFixed(7)} ${spec.quat[0].toFixed(7)} ${spec.quat[1].toFixed(7)} ${spec.quat[2].toFixed(7)}`;
 
-      initialBlocks.push({
-        id,
-        layer,
-        slot,
-        isLoose,
-        posDm: [pxDm, pyDm, pzDm],
-        quat,
-      });
-
-      blockBodyIds[id] = nextBodyId++;
-      blockGeomIds[id] = nextGeomId++;
-      blockQposAdr[id] = nextFreeJointIdx * 7;
-      blockDofAdr[id] = nextFreeJointIdx * 6;
-      nextFreeJointIdx++;
-
-      const pxM = pxDm * M_PER_DM;
-      const pyM = pyDm * M_PER_DM;
-      const pzM = pzDm * M_PER_DM;
-      // MuJoCo quaternion convention is [w, x, y, z]
-      const qStr = `${quat[3].toFixed(7)} ${quat[0].toFixed(7)} ${quat[1].toFixed(7)} ${quat[2].toFixed(7)}`;
-
-      bodyXmlChunks.push(
-        `    <body name="blk_${id}" pos="${pxM.toFixed(6)} ${pyM.toFixed(6)} ${pzM.toFixed(6)}" quat="${qStr}">` +
-          `<inertial pos="0 0 0" quat="1 0 0 0" mass="${TARGET_BLOCK_MASS_KG}" diaginertia="${blkIx} ${blkIy} ${blkIz}"/>` +
-          `<freejoint/>` +
-          `<geom name="g_blk_${id}" type="mesh" mesh="${meshName}" condim="4" friction="${fGlass}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_BLOCK}" conaffinity="${MJ_CONAFFINITY_BLOCK_ON_TABLE}"/>` +
-          `</body>`
-      );
-      id++;
-    }
+    bodyXmlChunks.push(
+      `    <body name="blk_${id}" pos="${pxM.toFixed(6)} ${pyM.toFixed(6)} ${pzM.toFixed(6)}" quat="${qStr}">` +
+        `<inertial pos="0 0 0" quat="1 0 0 0" mass="${TARGET_BLOCK_MASS_KG}" diaginertia="${blkIx} ${blkIy} ${blkIz}"/>` +
+        `<freejoint/>` +
+        `<geom name="g_blk_${id}" group="${MJ_GEOM_GROUP_BLOCK}" type="mesh" mesh="${meshName}" condim="4" friction="${fGlass}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_BLOCK}" conaffinity="${MJ_CONAFFINITY_BLOCK_ON_TABLE}"/>` +
+        `</body>`
+    );
   }
 
   // Pre-allocate 512 sleeping Voronoi shard bodies parked on the hidden underground shelf (0 µs step cost while asleep!)
@@ -320,7 +474,7 @@ export function buildMujocoTowerXml(
       `    <body name="shd_${s}" pos="${parkXM.toFixed(4)} ${parkYM.toFixed(4)} ${parkZM.toFixed(4)}" sleep="init">` +
         `<inertial pos="0 0 0" quat="1 0 0 0" mass="0.0045" diaginertia="1e-6 1e-6 1e-6"/>` +
         `<freejoint/>` +
-        `<geom name="g_shd_${s}" type="mesh" mesh="voronoi_arch_${archIdx}" condim="3" friction="${fShard}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
+        `<geom name="g_shd_${s}" group="${MJ_GEOM_GROUP_PARKED}" type="mesh" mesh="voronoi_arch_${archIdx}" condim="3" friction="${fShard}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
         `</body>`
     );
   }
@@ -343,28 +497,29 @@ export function buildMujocoTowerXml(
       `    <body name="ext_${e}" pos="${parkXM.toFixed(4)} ${parkYM.toFixed(4)} ${parkZM.toFixed(4)}" sleep="init">` +
         `<inertial pos="0 0 0" quat="1 0 0 0" mass="0.01" diaginertia="1e-5 1e-5 1e-5"/>` +
         `<freejoint/>` +
-        `<geom name="g_ext_${e}" type="box" size="0.50 0.50 0.50" condim="4" friction="${fGlass}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
+        `<geom name="g_ext_${e}" group="${MJ_GEOM_GROUP_PARKED}" type="box" size="0.50 0.50 0.50" condim="4" friction="${fGlass}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
         `</body>`
     );
   }
 
   const tableHalfSpanM = (TABLE_RADIUS + 0.5) * M_PER_DM;
   const tableHalfThickM = TABLE_THICKNESS * 0.5 * M_PER_DM;
+  const integrator = cfg.integrator ?? 'Euler';
 
   const xml = `<mujoco model="vitrail_mujoco_4">
   <size memory="24M"/>
   <compiler inertiafromgeom="auto" autolimits="true"/>
-  <option timestep="${cfg.timestepSec}" gravity="0 -9.81 0" integrator="Euler" solver="Newton" jacobian="sparse" cone="elliptic" iterations="${cfg.solverIterations}" ls_iterations="${cfg.lsIterations}" impratio="${cfg.impratio}" sleep_tolerance="${cfg.sleepTolerance}">
-    <flag multiccd="enable" sleep="enable" warmstart="enable"/>
+  <option timestep="${cfg.timestepSec}" gravity="0 -9.81 0" integrator="${integrator}" solver="Newton" jacobian="sparse" cone="elliptic" iterations="${cfg.solverIterations}" ls_iterations="${cfg.lsIterations}" impratio="${cfg.impratio}" sleep_tolerance="${cfg.sleepTolerance}">
+    <flag multiccd="enable" sleep="enable" warmstart="enable" energy="enable"/>
   </option>
   <asset>
     <mesh name="brick_std" vertex="${stdBrickVerts}" inertia="exact"/>
     <mesh name="brick_loose" vertex="${looseBrickVerts}" inertia="exact"/>
 ${voronoiBank.xmlAssets}  </asset>
   <worldbody>
-    <geom name="oak_table" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="6" friction="${fTable}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_TABLE}" conaffinity="${MJ_CONAFFINITY_TABLE}"/>
-    <geom name="parking_shelf" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="1" priority="10" solref="0.012 1.25" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
-    <geom name="oak_table_shard" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${solimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
+    <geom name="oak_table" group="${MJ_GEOM_GROUP_TABLE}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="6" friction="${fTable}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_TABLE}" conaffinity="${MJ_CONAFFINITY_TABLE}"/>
+    <geom name="parking_shelf" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="1" priority="10" solref="0.012 1.25" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
+    <geom name="oak_table_shard" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${solimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
     <body name="hand_anchor" mocap="true" pos="0 2.0 0"/>
 ${bodyXmlChunks.join('\n')}
   </worldbody>
