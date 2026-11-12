@@ -130,6 +130,7 @@ export type NetworkAudioEvent =
     }
   | {
       kind: 'wobbleRock';
+      blockId?: number;
       tiltAngleRad: number;
       angularSpeedRadPerSec: number;
       clampingLoadN: number;
@@ -169,6 +170,7 @@ export type MultiplayerControlMessage =
       collapseReason: string | null;
       activeShardMetas: SerializedShardMeta[];
       retiredShardIds: number[];
+      totalActiveShards?: number;
       minSnapshotSeq?: number;
       currentAudioBatchSeq?: number;
     }

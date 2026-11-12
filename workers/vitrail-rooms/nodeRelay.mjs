@@ -1,7 +1,49 @@
 import { createHash } from 'node:crypto';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const MAX_FRAME_BYTES = 1048576; // 1 MB safety cap
+const MAX_FRAME_BYTES = 1048576; // 1 MB outer wire-frame safety cap
+const MP_PROTOCOL_MAGIC = 0x564d;
+const MAX_BINARY_FRAME_BYTES = 16_384;
+const MAX_TEXT_FRAME_BYTES = 524_288;
+
+export function isAllowedRelayOrigin(originHeader) {
+  if (!originHeader) return true;
+  const trimmed = String(originHeader).trim();
+  if (trimmed === '' || trimmed.toLowerCase() === 'null') return true;
+  let host;
+  try {
+    host = new URL(trimmed).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1);
+  }
+  if (
+    host === 'vitrail.andrewvoirol.com' ||
+    host === 'andrewvoirol.com' ||
+    host.endsWith('.andrewvoirol.com') ||
+    host.endsWith('.vercel.app') ||
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === '::1' ||
+    host.endsWith('.local')
+  ) {
+    return true;
+  }
+  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4Match) {
+    const o1 = Number(ipv4Match[1]);
+    const o2 = Number(ipv4Match[2]);
+    const o3 = Number(ipv4Match[3]);
+    const o4 = Number(ipv4Match[4]);
+    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) return false;
+    if (o1 === 127 || o1 === 10) return true;
+    if (o1 === 192 && o2 === 168) return true;
+    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true;
+  }
+  return false;
+}
 
 function encodeWsFrame(opcode, payloadBuf) {
   const len = payloadBuf.length;
@@ -110,7 +152,10 @@ function createWsPeerConnection(socket, head, onMessage, onClose) {
       rxBuf = rxBuf.subarray(headerBytes + payloadLen);
 
       if (opcode === 0x08) {
-        conn.close(1000, 'Peer closed');
+        const rxCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1000;
+        const safeCode =
+          rxCode >= 1000 && rxCode <= 4999 && rxCode !== 1005 && rxCode !== 1006 ? rxCode : 1000;
+        conn.close(safeCode, 'Peer closed');
         return;
       }
       if (opcode === 0x09) {
@@ -190,6 +235,15 @@ export function attachVitrailRoomRelay(httpServer, pathPrefix = '/__vitrail_mp')
       return; // Leave Vite HMR and any other upgrade paths untouched
     }
 
+    const rawOrigin = req.headers['origin'];
+    if (!isAllowedRelayOrigin(typeof rawOrigin === 'string' ? rawOrigin : null)) {
+      socket.write(
+        'HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 16\r\n\r\nForbidden origin'
+      );
+      socket.destroy();
+      return;
+    }
+
     const wsKey = req.headers['sec-websocket-key'];
     if (!wsKey || typeof wsKey !== 'string') {
       socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -234,6 +288,15 @@ export function attachVitrailRoomRelay(httpServer, pathPrefix = '/__vitrail_mp')
       return;
     }
 
+    if (role === 'guest' && room.guest && room.guest.conn.isOpen && room.guest.clientId !== clientId) {
+      const rejectConn = createWsPeerConnection(socket, head, () => {}, () => {});
+      rejectConn.sendText(
+        JSON.stringify({ __relay: 'error', message: 'Room full (2/2 players)' })
+      );
+      rejectConn.close(1008, 'Room full (2/2 players)');
+      return;
+    }
+
     const prevSlot = room[role];
     if (prevSlot && prevSlot.conn.isOpen) {
       room[role] = null;
@@ -245,13 +308,46 @@ export function attachVitrailRoomRelay(httpServer, pathPrefix = '/__vitrail_mp')
       socket,
       head,
       (opcode, payload) => {
-        const currentRoom = rooms.get(roomCode);
-        if (!currentRoom) return;
-        const peerSlot = role === 'host' ? currentRoom.guest : currentRoom.host;
-        if (!peerSlot || !peerSlot.conn.isOpen) return;
         if (opcode === 0x01) {
-          peerSlot.conn.sendText(payload.toString('utf8'));
-        } else if (opcode === 0x02) {
+          if (payload.length > MAX_TEXT_FRAME_BYTES) {
+            conn.close(1009, 'Message too big');
+            return;
+          }
+          const text = payload.toString('utf8');
+          if (!text.trimStart().startsWith('{')) {
+            conn.close(1003, 'Unsupported text payload');
+            return;
+          }
+          if (text.includes('"__relay"')) {
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed && parsed.__relay === 'keepalive') {
+                return;
+              }
+            } catch {
+              // Forward regular text frames
+            }
+          }
+          const currentRoom = rooms.get(roomCode);
+          if (!currentRoom) return;
+          const peerSlot = role === 'host' ? currentRoom.guest : currentRoom.host;
+          if (!peerSlot || !peerSlot.conn.isOpen) return;
+          peerSlot.conn.sendText(text);
+          return;
+        }
+        if (opcode === 0x02) {
+          if (payload.length > MAX_BINARY_FRAME_BYTES) {
+            conn.close(1009, 'Message too big');
+            return;
+          }
+          if (payload.length < 2 || payload.readUInt16LE(0) !== MP_PROTOCOL_MAGIC) {
+            conn.close(1003, 'Unsupported binary payload');
+            return;
+          }
+          const currentRoom = rooms.get(roomCode);
+          if (!currentRoom) return;
+          const peerSlot = role === 'host' ? currentRoom.guest : currentRoom.host;
+          if (!peerSlot || !peerSlot.conn.isOpen) return;
           peerSlot.conn.sendBinary(payload);
         }
       },

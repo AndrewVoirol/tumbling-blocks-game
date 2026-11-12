@@ -25,11 +25,13 @@ async function runAudit() {
   try {
     const [
       { GlassAudioEngine },
-      { BLOCK_HALF_Y, BLOCK_HEIGHT, TABLE_RADIUS },
+      { quatFromAxisAngle },
+      { BLOCK_HALF_Y, BLOCK_HEIGHT, BLOCK_WIDTH, TABLE_RADIUS },
       { ensureMujocoInitialized },
       { PhysicsWorld },
     ] = await Promise.all([
       vite.ssrLoadModule('/src/audio/GlassAudioEngine.ts'),
+      vite.ssrLoadModule('/src/math/vecMat.ts'),
       vite.ssrLoadModule('/src/physics/constants.ts'),
       vite.ssrLoadModule('/src/physics/mujocoRuntime.ts'),
       vite.ssrLoadModule('/src/physics/PhysicsWorld.ts'),
@@ -458,11 +460,156 @@ async function runAudit() {
       world.dispose();
     }
 
+    // 8. Post-collapse 100% tree sleep (visible rubble + hidden shelf) and zero post-settle audio buzz
+    {
+      let simT = 0;
+      let postSettleImpacts = 0;
+      let postSettleWobbles = 0;
+      class CollapseSilenceAudio extends GlassAudioEngine {
+        playGlassImpact() {
+          if (simT >= 1.6) postSettleImpacts++;
+        }
+      }
+      const probeAudio = new CollapseSilenceAudio();
+      probeAudio.setMuted(true);
+      const world = new PhysicsWorld(probeAudio, 18, { seed: 1 });
+      world.rebuildTower('sandbox', 2, 18, 1);
+      for (let f = 0; f < 30; f++) world.step(1 / 60);
+      world.triggerSandboxCollapseImpulse();
+
+      let fullSleepSec = null;
+      for (let f = 1; f <= 180; f++) {
+        simT = f / 60;
+        world.step(1 / 60);
+        const wob = world.consumeWobbleEvents();
+        world.consumeShardImpacts();
+        if (simT >= 1.6) postSettleWobbles += wob.length;
+        if (fullSleepSec === null && simT > 0.35 && world.data.ntree_awake === 0) {
+          fullSleepSec = +simT.toFixed(3);
+        }
+      }
+
+      const ntreeAwakeEnd = world.data.ntree_awake;
+      const pass =
+        world.shatteredCount >= 15 &&
+        ntreeAwakeEnd === 0 &&
+        fullSleepSec !== null &&
+        fullSleepSec <= 2.4 &&
+        postSettleWobbles === 0 &&
+        postSettleImpacts === 0;
+
+      report.postCollapse100PctSleepAndSilence = {
+        pass,
+        shatteredCount: world.shatteredCount,
+        fullSleepSec,
+        ntreeAwakeEnd,
+        postSettleWobbles,
+        postSettleImpacts,
+      };
+      if (!pass) {
+        failures.push(
+          `postCollapse100PctSleepAndSilence failed: ${JSON.stringify(report.postCollapse100PctSleepAndSilence)}`
+        );
+      }
+      world.dispose();
+    }
+
+    // 9. Fulcrum seesaw rocking vs. stationary fulcrum & heavily clamped bearing-course silence
+    {
+      const world = new PhysicsWorld(audio, 1, { seed: 1 });
+      world.rebuildTower('sandbox', 2, 1, 1);
+      const rw = world.getWorld();
+      const [bSeesaw, bFulcrum, bSpare] = world.blocks;
+      rw.getRigidBody(bSpare.bodyHandle).setTranslation({ x: 2.5, y: BLOCK_HALF_Y, z: 0 }, true);
+      const qYaw90 = quatFromAxisAngle([0, 1, 0], Math.PI * 0.5);
+      rw.getRigidBody(bFulcrum.bodyHandle).setTranslation({ x: 0, y: BLOCK_HALF_Y, z: 0 }, true);
+      rw.getRigidBody(bFulcrum.bodyHandle).setRotation(
+        { x: qYaw90[0], y: qYaw90[1], z: qYaw90[2], w: qYaw90[3] },
+        true
+      );
+      rw.getRigidBody(bSeesaw.bodyHandle).setTranslation({ x: -2.5, y: BLOCK_HALF_Y, z: 0 }, true);
+      for (let k = 0; k < 120; k++) world.step(1 / 600);
+      world.consumeWobbleEvents();
+
+      const rad = (6.5 * Math.PI) / 180.0;
+      const halfSpan = BLOCK_WIDTH * 0.5 - 0.0125;
+      const yCenter =
+        BLOCK_HEIGHT + BLOCK_HALF_Y * Math.cos(rad) + halfSpan * Math.sin(rad) + 0.0004;
+      const qTilt = quatFromAxisAngle([0, 0, 1], rad);
+      const rbSeesaw = rw.getRigidBody(bSeesaw.bodyHandle);
+      rbSeesaw.setTranslation({ x: 0, y: yCenter, z: 0 }, true);
+      rbSeesaw.setRotation({ x: qTilt[0], y: qTilt[1], z: qTilt[2], w: qTilt[3] }, true);
+      rbSeesaw.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rbSeesaw.setAngvel({ x: 0, y: 0, z: 0 }, true);
+
+      const sDof = world.model.jnt_dofadr[world.model.body_jntadr[bSeesaw.bodyHandle]];
+      let prevSign = 0;
+      let seesawFlips = 0;
+      let seesawWobbles = 0;
+      let fulcrumWobbles = 0;
+      for (let k = 0; k < 420; k++) {
+        world.step(1 / 600);
+        const wz = world.data.qvel[sDof + 5];
+        if (Math.abs(wz) > 0.03) {
+          const sgn = wz > 0 ? 1 : -1;
+          if (prevSign !== 0 && sgn !== prevSign) seesawFlips++;
+          prevSign = sgn;
+        }
+        for (const w of world.consumeWobbleEvents()) {
+          if (w.blockId === bSeesaw.id) seesawWobbles++;
+          if (w.blockId === bFulcrum.id) fulcrumWobbles++;
+        }
+      }
+      const seesawAsleep =
+        world.data.tree_asleep[world.model.body_treeid[bSeesaw.bodyHandle]] >= 0;
+      world.dispose();
+
+      // Clamped lower-course check: nudging a clamped Layer-1 bearing block (> 10 N top load) emits 0 clamped wobbles
+      const towerWorld = new PhysicsWorld(audio, 18, { seed: 7 });
+      towerWorld.rebuildTower('solo', 2, 18, 7);
+      for (let f = 0; f < 50; f++) towerWorld.step(1 / 60);
+      towerWorld.consumeWobbleEvents();
+      const bearingBlk =
+        towerWorld.blocks.find((b) => b.assignedLayer === 1 && !b.isLooseSlot) ??
+        towerWorld.blocks[4];
+      const rbBearing = towerWorld.getWorld().getRigidBody(bearingBlk.bodyHandle);
+      rbBearing.setLinvel({ x: 0.28, y: 0, z: 0.08 }, true);
+      let clampedFalseWobbles = 0;
+      for (let f = 0; f < 45; f++) {
+        towerWorld.step(1 / 60);
+        for (const w of towerWorld.consumeWobbleEvents()) {
+          if (w.clampingLoadN >= 1.1) clampedFalseWobbles++;
+        }
+      }
+      towerWorld.dispose();
+
+      const pass =
+        seesawFlips >= 5 &&
+        seesawWobbles >= 3 &&
+        fulcrumWobbles === 0 &&
+        seesawAsleep &&
+        clampedFalseWobbles === 0;
+
+      report.fulcrumSeesawAndClampedWobbleIsolation = {
+        pass,
+        seesawFlips,
+        seesawWobbles,
+        fulcrumWobbles,
+        seesawAsleep,
+        clampedFalseWobbles,
+      };
+      if (!pass) {
+        failures.push(
+          `fulcrumSeesawAndClampedWobbleIsolation failed: ${JSON.stringify(report.fulcrumSeesawAndClampedWobbleIsolation)}`
+        );
+      }
+    }
+
     console.log(
       JSON.stringify(
         {
           overallPass: failures.length === 0,
-          passedProbes: `${7 - failures.length}/7`,
+          passedProbes: `${9 - failures.length}/9`,
           probes: report,
           failures,
         },

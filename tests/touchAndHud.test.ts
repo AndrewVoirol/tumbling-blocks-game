@@ -4,6 +4,7 @@ import { GlassAudioEngine } from '../src/audio/GlassAudioEngine';
 import { GameEngine } from '../src/engine/GameEngine';
 import { OrbitCamera } from '../src/engine/OrbitCamera';
 import { BLOCK_HALF_X, BLOCK_HALF_Z } from '../src/physics/constants';
+import type { MujocoPhysicsEngine } from '../src/physics/MujocoPhysicsEngine';
 import { quatRotateVec3, type Vec3 } from '../src/math/vecMat';
 
 interface MinimalChildProcess {
@@ -1213,17 +1214,185 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
         await auditViewportLayout(vp.width, vp.height, 'EXTRACTED Controls (Q / 90 R / E / 0° / Place Prism)');
       }
 
-      // State 3: Online Room Code controls (Host, CODE input, Join)
-      await cdp.evaluate(`(() => {
+      // State 3: Online Room Code controls (Host, CODE input, Join) + input autofill/a11y attributes
+      const onlineInputAttrs = await cdp.evaluate<{
+        id: string | null;
+        name: string | null;
+        autoComplete: string | null;
+      }>(`new Promise((resolve) => {
         window.__VITRAIL_ENGINE__.resetGame('solo', 2);
         const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
         const onlineTab = tabs.find((el) => el.textContent?.includes('Online'));
         onlineTab?.click();
-      })()`);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const inp = document.querySelector('input.online-code-input');
+          resolve({
+            id: inp?.getAttribute('id') ?? null,
+            name: inp?.getAttribute('name') ?? null,
+            autoComplete: inp?.getAttribute('autocomplete') ?? null,
+          });
+        }));
+      })`);
+      expect(onlineInputAttrs).toEqual({
+        id: 'online-room-code-input',
+        name: 'roomCode',
+        autoComplete: 'off',
+      });
 
       for (const vp of VIEWPORTS) {
         await auditViewportLayout(vp.width, vp.height, 'Online Room Code Controls');
       }
+
+      // State 4: Polariscope pill & crystal-optical-plate strict child containment across 390x844, 844x390, 1024x1366, 1366x1024, and 1440x900 in BOTH Natural (false) & Isochromatic (true)
+      await cdp.evaluate(`new Promise((resolve) => {
+        const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+        const soloTab = tabs.find((el) => el.textContent?.includes('Solo'));
+        soloTab?.click();
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      })`);
+      const polariscopeViewports = [
+        { width: 390, height: 844, dpr: 3, mobile: true, expectSingleLine: false, fullOffscreenAudit: true },
+        { width: 844, height: 390, dpr: 3, mobile: true, expectSingleLine: true, fullOffscreenAudit: false },
+        { width: 1024, height: 1366, dpr: 2, mobile: true, expectSingleLine: true, fullOffscreenAudit: true },
+        { width: 1366, height: 1024, dpr: 2, mobile: true, expectSingleLine: true, fullOffscreenAudit: true },
+        { width: 1440, height: 900, dpr: 2, mobile: false, expectSingleLine: true, fullOffscreenAudit: true },
+      ];
+      for (const pvp of polariscopeViewports) {
+        await cdp.send('Emulation.setDeviceMetricsOverride', {
+          width: pvp.width,
+          height: pvp.height,
+          deviceScaleFactor: pvp.dpr,
+          mobile: pvp.mobile,
+        });
+        for (const wantPolariscope of [false, true]) {
+          const containment = await cdp.evaluate<{
+            tagText: string;
+            tagVisible: boolean;
+            tagInsideBtn: boolean;
+            btnInsidePlate: boolean;
+            paneFillsBtn: boolean;
+            singleLineAligned: boolean;
+            metrics: Record<string, number>;
+          }>(`new Promise((resolve) => {
+            const btn = document.querySelector('button.polariscope-lens-btn');
+            const cur = btn?.getAttribute('aria-pressed') === 'true';
+            if (cur !== ${wantPolariscope}) btn?.click();
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+              const plate = document.querySelector('aside.crystal-optical-plate');
+              const polBtn = document.querySelector('button.polariscope-lens-btn');
+              const pane = polBtn?.querySelector('.quarry-glass-pane');
+              const content = polBtn?.querySelector('.quarry-etch-content');
+              const labelEl = content?.children?.[1];
+              const tag = polBtn?.querySelector('.polariscope-state-tag');
+              const pr = plate.getBoundingClientRect();
+              const br = polBtn.getBoundingClientRect();
+              const pnr = pane.getBoundingClientRect();
+              const lr = labelEl.getBoundingClientRect();
+              const tr = tag.getBoundingClientRect();
+              const eps = 0.5;
+              const labelCy = (lr.top + lr.bottom) * 0.5;
+              const tagCy = (tr.top + tr.bottom) * 0.5;
+              resolve({
+                tagText: (tag.textContent || '').trim(),
+                tagVisible: tr.width > 1 && tr.height > 1,
+                tagInsideBtn:
+                  tr.top >= br.top - eps &&
+                  tr.left >= br.left - eps &&
+                  tr.bottom <= br.bottom + eps &&
+                  tr.right <= br.right + eps,
+                btnInsidePlate:
+                  br.top >= pr.top - eps &&
+                  br.left >= pr.left - eps &&
+                  br.bottom <= pr.bottom + eps &&
+                  br.right <= pr.right + eps,
+                paneFillsBtn:
+                  Math.abs(pnr.height - br.height) <= 2.5 &&
+                  Math.abs(pnr.bottom - br.bottom) <= 2.0,
+                singleLineAligned: Math.abs(labelCy - tagCy) <= 4.0,
+                metrics: {
+                  plateBottom: +pr.bottom.toFixed(2),
+                  btnBottom: +br.bottom.toFixed(2),
+                  btnRight: +br.right.toFixed(2),
+                  paneHeight: +pnr.height.toFixed(2),
+                  btnHeight: +br.height.toFixed(2),
+                  tagBottom: +tr.bottom.toFixed(2),
+                  tagRight: +tr.right.toFixed(2),
+                  tagWidth: +tr.width.toFixed(2),
+                  tagHeight: +tr.height.toFixed(2),
+                },
+              });
+            }));
+          })`);
+
+          expect(containment.tagText).toBe(wantPolariscope ? 'Isochromatic' : 'Natural');
+          expect(
+            containment.tagVisible,
+            `polariscope tag visible @ ${pvp.width}x${pvp.height} (${containment.tagText}): ${JSON.stringify(containment.metrics)}`
+          ).toBe(true);
+          expect(
+            containment.tagInsideBtn,
+            `polariscope tag inside btn @ ${pvp.width}x${pvp.height} (${containment.tagText}): ${JSON.stringify(containment.metrics)}`
+          ).toBe(true);
+          expect(
+            containment.btnInsidePlate,
+            `polariscope btn inside plate @ ${pvp.width}x${pvp.height} (${containment.tagText}): ${JSON.stringify(containment.metrics)}`
+          ).toBe(true);
+          expect(
+            containment.paneFillsBtn,
+            `polariscope glass pane fills btn @ ${pvp.width}x${pvp.height} (${containment.tagText}): ${JSON.stringify(containment.metrics)}`
+          ).toBe(true);
+          if (pvp.expectSingleLine) {
+            expect(
+              containment.singleLineAligned,
+              `polariscope single-line @ ${pvp.width}x${pvp.height} (${containment.tagText})`
+            ).toBe(true);
+          }
+          if (pvp.fullOffscreenAudit) {
+            await auditViewportLayout(
+              pvp.width,
+              pvp.height,
+              `Polariscope ${containment.tagText}`
+            );
+          } else {
+            // Short landscape (`844x390`, `max-height: 580px`) uses scrollable `.vitrail-lancet-window`; still enforce `0 px` top-level HUD card overlap & on-screen `crystal-optical-plate`
+            const landscapeOverlap = await cdp.evaluate<{
+              plateInViewport: boolean;
+              zoneOverlaps: Array<{ pair: string; area: number }>;
+            }>(`(() => {
+              const plate = document.querySelector('.crystal-optical-plate');
+              const pr = plate.getBoundingClientRect();
+              const zones = [
+                ['lancet', document.querySelector('.vitrail-lancet-window')],
+                ['plate', plate],
+                ['prism', document.querySelector('.cut-glass-prism-bar')],
+              ].filter(([, el]) => el);
+              const zoneOverlaps = [];
+              for (let i = 0; i < zones.length; i++) {
+                for (let j = i + 1; j < zones.length; j++) {
+                  const a = zones[i][1].getBoundingClientRect();
+                  const b = zones[j][1].getBoundingClientRect();
+                  const ix = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+                  const iy = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+                  const area = +(ix * iy).toFixed(2);
+                  if (area > 0) zoneOverlaps.push({ pair: zones[i][0] + '<->' + zones[j][0], area });
+                }
+              }
+              return {
+                plateInViewport: pr.top >= -0.5 && pr.right <= window.innerWidth + 0.5 && pr.bottom <= window.innerHeight + 0.5,
+                zoneOverlaps,
+              };
+            })()`);
+            expect(landscapeOverlap.plateInViewport).toBe(true);
+            expect(landscapeOverlap.zoneOverlaps).toEqual([]);
+          }
+        }
+      }
+      // Reset Polariscope back to Natural (`false`) before keyboard test below
+      await cdp.evaluate(`new Promise((resolve) => {
+        const btn = document.querySelector('button.polariscope-lens-btn');
+        if (btn?.getAttribute('aria-pressed') === 'true') btn.click();
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      })`);
 
       // Keyboard QuarryButton activation (Enter & Space) + Guide Modal ARIA & Focus Trap
       await cdp.send('Emulation.setDeviceMetricsOverride', {
@@ -1423,6 +1592,44 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
       expect(modalCloseState.dialogStillOpen).toBe(false);
       expect(modalCloseState.focusRestoredToGuideOnEscape).toBe(true);
       expect(modalCloseState.hudAriaHiddenAfterClose).toBeNull();
+
+      // Verify Online lobby drawer toggle (`BUG-3` React DOM wiring): opening Online tab sets
+      // `onlineLobbyOpen = true`, and clicking the already-active Solo tab closes the drawer
+      // without wiping in-progress local tower state (`blocksStacked` preserved).
+      const onlineDrawerRoundTrip = await cdp.evaluate<{
+        lobbyOpenDuringDrawer: boolean;
+        drawerRendered: boolean;
+        lobbyOpenAfterReturn: boolean;
+        drawerClosedAfterReturn: boolean;
+        stackedPreserved: number;
+      }>(`(async () => {
+        const eng = window.__VITRAIL_ENGINE__;
+        if (eng && eng.physics) {
+          eng.physics.blocksStacked = 4;
+          eng.stepHeadless(1 / 120);
+        }
+        const tabs = Array.from(document.querySelectorAll('button.mode-course-btn[role="tab"]'));
+        const onlineTab = tabs.find((b) => b.textContent?.includes('Online'));
+        const soloTab = tabs.find((b) => b.textContent?.includes('Solo'));
+        onlineTab?.click();
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const lobbyOpenDuringDrawer = Boolean(eng?.onlineLobbyOpen);
+        const drawerRendered = Boolean(document.querySelector('.online-subcourse'));
+        soloTab?.click();
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        return {
+          lobbyOpenDuringDrawer,
+          drawerRendered,
+          lobbyOpenAfterReturn: Boolean(eng?.onlineLobbyOpen),
+          drawerClosedAfterReturn: !document.querySelector('.online-subcourse'),
+          stackedPreserved: eng?.physics?.blocksStacked ?? -1,
+        };
+      })()`);
+      expect(onlineDrawerRoundTrip.lobbyOpenDuringDrawer).toBe(true);
+      expect(onlineDrawerRoundTrip.drawerRendered).toBe(true);
+      expect(onlineDrawerRoundTrip.lobbyOpenAfterReturn).toBe(false);
+      expect(onlineDrawerRoundTrip.drawerClosedAfterReturn).toBe(true);
+      expect(onlineDrawerRoundTrip.stackedPreserved).toBe(4);
     } finally {
       cdp?.close();
       if (chromeProc && chromeProc.exitCode === null) {
@@ -1542,4 +1749,389 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
       engine.dispose();
     }
   }, 120000);
+
+  it('7. [BUG-1] releases Glazier AI mocap tether on Guide modal / AI-off mid-pull and cleanly resumes or hands off EXTRACTED placement', async () => {
+    const engine = new GameEngine();
+    await engine.initHeadless();
+
+    try {
+      engine.resetGame('party', 2);
+      engine.physics.currentPlayer = 1;
+      engine.setAiOpponentEnabled(true, 'master');
+      engine.aiFastCadence = true;
+
+      // A. Interrupt Glazier AI mid-pull (`PULLING`) by opening Guide modal -> releases mocap tether immediately
+      let guard = 0;
+      while (
+        guard++ < 400 &&
+        !(engine.physics.turnPhase === 'PULLING' && engine.physics.isPointerDraggingBlock)
+      ) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('PULLING');
+      expect(engine.physics.isPointerDraggingBlock).toBe(true);
+
+      engine.setModalOpen(true);
+      expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+      expect(engine.physics.isPointerDraggingBlock).toBe(false);
+      expect(engine.physics.activeBlockId).toBeNull();
+
+      for (let i = 0; i < 20; i++) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+
+      // Closing Guide modal resumes Glazier AI without deadlocking on `idle`
+      engine.setModalOpen(false);
+      guard = 0;
+      while (guard++ < 500 && engine.physics.turnPhase !== 'EXTRACTED') {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('EXTRACTED');
+      const extractedBlockId = engine.physics.activeBlockId;
+      expect(extractedBlockId).not.toBeNull();
+
+      // B. Open Guide modal while Glazier AI holds an `EXTRACTED` prism -> pauses without dropping, then resumes placement on close
+      engine.setModalOpen(true);
+      for (let i = 0; i < 30; i++) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('EXTRACTED');
+      expect(engine.physics.activeBlockId).toBe(extractedBlockId);
+
+      engine.setModalOpen(false);
+      guard = 0;
+      while (guard++ < 500 && engine.physics.blocksStacked < 1) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.blocksStacked).toBe(1);
+      expect(engine.physics.currentPlayer).toBe(0);
+
+      // C. Toggle AI OFF mid-pull (`PULLING`) -> releases mocap spring so Human P2 inherits clean `SELECT_BLOCK`
+      engine.physics.currentPlayer = 1;
+      guard = 0;
+      while (
+        guard++ < 400 &&
+        !(engine.physics.turnPhase === 'PULLING' && engine.physics.isPointerDraggingBlock)
+      ) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('PULLING');
+
+      engine.setAiOpponentEnabled(false);
+      expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+      expect(engine.physics.isPointerDraggingBlock).toBe(false);
+      expect(engine.physics.activeBlockId).toBeNull();
+
+      // D. Toggle AI OFF during `EXTRACTED` -> hands carried prism cleanly to Human P2 to rotate & release
+      engine.setAiOpponentEnabled(true, 'master');
+      engine.aiFastCadence = true;
+      guard = 0;
+      while (
+        guard++ < 500 &&
+        !(engine.physics.turnPhase === 'EXTRACTED' && engine.physics.isExtractionLiftReady)
+      ) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('EXTRACTED');
+      expect(engine.physics.isExtractionLiftReady).toBe(true);
+
+      engine.setAiOpponentEnabled(false);
+      expect(engine.physics.turnPhase).toBe('EXTRACTED');
+      expect(engine.physics.isPointerDraggingBlock).toBe(false);
+      expect(engine.physics.activeBlockId).not.toBeNull();
+
+      engine.handleRotateCarried(Math.PI / 24);
+      engine.handleReleaseOntoTop();
+      expect(engine.physics.turnPhase).toBe('SETTLING');
+    } finally {
+      engine.dispose();
+    }
+  }, 30000);
+
+  it('8. [BUG-2] releases canvas pointer capture on modal/up/reset and blocks pointer & wheel bleed-through behind open modal', async () => {
+    const captured = new Set<number>();
+    const releasedHistory: number[] = [];
+    const listeners = new Map<string, Array<(ev: unknown) => void>>();
+    const rect = { left: 0, top: 0, width: 1024, height: 768, right: 1024, bottom: 768 };
+
+    const mockCanvas = {
+      clientWidth: rect.width,
+      clientHeight: rect.height,
+      style: { cursor: '' },
+      getBoundingClientRect: () => rect,
+      setPointerCapture: (id: number) => {
+        captured.add(id);
+      },
+      releasePointerCapture: (id: number) => {
+        captured.delete(id);
+        releasedHistory.push(id);
+      },
+      addEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = listeners.get(type) ?? [];
+        list.push(fn);
+        listeners.set(type, list);
+      },
+      removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = listeners.get(type) ?? [];
+        const idx = list.indexOf(fn);
+        if (idx >= 0) list.splice(idx, 1);
+      },
+    } as unknown as HTMLCanvasElement;
+
+    const engine = new GameEngine(mockCanvas);
+    await engine.initHeadless();
+    const domHandlers = engine as unknown as {
+      onPointerDown(ev: unknown): void;
+      onWheel(ev: unknown): void;
+    };
+
+    try {
+      engine.camera.update(0.25, rect.width / rect.height);
+      const target = findFrontSelectableBlock(engine, rect, true);
+
+      // Start touch block pull (`pointerId = 41`) via DOM `onPointerDown` + `handlePointerMove`
+      domHandlers.onPointerDown({
+        clientX: target.screenPt[0],
+        clientY: target.screenPt[1],
+        pointerId: 41,
+        button: 0,
+        altKey: false,
+        pointerType: 'touch',
+        timeStamp: 100,
+      });
+      expect(captured.has(41)).toBe(true);
+
+      engine.handlePointerMove(
+        target.screenPt[0] + 14,
+        target.screenPt[1] + 2,
+        41,
+        rect,
+        'touch',
+        120
+      );
+      expect(engine.physics.turnPhase).toBe('PULLING');
+
+      // Opening modal mid-gesture cancels grab AND releases canvas pointer capture for `41`
+      engine.setModalOpen(true);
+      expect(captured.has(41)).toBe(false);
+      expect(releasedHistory).toContain(41);
+      expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+      expect(engine.getInteractionMode()).toBe('none');
+
+      // While modal is open, pointerdown / pointermove / wheel must not capture, hover, or zoom
+      const distBefore = getCameraTargetPose(engine.camera).targetDistance;
+      engine.physics.hoveredBlockId = null;
+      domHandlers.onPointerDown({
+        clientX: target.screenPt[0],
+        clientY: target.screenPt[1],
+        pointerId: 42,
+        button: 0,
+        altKey: false,
+        pointerType: 'mouse',
+        timeStamp: 200,
+      });
+      engine.handlePointerMove(target.screenPt[0], target.screenPt[1], 42, rect, 'mouse', 216);
+      domHandlers.onWheel({
+        deltaX: 0,
+        deltaY: 180,
+        altKey: false,
+        ctrlKey: false,
+        metaKey: false,
+        preventDefault: () => {},
+      });
+
+      expect(captured.has(42)).toBe(false);
+      expect(engine.physics.hoveredBlockId).toBeNull();
+      expect(engine.getInteractionMode()).toBe('none');
+      expect(getCameraTargetPose(engine.camera).targetDistance).toBe(distBefore);
+
+      // Close modal -> verify `handlePointerUp` and `resetGame` also release pointer capture
+      engine.setModalOpen(false);
+      domHandlers.onPointerDown({
+        clientX: target.screenPt[0],
+        clientY: target.screenPt[1],
+        pointerId: 55,
+        button: 0,
+        altKey: false,
+        pointerType: 'mouse',
+        timeStamp: 300,
+      });
+      expect(captured.has(55)).toBe(true);
+      engine.handlePointerUp(target.screenPt[0], target.screenPt[1], 55, rect, 'mouse', 316);
+      expect(captured.has(55)).toBe(false);
+
+      domHandlers.onPointerDown({
+        clientX: target.screenPt[0],
+        clientY: target.screenPt[1],
+        pointerId: 66,
+        button: 0,
+        altKey: false,
+        pointerType: 'touch',
+        timeStamp: 400,
+      });
+      expect(captured.has(66)).toBe(true);
+      engine.resetGame('solo');
+      expect(captured.size).toBe(0);
+    } finally {
+      engine.dispose();
+    }
+  });
+
+  it('9. [BUG-3] pauses Glazier AI progression while Online lobby drawer is open and resumes cleanly on close', async () => {
+    const engine = new GameEngine();
+    await engine.initHeadless();
+
+    try {
+      engine.resetGame('party', 2);
+      engine.physics.currentPlayer = 1;
+      engine.setAiOpponentEnabled(true, 'master');
+      engine.aiFastCadence = true;
+
+      let guard = 0;
+      while (
+        guard++ < 400 &&
+        !(engine.physics.turnPhase === 'PULLING' && engine.physics.isPointerDraggingBlock)
+      ) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('PULLING');
+
+      // Opening Online lobby drawer cancels active AI pull and holds AI completely idle
+      engine.setOnlineLobbyOpen(true);
+      expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+      expect(engine.physics.isPointerDraggingBlock).toBe(false);
+
+      for (let i = 0; i < 45; i++) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+      expect(engine.physics.blocksStacked).toBe(0);
+
+      // Closing Online lobby drawer back to Pass & Play resumes Glazier AI turn
+      engine.setOnlineLobbyOpen(false);
+      guard = 0;
+      while (guard++ < 600 && engine.physics.blocksStacked < 1) {
+        engine.stepHeadless(1 / 60);
+      }
+      expect(engine.physics.blocksStacked).toBe(1);
+    } finally {
+      engine.dispose();
+    }
+  }, 25000);
+
+  it('10. [BUG-4] flicks foreground Voronoi shard instead of occluded background intact block in Sandbox and honors <= 8 px touch vs < 5 px mouse tolerance', async () => {
+    const engine = new GameEngine();
+    await engine.initHeadless();
+
+    try {
+      const rect = { left: 0, top: 0, width: 1366, height: 1024 };
+      engine.camera.update(0.016, rect.width / rect.height);
+      engine.resetGame('sandbox');
+      engine.camera.update(0.016, rect.width / rect.height);
+
+      // Pick a mid-tower front block as the background intact block, and shatter an upper-course block to spawn real Voronoi shards
+      const bgBlock = engine.physics.blocks.find(
+        (b) => !b.shattered && b.assignedLayer === 3 && b.assignedSlot === 1
+      )!;
+      const sacrificialBlock = engine.physics.blocks.find(
+        (b) => !b.shattered && b.assignedLayer === 17 && b.assignedSlot === 1
+      )!;
+      engine.physics.shatterBlock(sacrificialBlock, [0, 0, 0], 18.0, [0, 1, 0], false);
+      expect(engine.physics.shards.length).toBeGreaterThan(0);
+
+      // Place shard[0] directly along the ray from camera -> bgBlock (`45%` of the way from camera to bgBlock, well above table)
+      const shd = engine.physics.shards[0];
+      const camPos = engine.camera.position;
+      const fgPos: Vec3 = [
+        camPos[0] + (bgBlock.position[0] - camPos[0]) * 0.62,
+        camPos[1] + (bgBlock.position[1] - camPos[1]) * 0.62,
+        camPos[2] + (bgBlock.position[2] - camPos[2]) * 0.62,
+      ];
+      const rbShard = (engine.physics as MujocoPhysicsEngine).getWorld().getRigidBody(shd.bodyHandle)!;
+      rbShard.setTranslation({ x: fgPos[0], y: fgPos[1], z: fgPos[2] }, true);
+      rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rbShard.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      shd.position = [...fgPos];
+      engine.physics.step(1 / 600);
+
+      const screenPt = worldToScreenPx(engine, shd.position, rect.width, rect.height);
+      const { origin, dir } = engine.camera.screenToRay(screenPt[0], screenPt[1], rect);
+      const behindBlockHit = raycastIntactBlocksForTest(engine, origin, dir);
+      expect(behindBlockHit).not.toBeNull();
+
+      // A. Mouse tap (`2 px` < `5 px`) hits foreground shard (`orbit` -> `nudgeShard`), NOT occluded background intact block
+      rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      engine.handlePointerDown(screenPt[0], screenPt[1], 1, 0, false, rect, 'mouse', 100);
+      expect(engine.getInteractionMode()).toBe('orbit');
+      expect(engine.physics.activeBlockId).toBeNull();
+      engine.handlePointerMove(screenPt[0] + 2.0, screenPt[1], 1, rect, 'mouse', 110);
+      engine.handlePointerUp(screenPt[0] + 2.0, screenPt[1], 1, rect, 'mouse', 120);
+      const lvAfterMouseTap = rbShard.linvel();
+      expect(Math.hypot(lvAfterMouseTap.x, lvAfterMouseTap.y, lvAfterMouseTap.z)).toBeGreaterThan(
+        0.05
+      );
+
+      // B. Mouse move of `6.5 px` (`>= 5.0 px` mouse threshold) orbits without firing `nudgeShard`
+      rbShard.setTranslation({ x: fgPos[0], y: fgPos[1], z: fgPos[2] }, true);
+      rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rbShard.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      shd.position = [...fgPos];
+      engine.physics.step(1 / 600);
+      const screenPt2 = worldToScreenPx(engine, shd.position, rect.width, rect.height);
+      engine.handlePointerDown(screenPt2[0], screenPt2[1], 2, 0, false, rect, 'mouse', 200);
+      engine.handlePointerMove(screenPt2[0] + 6.5, screenPt2[1], 2, rect, 'mouse', 210);
+      rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      engine.handlePointerUp(screenPt2[0] + 6.5, screenPt2[1], 2, rect, 'mouse', 220);
+      const lvAfterMouseDrag = rbShard.linvel();
+      expect(Math.hypot(lvAfterMouseDrag.x, lvAfterMouseDrag.y, lvAfterMouseDrag.z)).toBeLessThan(
+        1e-4
+      );
+
+      // C. Touch tap with `6.5 px` drift (`<= 8.0 px` touch tolerance) DOES fire `nudgeShard`
+      rbShard.setTranslation({ x: fgPos[0], y: fgPos[1], z: fgPos[2] }, true);
+      rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rbShard.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      shd.position = [...fgPos];
+      engine.physics.step(1 / 600);
+      const screenPt3 = worldToScreenPx(engine, shd.position, rect.width, rect.height);
+      engine.handlePointerDown(screenPt3[0], screenPt3[1], 3, 0, false, rect, 'touch', 300);
+      engine.handlePointerMove(screenPt3[0] + 6.5, screenPt3[1], 3, rect, 'touch', 310);
+      rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      engine.handlePointerUp(screenPt3[0] + 6.5, screenPt3[1], 3, rect, 'touch', 320);
+      const lvAfterTouchTap = rbShard.linvel();
+      expect(Math.hypot(lvAfterTouchTap.x, lvAfterTouchTap.y, lvAfterTouchTap.z)).toBeGreaterThan(
+        0.05
+      );
+
+      // D. Proportional micro-splinter (`0.2 g`) `nudgeShard` scaling: no 5x-20x off-rim launch
+      const phys = engine.physics as MujocoPhysicsEngine;
+      const microShard =
+        engine.physics.shards.reduce((best, cur) => (cur.massKg < best.massKg ? cur : best)) ?? shd;
+      const rbMicro = phys.getWorld().getRigidBody(microShard.bodyHandle)!;
+      const origMassKg = microShard.massKg;
+      try {
+        // Test exact 0.2 g (`0.0002 kg`) massRatio = 0.05 scaling when nudged horizontally/downward at CoM
+        microShard.massKg = Math.min(origMassKg, 0.0002);
+        rbMicro.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        rbMicro.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        const comPt = rbMicro.translation();
+        expect(
+          phys.nudgeShard(microShard.id, [comPt.x, comPt.y, comPt.z], [0.8, -0.6, 0])
+        ).toBe(true);
+        const lvMicro = rbMicro.linvel();
+        const speedSimDmPerS = Math.hypot(lvMicro.x, lvMicro.y, lvMicro.z);
+        // Expected linear speed in dm/s is ~(0.035 * 0.05 / origMassKg_in_0.1_units); even for actual 0.2g body, speed stays < 12 dm/s (< 1.2 m/s) and vy <= 2.5 dm/s
+        const massActualKg = Math.max(0.00018, rbMicro.mass());
+        const expectedMaxDmPerS = (0.035 * 0.05) / massActualKg + 0.5;
+        expect(speedSimDmPerS).toBeGreaterThan(0.05);
+        expect(speedSimDmPerS).toBeLessThanOrEqual(expectedMaxDmPerS);
+        expect(lvMicro.y).toBeLessThanOrEqual((0.004 * 0.05) / massActualKg + 0.25);
+      } finally {
+        microShard.massKg = origMassKg;
+      }
+    } finally {
+      engine.dispose();
+    }
+  });
 });

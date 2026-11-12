@@ -467,7 +467,7 @@ export function buildMujocoTowerXml(
 
     const parkXM = ((s % 32) - 15.5) * 0.12;
     const parkZM = (Math.floor(s / 32) - 8.0) * 0.12;
-    const parkYM = MJ_PARKING_SHELF_TOP_Y_M + 0.006;
+    const parkYM = MJ_PARKING_SHELF_TOP_Y_M + 0.0055;
     const archIdx = s % cfg.voronoiHullArchetypeCount;
 
     bodyXmlChunks.push(
@@ -518,7 +518,7 @@ export function buildMujocoTowerXml(
 ${voronoiBank.xmlAssets}  </asset>
   <worldbody>
     <geom name="oak_table" group="${MJ_GEOM_GROUP_TABLE}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="6" friction="${fTable}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_TABLE}" conaffinity="${MJ_CONAFFINITY_TABLE}"/>
-    <geom name="parking_shelf" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="1" priority="10" solref="0.012 1.25" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
+    <geom name="parking_shelf" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="3" friction="1.0 0.02 0.01" priority="10" solref="0.008 1.35" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
     <geom name="oak_table_shard" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${solimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
     <body name="hand_anchor" mocap="true" pos="0 2.0 0"/>
 ${bodyXmlChunks.join('\n')}

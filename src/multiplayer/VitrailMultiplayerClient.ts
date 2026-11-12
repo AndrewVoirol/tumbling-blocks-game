@@ -25,6 +25,12 @@ export interface VitrailMultiplayerClientOptions {
   role: MultiplayerRole;
   roomCode: string;
   roomSeed?: number;
+  /** Optional explicit per-tab persistent `clientId` (restored from `sessionStorage` across `F5` reloads) */
+  clientId?: string;
+  /** True when reclaiming an existing per-tab session across an `F5` reload */
+  isSessionReclaim?: boolean;
+  /** Lobby keepalive interval (`ms`) while waiting for remote peer (`default: 25000`) */
+  lobbyKeepaliveIntervalMs?: number;
   /** Optional explicit WebSocket room relay URL (`ws://.../__vitrail_mp` or Cloudflare Worker URL) */
   relayUrl?: string | null;
   /** Optional secondary WebSocket relay URL dialed if primary relay fails or WebRTC ICE stalls/fails */
@@ -75,12 +81,15 @@ interface PeerJsWireMessage {
     type?: string;
     sdp?: RTCSessionDescriptionInit;
     candidate?: RTCIceCandidateInit;
+    metadata?: { clientId?: string };
+    code?: number;
+    reason?: string;
     msg?: string;
   };
 }
 
 interface RelayEnvelopeMessage {
-  __relay?: 'peer_joined' | 'peer_left' | 'room_state' | 'error';
+  __relay?: 'peer_joined' | 'peer_left' | 'room_state' | 'error' | 'keepalive';
   role?: MultiplayerRole;
   hasHost?: boolean;
   hasGuest?: boolean;
@@ -483,10 +492,14 @@ export class VitrailMultiplayerClient {
   private disposed: boolean = false;
 
   // WebSocket Room Relay state
+  public static readonly LOBBY_KEEPALIVE_INTERVAL_MS = 25_000;
   private relayWs: WebSocket | null = null;
   private relayConnected: boolean = false;
   private relayPeerPresent: boolean = false;
   private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private relayKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private terminalRoomError: boolean = false;
+  private hostPeerJsIdTakenRetries: number = 0;
   private primaryRelayBaseUrl: string | null = null;
   private fallbackRelayBaseUrl: string | null = null;
   private activeRelayBaseUrl: string | null = null;
@@ -530,13 +543,16 @@ export class VitrailMultiplayerClient {
     this.role = options.role;
     this.roomCode = normalizeRoomCode(options.roomCode);
     this.roomSeed = (options.roomSeed ?? generateRoomSeed()) >>> 0;
-    this.clientId = `${this.role}-${randomAlphaNum(8)}`;
+    const providedId = options.clientId?.trim().slice(0, 48);
+    this.clientId = providedId && providedId.length >= 4 ? providedId : `${this.role}-${randomAlphaNum(8)}`;
     this.peerJsToken = `tok${randomAlphaNum(10)}`;
     this.hostTargetPeerId = `vitrail-v1-${this.roomCode}-host`;
+    const cleanGuestSuffix =
+      this.clientId.replace(/[^a-zA-Z0-9]/g, '').slice(-8) || randomAlphaNum(6);
     this.localPeerId =
       this.role === 'host'
         ? this.hostTargetPeerId
-        : `vitrail-v1-${this.roomCode}-g-${randomAlphaNum(6)}`;
+        : `vitrail-v1-${this.roomCode}-g-${cleanGuestSuffix}`;
 
     this.forcedRelayMode = isForcedRelayEnabled(options);
     const endpoints = resolveRelayEndpoints(options);
@@ -594,6 +610,8 @@ export class VitrailMultiplayerClient {
   public connect(): void {
     if (this.disposed) return;
     this.errorMessage = null;
+    this.terminalRoomError = false;
+    this.hostPeerJsIdTakenRetries = 0;
     this.webrtcUpgradeSuppressed = false;
     this.failedRelayBaseUrls.clear();
     this.updateStatus(this.role === 'host' ? 'waiting_peer' : 'connecting');
@@ -812,6 +830,30 @@ export class VitrailMultiplayerClient {
       this.activeRelayBaseUrl = baseUrl;
       this.failedRelayBaseUrls.delete(baseUrl);
       this.relayConnected = true;
+      if (this.relayKeepaliveTimer !== null) {
+        clearInterval(this.relayKeepaliveTimer);
+      }
+      const keepaliveMs = Math.max(
+        25,
+        this.options.lobbyKeepaliveIntervalMs ??
+          VitrailMultiplayerClient.LOBBY_KEEPALIVE_INTERVAL_MS
+      );
+      this.relayKeepaliveTimer = setInterval(() => {
+        if (
+          !this.disposed &&
+          !this.terminalRoomError &&
+          this.relayWs === ws &&
+          ws.readyState === WebSocket.OPEN &&
+          this.relayConnected &&
+          !this.peerConnected
+        ) {
+          try {
+            ws.send(JSON.stringify({ __relay: 'keepalive' }));
+          } catch {
+            // Ignore transient socket close
+          }
+        }
+      }, keepaliveMs);
       this.updateStatus();
     };
 
@@ -824,14 +866,32 @@ export class VitrailMultiplayerClient {
       // Handled in onclose
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev?: CloseEvent) => {
       if (this.relayWs !== ws) return;
       this.relayWs = null;
       this.relayConnected = false;
       this.relayPeerPresent = false;
+      if (this.relayKeepaliveTimer !== null) {
+        clearInterval(this.relayKeepaliveTimer);
+        this.relayKeepaliveTimer = null;
+      }
       if (!openedOnce) {
         this.failedRelayBaseUrls.add(baseUrl);
       }
+
+      const closeCode = typeof ev?.code === 'number' ? ev.code : 1006;
+      const closeReason = typeof ev?.reason === 'string' ? ev.reason.trim() : '';
+      if (closeCode === 1008 || this.terminalRoomError) {
+        this.terminalRoomError = true;
+        if (!this.errorMessage) {
+          this.errorMessage = closeReason || 'Room full (2/2 players)';
+        }
+        this.closePeerConnection();
+        this.cleanupPeerJsSocket();
+        this.updateStatus('error');
+        return;
+      }
+
       this.updateStatus();
 
       if (this.disposed) return;
@@ -851,7 +911,7 @@ export class VitrailMultiplayerClient {
       if (openedOnce) {
         this.relayReconnectTimer = setTimeout(() => {
           this.relayReconnectTimer = null;
-          if (!this.disposed) {
+          if (!this.disposed && !this.terminalRoomError) {
             this.connectRelaySocket(baseUrl, fallbackToPeerJsOnError, null);
           }
         }, 600);
@@ -863,8 +923,14 @@ export class VitrailMultiplayerClient {
   }
 
   private handleRelayMetaEnvelope(meta: RelayEnvelopeMessage): void {
+    if (meta.__relay === 'keepalive') {
+      return;
+    }
     if (meta.__relay === 'error') {
+      this.terminalRoomError = true;
       this.errorMessage = meta.message ?? 'Room error';
+      this.closePeerConnection();
+      this.cleanupPeerJsSocket();
       this.updateStatus('error');
       return;
     }
@@ -1004,44 +1070,87 @@ export class VitrailMultiplayerClient {
     };
   }
 
+  private ensureGuestPeerJsOfferRetryLoop(): void {
+    if (
+      this.disposed ||
+      this.terminalRoomError ||
+      this.role !== 'guest' ||
+      this.ctrlChannel?.readyState === 'open' ||
+      !this.canUpgradeWebRtc() ||
+      !this.isPeerJsAllowed()
+    ) {
+      return;
+    }
+    if (
+      !this.peerJsWs ||
+      this.peerJsWs.readyState === WebSocket.CLOSED ||
+      this.peerJsWs.readyState === WebSocket.CLOSING
+    ) {
+      this.connectPeerJsSignaling();
+      return;
+    }
+    if (this.peerJsOfferRetryTimer !== null) {
+      clearInterval(this.peerJsOfferRetryTimer);
+    }
+    const retryCadenceMs = this.getPreferredFallbackRelayUrl()
+      ? Math.max(this.webrtcHandshakeTimeoutMs + 400, 2600)
+      : this.hadPeerConnectionOnce
+        ? 850
+        : 2200;
+    this.peerJsOfferRetryTimer = setInterval(() => {
+      if (
+        this.disposed ||
+        this.terminalRoomError ||
+        this.ctrlChannel?.readyState === 'open' ||
+        !this.canUpgradeWebRtc()
+      ) {
+        if (this.peerJsOfferRetryTimer !== null) {
+          clearInterval(this.peerJsOfferRetryTimer);
+          this.peerJsOfferRetryTimer = null;
+        }
+        return;
+      }
+      if (this.peerJsOpen) {
+        void this.initiateWebRtcOffer('peerjs');
+      }
+    }, retryCadenceMs);
+  }
+
   private handlePeerJsSignalMessage(msg: PeerJsWireMessage): void {
     switch (msg.type) {
       case 'OPEN': {
         this.peerJsOpen = true;
+        this.hostPeerJsIdTakenRetries = 0;
         this.updateStatus();
         if (
           this.role === 'guest' &&
           this.ctrlChannel?.readyState !== 'open' &&
-          this.canUpgradeWebRtc()
+          this.canUpgradeWebRtc() &&
+          !this.terminalRoomError
         ) {
           void this.initiateWebRtcOffer('peerjs');
-          if (this.peerJsOfferRetryTimer !== null) {
-            clearInterval(this.peerJsOfferRetryTimer);
-          }
-          const retryCadenceMs = this.getPreferredFallbackRelayUrl()
-            ? Math.max(this.webrtcHandshakeTimeoutMs + 400, 2600)
-            : 2600;
-          this.peerJsOfferRetryTimer = setInterval(() => {
-            if (
-              this.disposed ||
-              this.ctrlChannel?.readyState === 'open' ||
-              !this.canUpgradeWebRtc()
-            ) {
-              if (this.peerJsOfferRetryTimer !== null) {
-                clearInterval(this.peerJsOfferRetryTimer);
-                this.peerJsOfferRetryTimer = null;
-              }
-              return;
-            }
-            if (this.peerJsOpen) {
-              void this.initiateWebRtcOffer('peerjs');
-            }
-          }, retryCadenceMs);
+          this.ensureGuestPeerJsOfferRetryLoop();
         }
         break;
       }
       case 'ID-TAKEN': {
         if (this.role === 'host') {
+          if (
+            this.options.isSessionReclaim &&
+            !this.terminalRoomError &&
+            this.hostPeerJsIdTakenRetries < 5
+          ) {
+            this.hostPeerJsIdTakenRetries++;
+            this.cleanupPeerJsSocket();
+            this.peerJsReconnectTimer = setTimeout(() => {
+              this.peerJsReconnectTimer = null;
+              if (!this.disposed && !this.terminalRoomError) {
+                this.connectPeerJsSignaling();
+              }
+            }, 350);
+            break;
+          }
+          this.terminalRoomError = true;
           this.errorMessage = `Room ${this.roomCode} already has an active Host.`;
           this.updateStatus('error');
           this.cleanupPeerJsSocket();
@@ -1053,6 +1162,51 @@ export class VitrailMultiplayerClient {
       }
       case 'OFFER': {
         if (this.role === 'host' && msg.src && msg.payload?.sdp && this.canUpgradeWebRtc()) {
+          const incomingClientId = msg.payload?.metadata?.clientId?.trim() || null;
+          const hasActiveBoundGuest =
+            this.peerConnected &&
+            (this.ctrlChannel?.readyState === 'open' || this.relayPeerPresent);
+          const isSameBoundGuest =
+            (incomingClientId !== null &&
+              this.remoteClientId !== null &&
+              incomingClientId === this.remoteClientId) ||
+            (incomingClientId === null &&
+              this.remoteGuestPeerId !== null &&
+              msg.src === this.remoteGuestPeerId);
+          if (hasActiveBoundGuest && !isSameBoundGuest) {
+            // Reject 3rd-peer WebRTC OFFER without disturbing the connected Guest 1 session.
+            // Send both `LEAVE` (custom PeerJS servers) AND a schema-valid `CANDIDATE` sentinel
+            // because public `0.peerjs.com` drops custom `LEAVE` payloads while forwarding `CANDIDATE` verbatim.
+            if (this.peerJsWs?.readyState === WebSocket.OPEN) {
+              this.peerJsWs.send(
+                JSON.stringify({
+                  type: 'CANDIDATE',
+                  dst: msg.src,
+                  payload: {
+                    connectionId: msg.payload.connectionId ?? 'dc_reject',
+                    type: 'data',
+                    candidate: {
+                      candidate: 'vitrail-reject:1008:Room full (2/2 players)',
+                      sdpMid: '0',
+                      sdpMLineIndex: 0,
+                    },
+                  },
+                })
+              );
+              this.peerJsWs.send(
+                JSON.stringify({
+                  type: 'LEAVE',
+                  dst: msg.src,
+                  payload: {
+                    code: 1008,
+                    reason: 'room-full',
+                    msg: 'Room full (2/2 players)',
+                  },
+                })
+              );
+            }
+            break;
+          }
           this.remoteGuestPeerId = msg.src;
           this.activeConnectionId = msg.payload.connectionId ?? `dc_${randomAlphaNum(8)}`;
           void this.acceptWebRtcOffer(msg.payload.sdp, 'peerjs', msg.src);
@@ -1066,6 +1220,20 @@ export class VitrailMultiplayerClient {
         break;
       }
       case 'CANDIDATE': {
+        const candStr = msg.payload?.candidate?.candidate;
+        if (
+          this.role === 'guest' &&
+          typeof candStr === 'string' &&
+          candStr.startsWith('vitrail-reject:1008:')
+        ) {
+          this.terminalRoomError = true;
+          this.errorMessage =
+            candStr.slice('vitrail-reject:1008:'.length).trim() || 'Room full (2/2 players)';
+          this.closePeerConnection();
+          this.cleanupPeerJsSocket();
+          this.updateStatus('error');
+          break;
+        }
         if (msg.payload?.candidate) {
           void this.addRemoteIceCandidate(msg.payload.candidate);
         }
@@ -1076,6 +1244,21 @@ export class VitrailMultiplayerClient {
         break;
       }
       case 'LEAVE': {
+        if (
+          this.role === 'guest' &&
+          msg.src === this.hostTargetPeerId &&
+          (!this.hadPeerConnectionOnce ||
+            msg.payload?.code === 1008 ||
+            msg.payload?.reason === 'room-full')
+        ) {
+          this.terminalRoomError = true;
+          this.errorMessage = msg.payload?.msg ?? 'Room full (2/2 players)';
+          this.closePeerConnection();
+          this.cleanupRelaySocket();
+          this.cleanupPeerJsSocket();
+          this.updateStatus('error');
+          break;
+        }
         if (msg.src && (msg.src === this.remoteGuestPeerId || msg.src === this.hostTargetPeerId)) {
           this.handleWebRtcDisconnectOrFailover('peerjs-leave');
         }
@@ -1094,7 +1277,7 @@ export class VitrailMultiplayerClient {
   }
 
   private handleWebRtcDisconnectOrFailover(reason: string): void {
-    if (this.disposed) return;
+    if (this.disposed || this.terminalRoomError) return;
     this.lastFailoverReason = reason;
     if (
       reason.startsWith('ice-') ||
@@ -1119,6 +1302,14 @@ export class VitrailMultiplayerClient {
     this.closePeerConnection();
     this.ensureRelaySocketConnectedImmediate();
     this.updateStatus();
+    if (
+      this.role === 'guest' &&
+      !this.getPreferredFallbackRelayUrl() &&
+      !this.forcedRelayMode &&
+      !this.webrtcUpgradeSuppressed
+    ) {
+      this.ensureGuestPeerJsOfferRetryLoop();
+    }
   }
 
   private createFreshPeerConnection(
@@ -1293,6 +1484,7 @@ export class VitrailMultiplayerClient {
                 reliable: true,
                 serialization: 'binary',
                 browser: 'Chrome',
+                metadata: { clientId: this.clientId },
                 sdp: sdpInit,
               },
             })
@@ -1478,6 +1670,14 @@ export class VitrailMultiplayerClient {
           this.relayPeerPresent = false;
         }
         this.updateStatus();
+        if (
+          this.role === 'guest' &&
+          !this.getPreferredFallbackRelayUrl() &&
+          !this.forcedRelayMode &&
+          !this.webrtcUpgradeSuppressed
+        ) {
+          this.ensureGuestPeerJsOfferRetryLoop();
+        }
         this.options.onRemotePeerBye?.(parsed.clientId);
       } else if (this.pcRemoteClientId === parsed.clientId) {
         this.closePeerConnection();
@@ -1651,6 +1851,10 @@ export class VitrailMultiplayerClient {
     if (this.relayReconnectTimer !== null) {
       clearTimeout(this.relayReconnectTimer);
       this.relayReconnectTimer = null;
+    }
+    if (this.relayKeepaliveTimer !== null) {
+      clearInterval(this.relayKeepaliveTimer);
+      this.relayKeepaliveTimer = null;
     }
     if (this.relayWs) {
       const ws = this.relayWs;

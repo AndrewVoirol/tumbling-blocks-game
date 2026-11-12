@@ -1027,4 +1027,98 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
 
     islandWorld.dispose();
   }, 45000);
+
+  it('C8: post-tumble rubble & parked shelf achieve 100% native tree sleep with 0 post-settle buzz while preserving fulcrum seesaw rocking & clamped-course silence', async () => {
+    await ensurePhysicsInitialized();
+
+    // 1. 18L Sandbox collapse must reach ntree_awake === 0 (0 visible jitter + 0 underground shelf ghost-wake)
+    // and emit 0 WobbleRockEvents / playGlassImpact calls after t = 1.6 s
+    let simT = 0;
+    let postSettleImpacts = 0;
+    let postSettleWobbles = 0;
+    class SilenceSpyAudio extends GlassAudioEngine {
+      public override playGlassImpact(): void {
+        if (simT >= 1.6) postSettleImpacts++;
+      }
+    }
+    const collapseAudio = new SilenceSpyAudio();
+    collapseAudio.setMuted(true);
+
+    const collapseWorld = new PhysicsWorld(collapseAudio, 18, { seed: 1 });
+    collapseWorld.rebuildTower('sandbox', 2, 18, 1);
+    for (let f = 0; f < 30; f++) collapseWorld.step(1 / 60);
+    collapseWorld.triggerSandboxCollapseImpulse();
+
+    for (let f = 1; f <= 180; f++) {
+      simT = f / 60;
+      collapseWorld.step(1 / 60);
+      const wob = collapseWorld.consumeWobbleEvents();
+      collapseWorld.consumeShardImpacts();
+      if (simT >= 1.6) postSettleWobbles += wob.length;
+    }
+
+    const collapseData = collapseWorld.getWorld().getData()!;
+    expect(collapseWorld.shatteredCount).toBeGreaterThanOrEqual(15);
+    expect(collapseData.ntree_awake).toBe(0);
+    expect(postSettleWobbles).toBe(0);
+    expect(postSettleImpacts).toBe(0);
+    collapseWorld.dispose();
+
+    // 2. 6.5-deg prism across transverse fulcrum block rocks with >= 5 reversals, emits discrete wobbles on seesaw block,
+    // emits 0 false wobbles on underlying stationary fulcrum block, and sleeps cleanly
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+    const seesawWorld = new PhysicsWorld(audio, 1, { seed: 1 });
+    seesawWorld.rebuildTower('sandbox', 2, 1, 1);
+    const rw = seesawWorld.getWorld();
+    const [bSeesaw, bFulcrum, bSpare] = seesawWorld.blocks;
+    rw.getRigidBody(bSpare.bodyHandle)!.setTranslation({ x: 2.5, y: BLOCK_HALF_Y, z: 0 }, true);
+    const qYaw90 = quatFromAxisAngle([0, 1, 0], Math.PI * 0.5);
+    rw.getRigidBody(bFulcrum.bodyHandle)!.setTranslation({ x: 0, y: BLOCK_HALF_Y, z: 0 }, true);
+    rw.getRigidBody(bFulcrum.bodyHandle)!.setRotation(
+      { x: qYaw90[0], y: qYaw90[1], z: qYaw90[2], w: qYaw90[3] },
+      true
+    );
+    rw.getRigidBody(bSeesaw.bodyHandle)!.setTranslation({ x: -2.5, y: BLOCK_HALF_Y, z: 0 }, true);
+    for (let k = 0; k < 120; k++) seesawWorld.step(1 / 600);
+    seesawWorld.consumeWobbleEvents();
+
+    const rad = (6.5 * Math.PI) / 180.0;
+    const halfSpan = BLOCK_WIDTH * 0.5 - 0.0125;
+    const yCenter =
+      BLOCK_HEIGHT + BLOCK_HALF_Y * Math.cos(rad) + halfSpan * Math.sin(rad) + 0.0004;
+    const qTilt = quatFromAxisAngle([0, 0, 1], rad);
+    const rbSeesaw = rw.getRigidBody(bSeesaw.bodyHandle)!;
+    rbSeesaw.setTranslation({ x: 0, y: yCenter, z: 0 }, true);
+    rbSeesaw.setRotation({ x: qTilt[0], y: qTilt[1], z: qTilt[2], w: qTilt[3] }, true);
+    rbSeesaw.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    rbSeesaw.setAngvel({ x: 0, y: 0, z: 0 }, true);
+
+    const mjModel = rw.getModel()!;
+    const mjData = rw.getData()!;
+    const sDof = mjModel.jnt_dofadr[mjModel.body_jntadr[bSeesaw.bodyHandle]];
+    let prevSign = 0;
+    let seesawFlips = 0;
+    let seesawWobbles = 0;
+    let fulcrumWobbles = 0;
+    for (let k = 0; k < 420; k++) {
+      seesawWorld.step(1 / 600);
+      const wz = mjData.qvel[sDof + 5];
+      if (Math.abs(wz) > 0.03) {
+        const sgn = wz > 0 ? 1 : -1;
+        if (prevSign !== 0 && sgn !== prevSign) seesawFlips++;
+        prevSign = sgn;
+      }
+      for (const w of seesawWorld.consumeWobbleEvents()) {
+        if (w.blockId === bSeesaw.id) seesawWobbles++;
+        if (w.blockId === bFulcrum.id) fulcrumWobbles++;
+        expect(w.clampingLoadN).toBeLessThan(1.1);
+      }
+    }
+    expect(seesawFlips).toBeGreaterThanOrEqual(5);
+    expect(seesawWobbles).toBeGreaterThanOrEqual(3);
+    expect(fulcrumWobbles).toBe(0);
+    expect(rw.getRigidBody(bSeesaw.bodyHandle)!.isSleeping()).toBe(true);
+    seesawWorld.dispose();
+  }, 35000);
 });

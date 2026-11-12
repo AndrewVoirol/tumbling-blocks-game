@@ -59,6 +59,7 @@ interface ExtendedGuestAudioHooks {
     clampingLoadN?: number,
     worldPos?: Vec3,
     options?: {
+      blockId?: number;
       surface?: 'glass' | 'wood';
       damage?: number;
       camPos?: Vec3;
@@ -287,20 +288,26 @@ export class MultiplayerGuestWorld {
     collapseReason: string | null;
     activeShardMetas: SerializedShardMeta[];
     retiredShardIds: number[];
+    totalActiveShards?: number;
     minSnapshotSeq?: number;
     currentAudioBatchSeq?: number;
   }): void {
     const nextSeed = params.roomSeed >>> 0;
     const isFreshWelcome = !this.hasReceivedWelcome && this.lastAcceptedSeq === 0;
     const seedChanged = this.roomSeed !== nextSeed;
+    const hostEpochReset =
+      typeof params.minSnapshotSeq === 'number' &&
+      Number.isFinite(params.minSnapshotSeq) &&
+      params.minSnapshotSeq >>> 0 < this.lastAcceptedSeq;
     this.hasReceivedWelcome = true;
 
     if (
       seedChanged ||
+      hostEpochReset ||
       this.blocks.length !== params.initialLayers * 3
     ) {
       this.initDeterministicTower(params.initialLayers, nextSeed, {
-        preserveSequenceState: !isFreshWelcome,
+        preserveSequenceState: !isFreshWelcome && !hostEpochReset,
       });
       this.hasReceivedWelcome = true;
     } else {
@@ -310,21 +317,29 @@ export class MultiplayerGuestWorld {
       }
     }
 
+    if (params.totalActiveShards === 0 && params.activeShardMetas.length === 0) {
+      this.shardMap.clear();
+      this.rebuildShardList();
+    }
+
     if (
       typeof params.minSnapshotSeq === 'number' &&
       Number.isFinite(params.minSnapshotSeq) &&
-      params.minSnapshotSeq > this.lastAcceptedSeq
+      (hostEpochReset || params.minSnapshotSeq > this.lastAcceptedSeq)
     ) {
       this.lastAcceptedSeq = params.minSnapshotSeq >>> 0;
     }
 
     if (
-      (isFreshWelcome || seedChanged) &&
+      (isFreshWelcome || seedChanged || hostEpochReset) &&
       typeof params.currentAudioBatchSeq === 'number' &&
       Number.isFinite(params.currentAudioBatchSeq)
     ) {
       const targetFloor = params.currentAudioBatchSeq >>> 0;
-      if (targetFloor > this.audioBatchSeqFloor) {
+      if (hostEpochReset) {
+        this.audioBatchSeqFloor = targetFloor;
+        this.receivedAudioBatchSeqs.clear();
+      } else if (targetFloor > this.audioBatchSeqFloor) {
         this.audioBatchSeqFloor = targetFloor;
         for (const seq of this.receivedAudioBatchSeqs) {
           if (seq <= targetFloor) {
@@ -880,6 +895,7 @@ export class MultiplayerGuestWorld {
             ev.clampingLoadN,
             ev.worldPos,
             {
+              blockId: ev.blockId,
               surface: ev.surface,
               damage: ev.damage,
               camPos: this.listenerCamPos,

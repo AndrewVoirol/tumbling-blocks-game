@@ -39,6 +39,7 @@ interface MinimalHttpModule {
 }
 
 interface NodeRelayModule {
+  isAllowedRelayOrigin(origin: string | null | undefined): boolean;
   attachVitrailRoomRelay(
     server: MinimalHttpServer,
     pathPrefix?: string
@@ -1135,6 +1136,21 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
     const host = new GameEngine();
     const guest1 = new GameEngine();
     const guestReloaded = new GameEngine();
+    const createMemoryTabStorage = () => {
+      const backing = new Map<string, string>();
+      return {
+        getItem: (k: string) => backing.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          backing.set(k, v);
+        },
+        removeItem: (k: string) => {
+          backing.delete(k);
+        },
+      };
+    };
+    const guestTabStore = createMemoryTabStorage();
+    guest1.setMpTabStorageForTesting(guestTabStore);
+    guestReloaded.setMpTabStorageForTesting(guestTabStore);
     await host.initHeadless();
     await guest1.initHeadless();
     await guestReloaded.initHeadless();
@@ -1199,8 +1215,8 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
         close: () => {},
       };
 
-      // Simulate abrupt Guest1 tab reload without clean dispose (new Guest tab connects on relay)
-      guestReloaded.joinOnlineRoom(code, {
+      // Simulate abrupt Guest1 tab F5 reload without clean dispose (same tab sessionStorage reclaims Guest1 clientId)
+      guestReloaded.restoreOrJoinOnlineRoomFromUrl(code, {
         relayUrl,
         roomSeed: 0x11111111, // Different initial seed -> must receive room_welcome with `seed`!
         enablePeerJsFallback: false,
@@ -1593,6 +1609,812 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
       host.dispose();
       (globalThis as unknown as { WebSocket: unknown }).WebSocket = origWS;
       (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = origRTC;
+    }
+  });
+
+  it('T-MP10: enforces 1008 Room full 3rd-peer Guest & PeerJS OFFER rejection, sessionStorage Host/Guest F5 reclaim, lobby keepalives, and cooldown/collapse audio gating', async () => {
+    const httpModName = 'node:http';
+    const relayModPath = '../workers/vitrail-rooms/nodeRelay.mjs';
+    const http = (await import(/* @vite-ignore */ httpModName)) as unknown as MinimalHttpModule;
+    const { attachVitrailRoomRelay } = (await import(
+      /* @vite-ignore */ relayModPath
+    )) as unknown as NodeRelayModule;
+
+    const server = http.createServer();
+    const relay = attachVitrailRoomRelay(server, '/__vitrail_mp');
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    const relayUrl = `ws://127.0.0.1:${port}`;
+
+    const makeTabStorage = () => {
+      const map = new Map<string, string>();
+      return {
+        getItem: (k: string) => map.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          map.set(k, v);
+        },
+        removeItem: (k: string) => {
+          map.delete(k);
+        },
+      };
+    };
+
+    const hostTabStore = makeTabStorage();
+    const guest1TabStore = makeTabStorage();
+    const intruderTabStore = makeTabStorage();
+
+    let intruderStatusChanges = 0;
+    const host = new GameEngine();
+    const guest1 = new GameEngine();
+    const intruder3 = new GameEngine(undefined, () => {
+      intruderStatusChanges++;
+    });
+    const dupHost = new GameEngine();
+    const hostReloaded = new GameEngine();
+    host.setMpTabStorageForTesting(hostTabStore);
+    guest1.setMpTabStorageForTesting(guest1TabStore);
+    intruder3.setMpTabStorageForTesting(intruderTabStore);
+    hostReloaded.setMpTabStorageForTesting(hostTabStore);
+
+    await Promise.all([
+      host.initHeadless(),
+      guest1.initHeadless(),
+      intruder3.initHeadless(),
+      dupHost.initHeadless(),
+      hostReloaded.initHeadless(),
+    ]);
+
+    try {
+      // 1. Host boots room with fast 60 ms lobby keepalive while `waiting_peer` (P1-4)
+      const seed = 0x778899aa;
+      const code = host.startOnlineHost('FULL5', {
+        relayUrl,
+        roomSeed: seed,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+        lobbyKeepaliveIntervalMs: 60,
+      });
+
+      await waitUntil(
+        () =>
+          host.getTelemetrySnapshot().mpConnectionState === 'waiting_peer' &&
+          !host.getTelemetrySnapshot().mpPeerConnected,
+        1500
+      );
+      await sleepMs(160);
+      // Relay silently absorbed >= 2 `{ __relay: 'keepalive' }` frames while waiting_peer
+      expect(host.getTelemetrySnapshot().mpConnectionState).toBe('waiting_peer');
+
+      // 2. Guest 1 joins -> 2/2 room full
+      guest1.restoreOrJoinOnlineRoomFromUrl(code, {
+        relayUrl,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+      await waitUntil(
+        () =>
+          Boolean(host.getTelemetrySnapshot().mpPeerConnected) &&
+          Boolean(guest1.getTelemetrySnapshot().mpPeerConnected),
+        2000
+      );
+      for (let i = 0; i < 6; i++) {
+        host.stepHeadless(1 / 60);
+        guest1.stepHeadless(1 / 60);
+        await sleepMs(5);
+      }
+      expect(guest1.mpRoomSeed).toBe(seed);
+
+      // 3. 3rd-peer Guest intrusion (empty tab storage -> new clientId) MUST be rejected with 1008 Room full & 0 reconnect storms (P0-1)
+      intruder3.restoreOrJoinOnlineRoomFromUrl(code, {
+        relayUrl,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+      await waitUntil(() => intruder3.getTelemetrySnapshot().mpConnectionState === 'error', 2000);
+      expect(intruder3.getTelemetrySnapshot().mpError).toContain('Room full (2/2 players)');
+      expect(intruder3.getTelemetrySnapshot().mpPeerConnected).toBe(false);
+      expect(guest1.getTelemetrySnapshot().mpPeerConnected).toBe(true);
+      expect(host.getTelemetrySnapshot().mpPeerConnected).toBe(true);
+
+      const changesAtTerminal = intruderStatusChanges;
+      await sleepMs(750);
+      expect(intruderStatusChanges).toBe(changesAtTerminal);
+      expect(guest1.getTelemetrySnapshot().mpPeerConnected).toBe(true);
+
+      // 4. Duplicate Host with different clientId is also rejected with 1008 while Host 1 stays connected
+      dupHost.startOnlineHost(code, {
+        relayUrl,
+        roomSeed: 0x12345678,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+      await waitUntil(() => dupHost.getTelemetrySnapshot().mpConnectionState === 'error', 2000);
+      expect(dupHost.getTelemetrySnapshot().mpError).toContain('already has an active Host');
+      expect(host.getTelemetrySnapshot().mpPeerConnected).toBe(true);
+      expect(guest1.getTelemetrySnapshot().mpPeerConnected).toBe(true);
+
+      // 5. P1-3: Cooldown-dropped `playGlassImpact` (< 12 ms) & `playWobbleRock` (< 65 ms per blockId) never transmit,
+      //    and `turnPhase === 'COLLAPSED'` caps collapse transient network audio at <= 25 Hz (>= 40 ms spacing)
+      let simClockSec = 10.0;
+      const makeMockNode = () => ({
+        gain: {
+          value: 1,
+          setValueAtTime() {},
+          linearRampToValueAtTime() {},
+          exponentialRampToValueAtTime() {},
+          setTargetAtTime() {},
+          cancelScheduledValues() {},
+        },
+        frequency: { value: 440, setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+        Q: { value: 1 },
+        pan: { value: 0 },
+        type: 'sine',
+        buffer: null,
+        loop: false,
+        onended: null,
+        connect() {
+          return this;
+        },
+        disconnect() {},
+        start() {},
+        stop() {},
+      });
+      const mockAudioCtx = {
+        sampleRate: 48000,
+        state: 'running',
+        get currentTime() {
+          return simClockSec;
+        },
+        destination: makeMockNode(),
+        createGain: makeMockNode,
+        createOscillator: makeMockNode,
+        createBiquadFilter: makeMockNode,
+        createStereoPanner: makeMockNode,
+        createBufferSource: makeMockNode,
+        createBuffer(_c: number, len: number) {
+          const buf = new Float32Array(Math.min(len, 2048));
+          return { getChannelData: () => buf };
+        },
+        resume: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+      };
+      (host.audio as unknown as { ctx: unknown; masterGain: unknown; muted: boolean }).ctx =
+        mockAudioCtx;
+      (host.audio as unknown as { masterGain: unknown }).masterGain = makeMockNode();
+      host.audio.setMuted(false);
+
+      host.benchPaused = true;
+      host.stepHeadless(1 / 60);
+      await sleepMs(25);
+      guest1.stepHeadless(1 / 60);
+
+      let guestImpactsRx = 0;
+      let guestWobblesRx = 0;
+      let guestLastWobbleBlockId: number | undefined;
+      const origGuestImpact = guest1.audio.playGlassImpact.bind(guest1.audio);
+      guest1.audio.playGlassImpact = (...args) => {
+        guestImpactsRx++;
+        return origGuestImpact(...args);
+      };
+      const origGuestWobble = guest1.audio.playWobbleRock.bind(guest1.audio);
+      guest1.audio.playWobbleRock = (tilt, speed, load, pos, opts) => {
+        guestWobblesRx++;
+        guestLastWobbleBlockId = opts?.blockId;
+        return origGuestWobble(tilt, speed, load, pos, opts);
+      };
+
+      // Fire 8 impacts + 8 wobbles at identical `simClockSec = 10.5` -> only 1 of each schedules & transmits!
+      simClockSec = 10.5;
+      for (let k = 0; k < 8; k++) {
+        host.audio.playGlassImpact(0.28, 1.0, [0, 0.4, 0], undefined, undefined, {
+          impactSpeedMps: 0.25,
+          surface: 'glass',
+        });
+        host.audio.playWobbleRock(0.06, 0.9, 0.2, [0, 0.4, 0], {
+          blockId: 17,
+          surface: 'glass',
+        });
+      }
+      (host as unknown as { pumpMultiplayerStep: (ms: number) => void }).pumpMultiplayerStep(
+        performance.now() + 100
+      );
+      await sleepMs(30);
+      guest1.stepHeadless(1 / 60);
+
+      expect(guestImpactsRx).toBe(1);
+      expect(guestWobblesRx).toBe(1);
+      expect(guestLastWobbleBlockId).toBe(17);
+
+      // Enter COLLAPSED state and fire 12 scheduled wobbles on distinct blockIds within 120 ms -> <= 25 Hz cap yields <= 4
+      guestWobblesRx = 0;
+      host.physics.turnPhase = 'COLLAPSED';
+      for (let k = 0; k < 12; k++) {
+        simClockSec += 0.02;
+        host.audio.playWobbleRock(0.07, 1.1, 0.15, [0, 0.2, 0], {
+          blockId: k + 1,
+          surface: 'glass',
+        });
+        await sleepMs(10);
+      }
+      (host as unknown as { pumpMultiplayerStep: (ms: number) => void }).pumpMultiplayerStep(
+        performance.now() + 200
+      );
+      await sleepMs(35);
+      guest1.stepHeadless(1 / 60);
+      expect(guestWobblesRx).toBeGreaterThanOrEqual(1);
+      expect(guestWobblesRx).toBeLessThanOrEqual(5);
+
+      // 6. P0-2: Host `F5` reload (`dispose()` preserves `vitrail_mp_tab_session_v1`, `restoreOrJoinOnlineRoomFromUrl` reclaims `host`!)
+      host.benchPaused = false;
+      host.dispose();
+      expect(hostTabStore.getItem('vitrail_mp_tab_session_v1')).not.toBeNull();
+
+      const reclaimedRole = hostReloaded.restoreOrJoinOnlineRoomFromUrl(code, {
+        relayUrl,
+        enablePeerJsFallback: false,
+        enableWebRtcUpgrade: false,
+      });
+      expect(reclaimedRole).toBe('host');
+      expect(hostReloaded.mpRole).toBe('host');
+      expect(hostReloaded.mpRoomSeed).toBe(seed);
+
+      await waitUntil(
+        () =>
+          Boolean(hostReloaded.getTelemetrySnapshot().mpPeerConnected) &&
+          Boolean(guest1.getTelemetrySnapshot().mpPeerConnected) &&
+          guest1.physics.turnPhase === 'SELECT_BLOCK',
+        2500
+      );
+      for (let i = 0; i < 6; i++) {
+        hostReloaded.stepHeadless(1 / 60);
+        guest1.stepHeadless(1 / 60);
+        await sleepMs(5);
+      }
+      expect(guest1.mpRoomSeed).toBe(seed);
+
+      // Leaving online room clears per-tab sessionStorage so future `?room=` opens join normally
+      hostReloaded.leaveOnlineRoom('solo', 2);
+      expect(hostTabStore.getItem('vitrail_mp_tab_session_v1')).toBeNull();
+    } finally {
+      host.dispose();
+      guest1.dispose();
+      intruder3.dispose();
+      dupHost.dispose();
+      hostReloaded.dispose();
+      relay.detach();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    // 7. P0-1 PeerJS `OFFER` 3rd-peer intrusion guard (`LEAVE` code 1008 without disturbing active WebRTC Guest 1)
+    const origWS = globalThis.WebSocket;
+    const origRTC = globalThis.RTCPeerConnection;
+    const peerSockets = new Map<string, MockPeerJsBusSocket>();
+
+    class MockPeerJsBusSocket {
+      public static readonly CONNECTING = 0;
+      public static readonly OPEN = 1;
+      public static readonly CLOSING = 2;
+      public static readonly CLOSED = 3;
+      public readyState = MockPeerJsBusSocket.CONNECTING;
+      public binaryType = 'arraybuffer';
+      public onopen: (() => void) | null = null;
+      public onmessage: ((ev: { data: unknown }) => void) | null = null;
+      public onerror: (() => void) | null = null;
+      public onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+      public readonly peerId: string;
+
+      constructor(url: string) {
+        const parsed = new URL(url);
+        this.peerId = parsed.searchParams.get('id') ?? '';
+        queueMicrotask(() => {
+          if (peerSockets.has(this.peerId)) {
+            this.readyState = MockPeerJsBusSocket.OPEN;
+            this.onopen?.();
+            this.onmessage?.({ data: JSON.stringify({ type: 'ID-TAKEN' }) });
+            return;
+          }
+          peerSockets.set(this.peerId, this);
+          this.readyState = MockPeerJsBusSocket.OPEN;
+          this.onopen?.();
+          this.onmessage?.({ data: JSON.stringify({ type: 'OPEN' }) });
+        });
+      }
+
+      public send(raw: string): void {
+        const msg = JSON.parse(raw) as { type: string; dst?: string };
+        if (msg.type === 'HEARTBEAT') {
+          queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ type: 'HEARTBEAT' }) }));
+          return;
+        }
+        const target = msg.dst ? peerSockets.get(msg.dst) : undefined;
+        if (target) {
+          queueMicrotask(() =>
+            target.onmessage?.({ data: JSON.stringify({ ...msg, src: this.peerId }) })
+          );
+        }
+      }
+
+      public close(code: number = 1000, reason: string = ''): void {
+        if (this.readyState === MockPeerJsBusSocket.CLOSED) return;
+        this.readyState = MockPeerJsBusSocket.CLOSED;
+        if (peerSockets.get(this.peerId) === this) {
+          peerSockets.delete(this.peerId);
+        }
+        this.onclose?.({ code, reason });
+      }
+    }
+
+    const activePcs: MockPeerRTC[] = [];
+    class MockPeerDC {
+      public binaryType = 'arraybuffer';
+      public readyState: 'connecting' | 'open' | 'closed' = 'connecting';
+      public onopen: (() => void) | null = null;
+      public onmessage: ((ev: { data: unknown }) => void) | null = null;
+      public onclose: (() => void) | null = null;
+      public peerChannel: MockPeerDC | null = null;
+      constructor(public readonly label: string, public readonly id: number) {}
+      public send(data: unknown): void {
+        if (this.readyState === 'open' && this.peerChannel?.readyState === 'open') {
+          const peer = this.peerChannel;
+          queueMicrotask(() => peer.onmessage?.({ data }));
+        }
+      }
+      public close(): void {
+        this.readyState = 'closed';
+        this.onclose?.();
+      }
+    }
+
+    class MockPeerRTC {
+      public signalingState: RTCSignalingState = 'stable';
+      public connectionState: RTCPeerConnectionState = 'new';
+      public iceConnectionState: RTCIceConnectionState = 'new';
+      public localDescription: RTCSessionDescriptionInit | null = null;
+      public remoteDescription: RTCSessionDescriptionInit | null = null;
+      public onicecandidate: ((ev: { candidate: null }) => void) | null = null;
+      public onconnectionstatechange: (() => void) | null = null;
+      public oniceconnectionstatechange: (() => void) | null = null;
+      public channels = new Map<number, MockPeerDC>();
+      constructor() {
+        activePcs.push(this);
+      }
+      public createDataChannel(label: string, opts: { id?: number }): MockPeerDC {
+        const ch = new MockPeerDC(label, opts.id ?? 0);
+        this.channels.set(ch.id, ch);
+        return ch;
+      }
+      public async createOffer(): Promise<RTCSessionDescriptionInit> {
+        return { type: 'offer', sdp: 'v=0\r\n' };
+      }
+      public async createAnswer(): Promise<RTCSessionDescriptionInit> {
+        return { type: 'answer', sdp: 'v=0\r\n' };
+      }
+      public async setLocalDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+        this.localDescription = desc;
+        this.signalingState = desc.type === 'offer' ? 'have-local-offer' : 'stable';
+      }
+      public async setRemoteDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+        this.remoteDescription = desc;
+        if (desc.type === 'answer' && activePcs.length >= 2) {
+          this.signalingState = 'stable';
+          const [pcA, pcB] = activePcs.slice(-2);
+          for (const [id, chA] of pcA.channels.entries()) {
+            const chB = pcB.channels.get(id);
+            if (chB) {
+              chA.peerChannel = chB;
+              chB.peerChannel = chA;
+              chA.readyState = 'open';
+              chB.readyState = 'open';
+              queueMicrotask(() => {
+                chA.onopen?.();
+                chB.onopen?.();
+              });
+            }
+          }
+        }
+      }
+      public async addIceCandidate(): Promise<void> {}
+      public close(): void {
+        this.connectionState = 'closed';
+        for (const ch of this.channels.values()) ch.close();
+      }
+    }
+
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = MockPeerJsBusSocket;
+    (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = MockPeerRTC;
+
+    const pjsHost = new GameEngine();
+    const pjsGuest1 = new GameEngine();
+    const pjsIntruder3 = new GameEngine();
+    await Promise.all([pjsHost.initHeadless(), pjsGuest1.initHeadless(), pjsIntruder3.initHeadless()]);
+    try {
+      const pjsCode = pjsHost.startOnlineHost('PJS3P', {
+        relayUrl: null,
+        peerJsUrl: 'wss://0.peerjs.com/peerjs',
+        enablePeerJsFallback: true,
+        roomSeed: 0x334455,
+      });
+      pjsGuest1.joinOnlineRoom(pjsCode, {
+        relayUrl: null,
+        peerJsUrl: 'wss://0.peerjs.com/peerjs',
+        enablePeerJsFallback: true,
+        roomSeed: 0x334455,
+      });
+      await waitUntil(
+        () =>
+          pjsHost.getTelemetrySnapshot().mpTransport === 'webrtc-p2p' &&
+          pjsGuest1.getTelemetrySnapshot().mpTransport === 'webrtc-p2p',
+        2000
+      );
+      pjsHost.stepHeadless(1 / 60);
+      await sleepMs(15);
+      pjsGuest1.stepHeadless(1 / 60);
+
+      pjsIntruder3.joinOnlineRoom(pjsCode, {
+        relayUrl: null,
+        peerJsUrl: 'wss://0.peerjs.com/peerjs',
+        enablePeerJsFallback: true,
+      });
+      await waitUntil(
+        () => pjsIntruder3.getTelemetrySnapshot().mpConnectionState === 'error',
+        2000
+      );
+      expect(pjsIntruder3.getTelemetrySnapshot().mpError).toContain('Room full (2/2 players)');
+      expect(pjsIntruder3.getTelemetrySnapshot().mpPeerConnected).toBe(false);
+      expect(pjsGuest1.getTelemetrySnapshot().mpPeerConnected).toBe(true);
+      expect(pjsGuest1.getTelemetrySnapshot().mpTransport).toBe('webrtc-p2p');
+    } finally {
+      pjsIntruder3.dispose();
+      pjsGuest1.dispose();
+      pjsHost.dispose();
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket = origWS;
+      (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = origRTC;
+    }
+  });
+
+  it('T-MP11: Non-inhibiting relay abuse guard rejects foreign Origins (403) & non-0x564d / >16 KB binary / >512 KB or non-JSON frames while passing 0x564d & ~400 KB 512-shard room_welcome', async () => {
+    const httpModName = 'node:http';
+    const netModName = 'node:net';
+    const relayModPath = '../workers/vitrail-rooms/nodeRelay.mjs';
+    const cfModPath = '../workers/vitrail-rooms/src/index';
+
+    const http = (await import(/* @vite-ignore */ httpModName)) as unknown as MinimalHttpModule;
+    const net = (await import(/* @vite-ignore */ netModName)) as unknown as {
+      createConnection(opts: { host: string; port: number }, cb: () => void): {
+        write(data: string): void;
+        on(ev: string, cb: (chunk?: { toString(enc?: string): string }) => void): void;
+        destroy(): void;
+      };
+    };
+    const { attachVitrailRoomRelay, isAllowedRelayOrigin: nodeIsAllowed } = (await import(
+      /* @vite-ignore */ relayModPath
+    )) as unknown as NodeRelayModule;
+
+    interface MockCfSocket {
+      sent: Array<string | ArrayBuffer>;
+      closeCode: number | null;
+      readyState: number;
+      attachment: unknown;
+      send(msg: string | ArrayBuffer): void;
+      close(code?: number, reason?: string): void;
+      serializeAttachment(v: unknown): void;
+      deserializeAttachment(): unknown;
+    }
+    interface CfWorkerModule {
+      isAllowedRelayOrigin(origin: string | null | undefined): boolean;
+      default: {
+        fetch(
+          req: Request,
+          env: {
+            VITRAIL_ROOMS: {
+              idFromName(name: string): string;
+              get(id: string): { fetch(req: Request): Promise<Response> };
+            };
+          }
+        ): Promise<Response>;
+      };
+      VitrailRoomDurableObject: new (state: {
+        acceptWebSocket(ws: MockCfSocket, tags: string[]): void;
+        getWebSockets(tag?: string): MockCfSocket[];
+      }) => {
+        webSocketMessage(ws: MockCfSocket, message: string | ArrayBuffer): void;
+      };
+    }
+
+    const cfMod = (await import(/* @vite-ignore */ cfModPath)) as unknown as CfWorkerModule;
+
+    // 1. Permissive Origin allowlist parity across Cloudflare Worker and Node dev relay
+    const allowedOrigins: Array<string | null | undefined> = [
+      null,
+      undefined,
+      '',
+      'null',
+      'https://vitrail.andrewvoirol.com',
+      'https://preview.andrewvoirol.com',
+      'https://tumbling-blocks-git-main-andrew.vercel.app',
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'http://[::1]:5173',
+      'http://macbook-pro.local:5173',
+      'http://10.0.1.15:5173',
+      'http://192.168.1.42:5173',
+      'http://172.16.0.4:5173',
+      'http://172.31.255.200:5173',
+    ];
+    for (const orig of allowedOrigins) {
+      expect(nodeIsAllowed(orig)).toBe(true);
+      expect(cfMod.isAllowedRelayOrigin(orig)).toBe(true);
+    }
+
+    const blockedOrigins = [
+      'https://evil.example.com',
+      'https://10.evil.com',
+      'https://192.168.evil.com',
+      'http://172.15.0.1:5173',
+      'http://172.32.0.1:5173',
+      'https://vitrail.andrewvoirol.com.attacker.io',
+      ':::bad-origin:::',
+    ];
+    for (const orig of blockedOrigins) {
+      expect(nodeIsAllowed(orig)).toBe(false);
+      expect(cfMod.isAllowedRelayOrigin(orig)).toBe(false);
+    }
+
+    // Verify Cloudflare Worker `fetch` rejects foreign Origin with 403 before touching DO namespace
+    let doCalls = 0;
+    const mockEnv = {
+      VITRAIL_ROOMS: {
+        idFromName: (n: string) => n,
+        get: () => {
+          doCalls++;
+          return {
+            fetch: async () => new Response('ok', { status: 200 }),
+          };
+        },
+      },
+    };
+    const cfEvilRes = await cfMod.default.fetch(
+      new Request('https://vitrail-rooms.andrew9687.workers.dev/__vitrail_mp?room=TEST9', {
+        headers: {
+          Origin: 'https://evil.example.com',
+          Upgrade: 'websocket',
+          Connection: 'Upgrade',
+        },
+      }),
+      mockEnv
+    );
+    expect(cfEvilRes.status).toBe(403);
+    expect(doCalls).toBe(0);
+
+    const cfGoodRes = await cfMod.default.fetch(
+      new Request('https://vitrail-rooms.andrew9687.workers.dev/__vitrail_mp?room=TEST9', {
+        headers: {
+          Origin: 'https://vitrail.andrewvoirol.com',
+          Upgrade: 'websocket',
+          Connection: 'Upgrade',
+        },
+      }),
+      mockEnv
+    );
+    expect(cfGoodRes.status).toBe(200);
+    expect(doCalls).toBe(1);
+
+    // 2. Verify Cloudflare Durable Object `webSocketMessage` payload guard directly
+    const makeCfRoomHarness = () => {
+      const tagged = new Map<string, MockCfSocket[]>();
+      const makeSock = (role: 'host' | 'guest'): MockCfSocket => {
+        const s: MockCfSocket = {
+          sent: [],
+          closeCode: null,
+          readyState: 1,
+          attachment: { role, clientId: `${role}-1` },
+          send(m) {
+            s.sent.push(m);
+          },
+          close(code = 1000) {
+            s.closeCode = code;
+            s.readyState = 3;
+          },
+          serializeAttachment(v) {
+            s.attachment = v;
+          },
+          deserializeAttachment() {
+            return s.attachment;
+          },
+        };
+        return s;
+      };
+      const doObj = new cfMod.VitrailRoomDurableObject({
+        acceptWebSocket(ws, tags) {
+          for (const t of tags) {
+            const list = tagged.get(t) ?? [];
+            list.push(ws);
+            tagged.set(t, list);
+          }
+        },
+        getWebSockets(tag) {
+          if (!tag) return [...(tagged.get('host') ?? []), ...(tagged.get('guest') ?? [])];
+          return tagged.get(tag) ?? [];
+        },
+      });
+      const hostWs = makeSock('host');
+      const guestWs = makeSock('guest');
+      tagged.set('host', [hostWs]);
+      tagged.set('guest', [guestWs]);
+      return { doObj, hostWs, guestWs };
+    };
+
+    const validFrameBuf = encodeMultiplayerStateFrame({
+      seq: 7,
+      hostElapsedSec: 1.25,
+      roomSeed: 0xabcde,
+      turnPhase: 'PULLING',
+      gameMode: 'party',
+      currentPlayer: 0,
+      playerCount: 2,
+      blocksStacked: 0,
+      shatteredCount: 0,
+      currentLayers: 18,
+      peakLayers: 18,
+      activeBlockId: null,
+      hoveredBlockId: null,
+      hoveredSlotIndex: -1,
+      lockedMinRow: null,
+      isPointerDraggingBlock: false,
+      isExtractionLiftReady: false,
+      polariscopeMode: false,
+      grabResistance01: 0,
+      settleProgress01: 1,
+      leanAngleDeg: 0,
+      wobbleSpeedDegPerSec: 0,
+      liveHeightCm: 27.0,
+      peakHeightCm: 27.0,
+      centerOfMassXZCm: [0, 0],
+      carriedYawOffsetRad: 0,
+      grabCurrentWorldOnBlock: [0, 0, 0],
+      grabWorldAnchor: [0, 0, 0],
+      carriedLandingPos: [0, 2.775, 0],
+      carriedTargetQuat: [0, 0, 0, 1],
+      topSupportSurfaceCenter: [0, 2.7, 0],
+      topSupportUpNormal: [0, 1, 0],
+      topSupportDefaultRot: [0, 0, 0, 1],
+      topSupportTargetLayer: 18,
+      blocks: [],
+      shards: [],
+      splinters: [],
+    });
+    const bigWelcomeJson = JSON.stringify({
+      type: 'room_welcome',
+      roomCode: 'GUARD',
+      pad: 'x'.repeat(400_000),
+    });
+
+    {
+      const { doObj, hostWs, guestWs } = makeCfRoomHarness();
+      doObj.webSocketMessage(hostWs, validFrameBuf);
+      doObj.webSocketMessage(hostWs, bigWelcomeJson);
+      expect(hostWs.closeCode).toBeNull();
+      expect(guestWs.sent.length).toBe(2);
+      expect((guestWs.sent[0] as ArrayBuffer).byteLength).toBe(validFrameBuf.byteLength);
+      expect(guestWs.sent[1]).toBe(bigWelcomeJson);
+    }
+    {
+      const { doObj, hostWs, guestWs } = makeCfRoomHarness();
+      const badMagic = new Uint8Array([0xde, 0xad, 0xbe, 0xef]).buffer;
+      doObj.webSocketMessage(hostWs, badMagic);
+      expect(hostWs.closeCode).toBe(1003);
+      expect(guestWs.sent.filter((m) => typeof m !== 'string')).toHaveLength(0);
+    }
+    {
+      const { doObj, hostWs, guestWs } = makeCfRoomHarness();
+      const hugeBin = new Uint8Array(20_000);
+      hugeBin[0] = 0x4d;
+      hugeBin[1] = 0x56;
+      doObj.webSocketMessage(hostWs, hugeBin.buffer);
+      expect(hostWs.closeCode).toBe(1009);
+      expect(guestWs.sent.filter((m) => typeof m !== 'string')).toHaveLength(0);
+    }
+    {
+      const { doObj, hostWs } = makeCfRoomHarness();
+      doObj.webSocketMessage(hostWs, 'not-json-at-all');
+      expect(hostWs.closeCode).toBe(1003);
+    }
+    {
+      const { doObj, hostWs } = makeCfRoomHarness();
+      doObj.webSocketMessage(hostWs, `{"oversized":"${'y'.repeat(530_000)}"}`);
+      expect(hostWs.closeCode).toBe(1009);
+    }
+
+    // 3. End-to-end socket verification against `nodeRelay.mjs` over real local TCP/WebSocket
+    const server = http.createServer();
+    const relay = attachVitrailRoomRelay(server, '/__vitrail_mp');
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    try {
+      const rawUpgradeStatus = await new Promise<number>((resolve) => {
+        let resp = '';
+        const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+          sock.write(
+            'GET /__vitrail_mp?room=GUARD&role=guest HTTP/1.1\r\n' +
+              `Host: 127.0.0.1:${port}\r\n` +
+              'Origin: https://evil.example.com\r\n' +
+              'Upgrade: websocket\r\n' +
+              'Connection: Upgrade\r\n\r\n'
+          );
+        });
+        sock.on('data', (chunk) => {
+          if (chunk) resp += chunk.toString('utf8');
+        });
+        sock.on('close', () => {
+          const m = /^HTTP\/1\.1 (\d{3})/.exec(resp);
+          resolve(m ? Number(m[1]) : 0);
+        });
+      });
+      expect(rawUpgradeStatus).toBe(403);
+
+      const openRelayWs = (role: 'host' | 'guest', clientId: string) =>
+        new Promise<{
+          ws: WebSocket;
+          rxBin: number[];
+          rxText: string[];
+          closed: { code: number } | null;
+          getClosed: () => { code: number } | null;
+        }>((resolve, reject) => {
+          const ws = new WebSocket(
+            `ws://127.0.0.1:${port}/__vitrail_mp?room=GUARD&role=${role}&clientId=${clientId}`
+          );
+          ws.binaryType = 'arraybuffer';
+          const rxBin: number[] = [];
+          const rxText: string[] = [];
+          let closed: { code: number } | null = null;
+          ws.onmessage = (ev) => {
+            if (typeof ev.data === 'string') {
+              if (!ev.data.includes('"__relay"')) rxText.push(ev.data);
+            } else if (ev.data instanceof ArrayBuffer) {
+              rxBin.push(ev.data.byteLength);
+            }
+          };
+          ws.onclose = (ev) => {
+            closed = { code: ev.code };
+          };
+          ws.onopen = () =>
+            resolve({ ws, rxBin, rxText, closed, getClosed: () => closed });
+          ws.onerror = () => reject(new Error('WS error'));
+        });
+
+      const h1 = await openRelayWs('host', 'h-ok');
+      const g1 = await openRelayWs('guest', 'g-ok');
+
+      // Valid 0x564d binary + ~400 KB room_welcome JSON pass cleanly
+      h1.ws.send(validFrameBuf);
+      h1.ws.send(bigWelcomeJson);
+      await waitUntil(() => g1.rxBin.length === 1 && g1.rxText.length === 1, 1500);
+      expect(g1.rxBin[0]).toBe(validFrameBuf.byteLength);
+      expect(g1.rxText[0].length).toBe(bigWelcomeJson.length);
+
+      // Non-0x564d binary closes sender with 1003 without forwarding to Guest
+      h1.ws.send(new Uint8Array([0x01, 0x02, 0x03, 0x04]));
+      await waitUntil(() => h1.getClosed() !== null, 1500);
+      expect(h1.getClosed()?.code).toBe(1003);
+      expect(g1.rxBin.length).toBe(1);
+
+      // Reconnect Host and send > 16 KB binary -> closes with 1009 without forwarding to Guest
+      const h2 = await openRelayWs('host', 'h-oversize');
+      const overBin = new Uint8Array(20_000);
+      overBin[0] = 0x4d;
+      overBin[1] = 0x56;
+      h2.ws.send(overBin);
+      await waitUntil(() => h2.getClosed() !== null, 1500);
+      expect(h2.getClosed()?.code).toBe(1009);
+      expect(g1.rxBin.length).toBe(1);
+
+      g1.ws.close();
+    } finally {
+      relay.detach();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 });

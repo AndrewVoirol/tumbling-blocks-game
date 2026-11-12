@@ -9,13 +9,13 @@ description: >-
 
 # Vitrail Simulation Mastery & Swarm Audit Playbook
 
-Use this playbook and its executable 7-probe dynamical harness (`scripts/audit-dynamics.mjs`) to verify physical accuracy across continuous AND multi-stage stateful trajectories—catching defects that single-shot endpoint unit tests miss—and to partition multi-agent `swarm` work cleanly without file collisions.
+Use this playbook and its executable 9-probe dynamical harness (`scripts/audit-dynamics.mjs`) to verify physical accuracy across continuous AND multi-stage stateful trajectories—catching defects that single-shot endpoint unit tests miss—and to partition multi-agent `swarm` work cleanly without file collisions.
 
 ---
 
 ## 1. Fast Verification Pipeline (Run Before & After Any Simulation Change)
 
-1. **7-Probe Continuous & Multi-Stage Dynamics Harness (`~6 s`, exits `1` on any regression)**:
+1. **9-Probe Continuous & Multi-Stage Dynamics Harness (`~7 s`, exits `1` on any regression)**:
    ```bash
    node .agents/skills/vitrail-simulation-audit/scripts/audit-dynamics.mjs
    ```
@@ -27,6 +27,8 @@ Use this playbook and its executable 7-probe dynamical harness (`scripts/audit-d
    - `polariscopeSpatialAccuracy`: Unloaded top course `[0,0,0,0]`, loose Row-0 slot `[0,0,0,0]`, cantilevered half `< 0.02` vs. `+X` bearing fulcrum `> 0.28`.
    - `grazingPullIsolation`: Full-row grazing extraction keeps upper-course lateral drift `< 2.0 mm` and cleanly clears Layer-0 tabletop prisms.
    - `multiStageSupportLossAndTelemetry`: Multi-stage Sandbox play (shatter upper courses so Voronoi shards sleep perched at `y ~ 20–22 cm` + rest 1 crooked `22°` top-notch outlier block -> verify consensus `leanAngleDeg < 2.0°` -> buckle/shatter supporting tower underneath -> verify `0` unsupported elevated shards freeze in mid-air and HUD telemetry transitions cleanly to `currentLayers = 0` / `Toppled`).
+   - `postCollapse100PctSleepAndSilence`: Sandbox `18L` collapse reaches `ntree_awake === 0` (`<= 2.4 s`) with `0` post-`1.6 s` `wobbleRock` / `glassImpact` buzz (`condim="3"` frictioned `parking_shelf`, kinetic-speed-gated `mjDSBL_MULTICCD`).
+   - `fulcrumSeesawAndClampedWobbleIsolation`: `6.5°` rubble fulcrum seesaw rocks (`>= 5` flips, `>= 3` `wobbleRock` on seesaw, `0` on fulcrum) and sleeps, while clamped Layer-1 bearing blocks (`>= 1.1 N` top load) emit `0` false wobbles.
 2. **MuJoCo 4.0 Calibration Scorecard (`8/8` Gates, `~5 s`)**:
    ```bash
    npm run calibrate:physics
@@ -39,9 +41,10 @@ Use this playbook and its executable 7-probe dynamical harness (`scripts/audit-d
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `46/46` Vitest Suite (`6` suites: `T1–T9`, `C1–C7`, `520`-Seed Stateful Fuzzer, iPad Touch/HUD, Acoustics & Multiplayer, `~45 s`) + Standalone Stateful Trajectory Fuzzer**:
+5. **Complete `58/58` Vitest Suite (`7` suites: `T1–T9`, `C1–C8`, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos) + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
    ```bash
    npx vitest run
+   npm run verify:mp:live
    node scripts/fuzz-stateful-trajectories.mjs --seeds 500 --actions 80
    ```
 

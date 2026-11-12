@@ -818,12 +818,14 @@ class ChaosTransportNetwork {
  * `playGlassImpact`, and `playGlassShatter` execute their full internal codepaths (verifying
  * `installHostAudioTap`'s `runTopLevelGuarded` never double-records nested calls!).
  */
-function attachMockAudioContextAndCounters(audioEngine, clock) {
+function attachMockAudioContextAndCounters(audioEngine, clock, options = {}) {
+  const onlyCountScheduled = Boolean(options.onlyCountScheduled);
   const counts = {
     blockThud: 0,
     glassImpact: 0,
     glassShatter: 0,
     nestedCallsSuppressed: 0,
+    cooldownDropped: 0,
   };
 
   const dummyParam = {
@@ -881,14 +883,20 @@ function attachMockAudioContextAndCounters(audioEngine, clock) {
     const orig = audioEngine[methodName].bind(audioEngine);
     audioEngine[methodName] = (...args) => {
       const isTop = depth === 0;
-      if (isTop) {
-        counts[key]++;
-      } else {
+      if (!isTop) {
         counts.nestedCallsSuppressed++;
       }
       depth++;
       try {
-        return orig(...args);
+        const res = orig(...args);
+        if (isTop) {
+          if (onlyCountScheduled && res === false) {
+            counts.cooldownDropped++;
+          } else {
+            counts[key]++;
+          }
+        }
+        return res;
       } finally {
         depth--;
       }
@@ -921,6 +929,7 @@ function attachMockAudioContextAndCounters(audioEngine, clock) {
       counts.glassImpact = 0;
       counts.glassShatter = 0;
       counts.nestedCallsSuppressed = 0;
+      counts.cooldownDropped = 0;
     },
   };
 }
@@ -974,7 +983,9 @@ export async function createChaosMultiplayerSuite(deps) {
     await host.initHeadless();
     await guest.initHeadless();
 
-    const hostAudioTracker = attachMockAudioContextAndCounters(host.audio, clock);
+    const hostAudioTracker = attachMockAudioContextAndCounters(host.audio, clock, {
+      onlyCountScheduled: true,
+    });
     const guestAudioTracker = attachMockAudioContextAndCounters(guest.audio, clock);
     // Re-wrap Host audio tap ON TOP of our counter wrapper so `hostAudioTracker` sees exact Host calls!
     host.hostAudioTapInstalled = false;

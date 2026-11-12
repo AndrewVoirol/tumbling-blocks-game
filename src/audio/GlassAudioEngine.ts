@@ -140,6 +140,11 @@ export class GlassAudioEngine {
   private shardWindowStartSec: number = -1;
   private shardWindowGrainsUsed: number = 0;
 
+  /** True when the most recent `playGlassImpact` call passed amplitude/cooldown/voice-budget gates */
+  public lastImpactPassedGate: boolean = false;
+  /** True when the most recent `playWobbleRock` call passed schedule/cooldown/voice-budget gates */
+  public lastWobblePassedGate: boolean = false;
+
   private readonly prng = createMulberry32(0x676c6173);
 
   public lastTapDiagnostics: {
@@ -874,15 +879,31 @@ export class GlassAudioEngine {
     camPos?: [number, number, number],
     camRight?: [number, number, number],
     options?: GlassImpactOptions
-  ): void {
-    if (!this.ctx || !this.masterGain || this.muted) return;
+  ): boolean | void {
     const intensity = clampFinite(intensity01, 0.0, 1.0, 0.0);
-    if (intensity <= 0.002 && !options?.impactSpeedMps) return;
+    if (intensity <= 0.002 && !options?.impactSpeedMps) {
+      this.lastImpactPassedGate = false;
+      return false;
+    }
+
+    const clockNow = this.ctx
+      ? this.ctx.currentTime
+      : (typeof performance !== 'undefined' ? performance.now() : Date.now()) * 0.001;
+    const clinkDt = clockNow - this.lastClinkTime;
+    if (clinkDt >= 0 && clinkDt < 0.012 && intensity < 0.48) {
+      this.lastImpactPassedGate = false;
+      return false;
+    }
+    this.lastClinkTime = clockNow;
+
+    if (!this.ctx || !this.masterGain || this.muted) {
+      // Passed physical threshold + 12 ms cooldown (headless test or locally muted Host)
+      this.lastImpactPassedGate = !this.muted && !this.ctx;
+      return false;
+    }
 
     const now = this.ctx.currentTime;
     const sr = this.ctx.sampleRate || 48000;
-    if (now - this.lastClinkTime < 0.012 && intensity < 0.48) return;
-    this.lastClinkTime = now;
 
     const pScale = clampFinite(pitchScale, 0.5, 2.5, 1.0);
     // Legacy MujocoPhysicsEngine passes pitchScale = 0.92 when bestHitTable === true
@@ -921,6 +942,7 @@ export class GlassAudioEngine {
     const gainBase = clampFinite(0.018 + intensity * 0.33, 0.015, 0.36, 0.12);
     const detune = 0.988 + this.prng() * 0.024;
     const priorityBase = 0.45 + 0.35 * intensity;
+    let scheduledVoices = 0;
 
     for (let i = 0; i < selectedModes.length; i++) {
       const m = selectedModes[i];
@@ -952,6 +974,7 @@ export class GlassAudioEngine {
       this.registerTransientVoice(osc, [g], cleanup, stopT, priorityBase - i * 0.05);
       osc.start(now);
       osc.stop(stopT);
+      scheduledVoices++;
 
       // Crazed glass doublet-splitting beat partner on the primary flexural mode
       if (i === 0 && damage > 0.12 && m.splitBeatHz > 1.0 && this.acquireVoiceSlot(now, priorityBase - 0.08)) {
@@ -1002,6 +1025,7 @@ export class GlassAudioEngine {
       const stopClick = now + pulseDur + 0.008;
       this.registerTransientVoice(click, [bp, cg], cleanupClick, stopClick, priorityBase - 0.12);
       click.start(now, this.prng() * 1.5, pulseDur + 0.008);
+      scheduledVoices++;
     }
 
     // Voice circular white-oak Kirchhoff plate modes on wood substrate impacts
@@ -1015,6 +1039,9 @@ export class GlassAudioEngine {
             : 0.35;
       this.triggerOakPlateModes(vnMps, gainBase * 0.62, radialNorm, worldPos, camPos, camRight);
     }
+
+    this.lastImpactPassedGate = scheduledVoices > 0;
+    return scheduledVoices > 0;
   }
 
   /**
@@ -1035,16 +1062,31 @@ export class GlassAudioEngine {
       clampingLoadN,
       surface
     );
-    if (schedule.length === 0) return 0;
-    if (!this.ctx || !this.masterGain || this.muted) return 0;
+    if (schedule.length === 0) {
+      this.lastWobblePassedGate = false;
+      return 0;
+    }
+
+    const clockNow = this.ctx
+      ? this.ctx.currentTime
+      : (typeof performance !== 'undefined' ? performance.now() : Date.now()) * 0.001;
+    if (options?.blockId !== undefined) {
+      const prevT = this.wobbleBlockLastTimeSec.get(options.blockId) ?? -10;
+      const wobbleDt = clockNow - prevT;
+      if (wobbleDt >= 0 && wobbleDt < 0.065) {
+        this.lastWobblePassedGate = false;
+        return 0;
+      }
+      this.wobbleBlockLastTimeSec.set(options.blockId, clockNow);
+    }
+
+    if (!this.ctx || !this.masterGain || this.muted) {
+      this.lastWobblePassedGate = !this.muted && !this.ctx;
+      return 0;
+    }
 
     const now = this.ctx.currentTime;
     const sr = this.ctx.sampleRate || 48000;
-    if (options?.blockId !== undefined) {
-      const prevT = this.wobbleBlockLastTimeSec.get(options.blockId) ?? -10;
-      if (now - prevT < 0.065) return 0;
-      this.wobbleBlockLastTimeSec.set(options.blockId, now);
-    }
 
     const damage = clampFinite(options?.damage ?? 0.0, 0.0, 1.0, 0.0);
     const modes = computeGlassBarModes({ damage, clampingLoadN });
@@ -1098,6 +1140,7 @@ export class GlassAudioEngine {
       }
     }
 
+    this.lastWobblePassedGate = scheduledCount > 0;
     return scheduledCount;
   }
 

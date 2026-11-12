@@ -390,6 +390,10 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [showHelp]);
 
+  useEffect(() => {
+    engineRef.current?.setOnlineLobbyOpen(onlineDrawerOpen && !Boolean(telemetry.mpRole));
+  }, [onlineDrawerOpen, telemetry.mpRole]);
+
   const playUiDown = useCallback((tone: UiSoundTone) => {
     engineRef.current?.audio.playUiKeyDown(tone);
   }, []);
@@ -399,9 +403,14 @@ export const App: React.FC = () => {
   }, []);
 
   const handleModeChange = (mode: GameMode) => {
+    const wasOnlineDrawerOnly = onlineDrawerOpen && !telemetry.mpRole;
     setOnlineDrawerOpen(false);
+    engineRef.current?.setOnlineLobbyOpen(false);
     if (telemetry.mpRole) {
       engineRef.current?.leaveOnlineRoom(mode, telemetry.playerCount);
+      return;
+    }
+    if (wasOnlineDrawerOnly && mode === telemetry.gameMode) {
       return;
     }
     engineRef.current?.resetGame(mode, telemetry.playerCount);
@@ -409,6 +418,9 @@ export const App: React.FC = () => {
 
   const handleSelectOnlineTab = () => {
     setOnlineDrawerOpen(true);
+    if (!telemetry.mpRole) {
+      engineRef.current?.setOnlineLobbyOpen(true);
+    }
   };
 
   const handleHostOnlineRoom = () => {
@@ -936,6 +948,8 @@ export const App: React.FC = () => {
                           <span>Host</span>
                         </QuarryButton>
                         <input
+                          id="online-room-code-input"
+                          name="roomCode"
                           type="text"
                           value={joinCodeDraft}
                           onChange={(e) => setJoinCodeDraft(normalizeRoomCode(e.target.value))}
@@ -1297,7 +1311,7 @@ export const App: React.FC = () => {
                 </div>
                 <p className="monument-prose">
                   {telemetry.shatteredCount > 0
-                    ? 'The stained-glass stack gave way across the walnut table.'
+                    ? 'The stained-glass stack gave way across the oak table.'
                     : 'The stained-glass stack lost equilibrium and tumbled.'}{' '}
                   Reached <strong>{telemetry.peakHeightCm.toFixed(1)} cm</strong> (
                   {telemetry.peakLayers} {telemetry.peakLayers === 1 ? 'course' : 'courses'}) with{' '}
