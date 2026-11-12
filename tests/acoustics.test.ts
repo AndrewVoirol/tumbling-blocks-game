@@ -582,4 +582,105 @@ describe('Vitrail First-Principles Physical Modal & Impact Acoustics', () => {
     expect(proxy.impacts).toBe(1);
     proxy.dispose();
   });
+
+  it('9. triggers Kirchhoff white-oak plate modes on explicit options.surface === "wood" (pitchScale = 1.0) and unlocks iOS/WebKit suspended/interrupted contexts', async () => {
+    // A. Explicit options.surface === 'wood' with pitchScale = 1.0 (> 0.94) MUST excite oak plate modes (90..650 Hz)
+    const woodCtx = new InstrumentedMockAudioContext();
+    const woodAudio = new GlassAudioEngine(woodCtx as unknown as AudioContext);
+    const baseOscCountWood = woodCtx.createdOscillators.length;
+
+    woodAudio.playGlassImpact(0.82, 1.0, [1.8, 0.05, -0.6], undefined, undefined, {
+      surface: 'wood',
+      radialNorm: 0.75,
+    });
+
+    const woodImpactOscs = woodCtx.createdOscillators.slice(baseOscCountWood);
+    const oakPlateOscs = woodImpactOscs.filter((o) =>
+      o.frequencyValues.some((f) => f >= 90 && f <= 650)
+    );
+    expect(oakPlateOscs.length).toBeGreaterThanOrEqual(2);
+
+    // Contrast: options.surface === 'glass' at identical pitchScale = 1.0 must NOT excite oak plate oscillators
+    const glassCtx = new InstrumentedMockAudioContext();
+    const glassAudio = new GlassAudioEngine(glassCtx as unknown as AudioContext);
+    const baseOscCountGlass = glassCtx.createdOscillators.length;
+
+    glassAudio.playGlassImpact(0.82, 1.0, [1.8, 0.05, -0.6], undefined, undefined, {
+      surface: 'glass',
+    });
+
+    const glassImpactOscs = glassCtx.createdOscillators.slice(baseOscCountGlass);
+    const glassLowOakOscs = glassImpactOscs.filter((o) =>
+      o.frequencyValues.some((f) => f >= 90 && f <= 650)
+    );
+    expect(glassLowOakOscs.length).toBe(0);
+
+    // Contrast: playBlockThud triggers oak plate modes once (no double-voicing via skipOakPlateModes)
+    const thudCtx = new InstrumentedMockAudioContext();
+    const thudAudio = new GlassAudioEngine(thudCtx as unknown as AudioContext);
+    const baseOscCountThud = thudCtx.createdOscillators.length;
+    thudAudio.playBlockThud(0.9, [1.8, 0.05, -0.6], { radialNorm: 0.75 });
+    const thudOakOscs = thudCtx.createdOscillators
+      .slice(baseOscCountThud)
+      .filter((o) => o.frequencyValues.some((f) => f >= 90 && f <= 650));
+    expect(thudOakOscs.length).toBeGreaterThanOrEqual(2);
+    expect(thudOakOscs.length).toBeLessThanOrEqual(4);
+
+    woodAudio.dispose();
+    glassAudio.dispose();
+    thudAudio.dispose();
+
+    // B. iOS/WebKit first-gesture AudioContext.resume() unlock across 'suspended', 'interrupted', and rejected promises
+    const iosCtx = new InstrumentedMockAudioContext();
+    iosCtx.state = 'suspended';
+    let resumeCalls = 0;
+    let bufferOneSampleCount = 0;
+    const origCreateBuffer = iosCtx.createBuffer.bind(iosCtx);
+    iosCtx.createBuffer = (channels: number, length: number, sr: number) => {
+      if (length === 1) bufferOneSampleCount++;
+      return origCreateBuffer(channels, length, sr);
+    };
+    iosCtx.resume = async () => {
+      resumeCalls++;
+      iosCtx.state = 'running';
+    };
+
+    const iosAudio = new GlassAudioEngine(iosCtx as unknown as AudioContext);
+    expect(iosAudio.getContextState()).toBe('suspended');
+    expect(iosAudio.isUnlockedAndRunning()).toBe(false);
+
+    iosAudio.unlock();
+    await Promise.resolve();
+    expect(resumeCalls).toBe(1);
+    expect(bufferOneSampleCount).toBe(1);
+    expect(iosAudio.isUnlockedAndRunning()).toBe(true);
+
+    // Simulate iOS Safari background/phone-call 'interrupted' state + rejected first attempt before gesture
+    (iosCtx as unknown as { state: string }).state = 'interrupted';
+    expect(iosAudio.isUnlockedAndRunning()).toBe(false);
+    let rejectOnce = true;
+    iosCtx.resume = () => {
+      resumeCalls++;
+      if (rejectOnce) {
+        rejectOnce = false;
+        return Promise.reject(new Error('NotAllowedError: user gesture required'));
+      }
+      iosCtx.state = 'running';
+      return Promise.resolve();
+    };
+
+    // Must swallow async rejection cleanly without unhandledRejection, then succeed on next user gesture
+    expect(() => iosAudio.unlock()).not.toThrow();
+    await Promise.resolve();
+    expect(iosAudio.isUnlockedAndRunning()).toBe(false);
+
+    iosAudio.unlock();
+    await Promise.resolve();
+    expect(resumeCalls).toBe(3);
+    expect(bufferOneSampleCount).toBe(1); // 1-sample silent warmup only fires once
+    expect(iosAudio.isUnlockedAndRunning()).toBe(true);
+
+    iosAudio.dispose();
+  });
 });
+

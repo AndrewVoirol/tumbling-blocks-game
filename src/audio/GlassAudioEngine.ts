@@ -24,6 +24,10 @@ export interface GlassImpactOptions {
   massKg?: number;
   /** Effective local Hertzian contact curvature radius in meters (default 0.0022 m beveled crown) */
   effectiveRadiusM?: number;
+  /** Normalized radial strike coordinate r / R_table in [0, 1] across the R = 43 cm circular oak table */
+  radialNorm?: number;
+  /** Suppresses automatic circular white-oak Kirchhoff plate modes when already voiced by caller */
+  skipOakPlateModes?: boolean;
 }
 
 export interface BlockThudOptions {
@@ -368,17 +372,62 @@ export class GlassAudioEngine {
     return this.connectWithExplicitPan(source, pan);
   }
 
+  private unlockedWarmupDone: boolean = false;
+
+  public getContextState(): AudioContextState | 'interrupted' | 'uninitialized' {
+    if (!this.ctx) return 'uninitialized';
+    return (this.ctx.state as AudioContextState | 'interrupted') ?? 'suspended';
+  }
+
+  public isUnlockedAndRunning(): boolean {
+    return Boolean(this.ctx && this.ctx.state === 'running');
+  }
+
   public unlock(): void {
-    if (typeof window === 'undefined') return;
     if (!this.ctx) {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      const scope = (typeof window !== 'undefined' ? window : globalThis) as unknown as {
+        AudioContext?: typeof AudioContext;
+        webkitAudioContext?: typeof AudioContext;
+      };
+      const AudioCtx = scope.AudioContext || scope.webkitAudioContext;
       if (!AudioCtx) return;
       this.attachAudioContext(new AudioCtx());
     }
-    if (this.ctx && this.ctx.state === 'suspended') {
-      void this.ctx.resume();
+    if (!this.ctx) return;
+
+    const state = this.ctx.state as AudioContextState | 'interrupted';
+    if (state !== 'running' && state !== 'closed') {
+      try {
+        const resumePromise = this.ctx.resume();
+        if (resumePromise && typeof resumePromise.catch === 'function') {
+          resumePromise.catch(() => {
+            // iOS/WebKit may reject resume() outside an active user gesture; next gesture will retry
+          });
+        }
+      } catch {
+        // Ignore synchronous state transition errors on restricted WebKit contexts
+      }
+
+      if (!this.unlockedWarmupDone) {
+        this.unlockedWarmupDone = true;
+        try {
+          const sr = this.ctx.sampleRate || 48000;
+          const silentBuf = this.ctx.createBuffer(1, 1, sr);
+          const warmSrc = this.ctx.createBufferSource();
+          warmSrc.buffer = silentBuf;
+          warmSrc.connect(this.ctx.destination);
+          warmSrc.onended = () => {
+            try {
+              warmSrc.disconnect();
+            } catch {
+              // Ignore cleanup error
+            }
+          };
+          warmSrc.start(0);
+        } catch {
+          // Ignore if mock or context disallows immediate 1-sample warmup
+        }
+      }
     }
   }
 
@@ -808,6 +857,8 @@ export class GlassAudioEngine {
         damage: resolvedDamage,
         surface: 'wood',
         massKg: resolvedMassKg,
+        radialNorm,
+        skipOakPlateModes: true,
       }
     );
   }
@@ -953,11 +1004,15 @@ export class GlassAudioEngine {
       click.start(now, this.prng() * 1.5, pulseDur + 0.008);
     }
 
-    // Automatically voice circular white-oak Kirchhoff plate modes when legacy caller hits table (pitchScale <= 0.94)
-    if (inferredWoodFromPitch) {
-      const radialNorm = worldPos
-        ? clampFinite(Math.hypot(worldPos[0] ?? 0, worldPos[2] ?? 0) / 4.3, 0, 1, 0.35)
-        : 0.35;
+    // Voice circular white-oak Kirchhoff plate modes on wood substrate impacts
+    // (triggered for explicit `options.surface === 'wood'` as well as legacy `pitchScale <= 0.94` table hits)
+    if (surface === 'wood' && !options?.skipOakPlateModes) {
+      const radialNorm =
+        options?.radialNorm !== undefined
+          ? clampFinite(options.radialNorm, 0, 1, 0.35)
+          : worldPos
+            ? clampFinite(Math.hypot(worldPos[0] ?? 0, worldPos[2] ?? 0) / 4.3, 0, 1, 0.35)
+            : 0.35;
       this.triggerOakPlateModes(vnMps, gainBase * 0.62, radialNorm, worldPos, camPos, camRight);
     }
   }

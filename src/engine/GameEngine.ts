@@ -46,7 +46,30 @@ import {
   VitrailMultiplayerClientOptions,
 } from '../multiplayer';
 
+export type AiDifficulty = 'apprentice' | 'master';
+
+export interface TouchExtractionPlan {
+  blockId: number;
+  pullDirXZ: [number, number];
+  azimuthRad: number;
+  azimuthOffsetDeg: number;
+  dirSign: 1 | -1;
+  localGrab: Vec3;
+  startWorld: Vec3;
+  minNeighborClearanceDm: number;
+}
+
+export interface AdversarialPlacementPlan {
+  targetXZ: [number, number];
+  localVU: [number, number];
+  yawOffsetRad: number;
+  predictedComXZCm: [number, number];
+  predictedMinCourseMarginDm: number;
+}
+
 export interface VitrailHudTelemetry extends TowerTelemetry {
+  aiDifficulty?: AiDifficulty;
+  aiVsAiEnabled?: boolean;
   mpActive?: boolean;
   mpRole?: MultiplayerRole | null;
   mpRoomCode?: string | null;
@@ -111,6 +134,9 @@ export type OnlineSessionOverrides = Omit<
 >;
 
 export class GameEngine {
+  /** Second-finger arrival window (ms) within which an optimistic 1-finger grab is canceled into pinch/pan */
+  public static readonly MULTI_TOUCH_GRAB_CANCEL_WINDOW_MS = 80;
+
   private canvas: HTMLCanvasElement;
   public audio: GlassAudioEngine;
   public physics!: PhysicsWorld;
@@ -123,16 +149,24 @@ export class GameEngine {
   private lastFrameMs: number = 0;
   private elapsedSec: number = 0;
   private lastTelemetryEmitMs: number = 0;
-  private listener: TelemetryListener | null = null;
+  private listener: TelemetryListener | null;
 
-  // Pointer interaction tracking
+  // Pointer & multi-touch interaction tracking
   private activePointerId: number | null = null;
   private activeTouches = new Map<number, [number, number]>();
+  private primaryTouchDownMs: number = -Infinity;
   private lastPinchDist: number = 0;
+  private lastPinchMidpoint: [number, number] = [0, 0];
   private pointerDownPos: [number, number] = [0, 0];
   private lastPointerPos: [number, number] = [0, 0];
   private pointerMovedDist: number = 0;
-  private interactionMode: 'none' | 'orbit' | 'block_pending' | 'block' | 'place_top' = 'none';
+  private interactionMode:
+    | 'none'
+    | 'orbit'
+    | 'block_pending'
+    | 'block'
+    | 'place_top'
+    | 'pinch_pan' = 'none';
   private pendingTapHit: { blockId: number; hit: RayOBBHit } | null = null;
   private grabAnchorOrigin: Vec3 = [0, 0, 0];
 
@@ -140,13 +174,17 @@ export class GameEngine {
   public benchPaused: boolean = false;
   public benchCameraLocked: boolean = false;
   public aiOpponentEnabled: boolean = false;
+  public aiDifficulty: AiDifficulty = 'master';
+  public aiVsAiEnabled: boolean = false;
+  public aiFastCadence: boolean = false;
+  private aiPlayerDifficulties: [AiDifficulty, AiDifficulty] = ['master', 'master'];
   public aiThinking: boolean = false;
   public aiActionLabel: string | null = null;
   public polariscopeMode: boolean = false;
   public physicsWorkerActive: boolean = false;
   private resizeObserver: ResizeObserver | null = null;
 
-  // Master Glazier AI turn controller state
+  // Glazier AI 2-ply turn controller state
   private aiStage:
     | 'idle'
     | 'scouting'
@@ -156,11 +194,16 @@ export class GameEngine {
     | 'pulling'
     | 'placing' = 'idle';
   private aiTimerSec: number = 0;
+  private aiPullProgressSec: number = 0;
   private aiTargetBlockId: number | null = null;
   private aiPullStartWorld: Vec3 = [0, 0, 0];
+  private aiPullBlockInitXZ: [number, number] = [0, 0];
   private aiPullDirXZ: [number, number] = [1, 0];
   private aiHoverTargetXZ: [number, number] = [0, 0];
   private aiHoverCurrentXZ: [number, number] = [0, 0];
+  private aiTargetYawOffsetRad: number = 0;
+  private aiAbortedBlockIds: Set<number> = new Set();
+  private aiLastBlocksStacked: number = -1;
 
   // Internet Multiplayer (Host-Authoritative + Render-Interpolated Guest Mirror)
   private authoritativePhysics: PhysicsWorld | null = null;
@@ -187,7 +230,7 @@ export class GameEngine {
   private mpLastCollapseReasonSent: string | null = null;
   private mpGuestCmdSeq: number = 0;
   private mpLastGuestCmdSentMs: number = 0;
-  private mpLastSentGuestHoverId: number | null = null;
+  private mpLastSentGuestHoverId: number | null;
   private mpPendingPullTarget: Vec3 | null = null;
   private mpExpectedPalette: Array<{
     swatchId: number;
@@ -202,6 +245,7 @@ export class GameEngine {
   private hostSlotLocalCentroids = new Map<number, Vec3>();
   private hostActiveShardMetas = new Map<number, SerializedShardMeta>();
   private hostAudioTapInstalled: boolean = false;
+  private hostAudioTapDepth: number = 0;
   private mpOutboundAudioQueue: NetworkAudioEvent[] = [];
   private mpLastSlideAudioSentMs: number = 0;
   private mpLastSlideWasNonZero: boolean = false;
@@ -210,6 +254,7 @@ export class GameEngine {
   constructor(canvas?: HTMLCanvasElement, onTelemetry?: TelemetryListener) {
     this.canvas = canvas ?? ({ style: {} } as HTMLCanvasElement);
     this.listener = onTelemetry ?? null;
+    this.mpLastSentGuestHoverId = null;
     this.audio = new GlassAudioEngine();
     this.camera = new OrbitCamera();
   }
@@ -438,6 +483,8 @@ export class GameEngine {
     this.listener({
       ...base,
       aiOpponentEnabled: this.aiOpponentEnabled,
+      aiDifficulty: this.aiDifficulty,
+      aiVsAiEnabled: this.aiVsAiEnabled,
       aiThinking: this.aiThinking,
       aiActionLabel: this.aiActionLabel,
       polariscopeMode: this.polariscopeMode,
@@ -458,6 +505,8 @@ export class GameEngine {
     return {
       ...base,
       aiOpponentEnabled: this.aiOpponentEnabled,
+      aiDifficulty: this.aiDifficulty,
+      aiVsAiEnabled: this.aiVsAiEnabled,
       aiThinking: this.aiThinking,
       aiActionLabel: this.aiActionLabel,
       polariscopeMode: this.polariscopeMode,
@@ -662,9 +711,27 @@ export class GameEngine {
     }
   }
 
-  private installHostAudioTap(): void {
+  public getOutboundAudioQueueSnapshot(): ReadonlyArray<NetworkAudioEvent> {
+    return [...this.mpOutboundAudioQueue];
+  }
+
+  public installHostAudioTap(): void {
     if (this.hostAudioTapInstalled) return;
     this.hostAudioTapInstalled = true;
+
+    const runTopLevelGuarded = <T>(fn: () => T, onTopLevel: (res: T) => void): T => {
+      const isTopLevel = this.hostAudioTapDepth === 0;
+      this.hostAudioTapDepth++;
+      try {
+        const result = fn();
+        if (isTopLevel) {
+          onTopLevel(result);
+        }
+        return result;
+      } finally {
+        this.hostAudioTapDepth--;
+      }
+    };
 
     const audioAny = this.audio as unknown as {
       updateSlideFriction: (
@@ -720,107 +787,139 @@ export class GameEngine {
 
     const origSlide = audioAny.updateSlideFriction.bind(this.audio);
     audioAny.updateSlideFriction = (speed, res, power = 0, torsion = 0, loadN) => {
-      origSlide(speed, res, power, torsion, loadN);
-      if (this.mpRole !== 'host' || !this.mpStatus.peerConnected) return;
-      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      const isZero = speed <= 0.001;
-      if (isZero && this.mpLastSlideWasNonZero) {
-        this.mpLastSlideWasNonZero = false;
-        this.mpLastSlideAudioSentMs = now;
-        this.enqueueHostAudioEvent({
-          kind: 'slideFriction',
-          slideSpeedDmPerSec: 0,
-          resistance01: 0,
-          slipPowerMw: 0,
-          torsionRadPerSec: 0,
-          clampingLoadN: loadN,
-        });
-      } else if (!isZero && now - this.mpLastSlideAudioSentMs >= 48) {
-        this.mpLastSlideWasNonZero = true;
-        this.mpLastSlideAudioSentMs = now;
-        this.enqueueHostAudioEvent({
-          kind: 'slideFriction',
-          slideSpeedDmPerSec: speed,
-          resistance01: res,
-          slipPowerMw: power,
-          torsionRadPerSec: torsion,
-          clampingLoadN: loadN,
-        });
-      }
+      runTopLevelGuarded(
+        () => origSlide(speed, res, power, torsion, loadN),
+        () => {
+          if (this.mpRole !== 'host' || !this.mpStatus.peerConnected) return;
+          const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          const isZero = speed <= 0.001;
+          if (isZero && this.mpLastSlideWasNonZero) {
+            this.mpLastSlideWasNonZero = false;
+            this.mpLastSlideAudioSentMs = now;
+            this.enqueueHostAudioEvent({
+              kind: 'slideFriction',
+              slideSpeedDmPerSec: 0,
+              resistance01: 0,
+              slipPowerMw: 0,
+              torsionRadPerSec: 0,
+              clampingLoadN: loadN,
+            });
+          } else if (!isZero && now - this.mpLastSlideAudioSentMs >= 48) {
+            this.mpLastSlideWasNonZero = true;
+            this.mpLastSlideAudioSentMs = now;
+            this.enqueueHostAudioEvent({
+              kind: 'slideFriction',
+              slideSpeedDmPerSec: speed,
+              resistance01: res,
+              slipPowerMw: power,
+              torsionRadPerSec: torsion,
+              clampingLoadN: loadN,
+            });
+          }
+        }
+      );
     };
 
     const origTap = audioAny.playTapTestResonance.bind(this.audio);
     audioAny.playTapTestResonance = (pinch01, worldPos, camPos, camRight, damage) => {
-      origTap(pinch01, worldPos, camPos, camRight, damage);
-      this.enqueueHostAudioEvent({ kind: 'tapTest', pinch01, worldPos, damage });
+      runTopLevelGuarded(
+        () => origTap(pinch01, worldPos, camPos, camRight, damage),
+        () => {
+          this.enqueueHostAudioEvent({ kind: 'tapTest', pinch01, worldPos, damage });
+        }
+      );
     };
 
     const origImpact = audioAny.playGlassImpact.bind(this.audio);
     audioAny.playGlassImpact = (intensity01, pitchMul = 1.0, worldPos, camPos, camRight, opts) => {
-      origImpact(intensity01, pitchMul, worldPos, camPos, camRight, opts);
-      this.enqueueHostAudioEvent({
-        kind: 'glassImpact',
-        intensity01,
-        pitchMul,
-        worldPos,
-        impactSpeedMps: opts?.impactSpeedMps,
-        damage: opts?.damage,
-        surface: opts?.surface,
-      });
+      runTopLevelGuarded(
+        () => origImpact(intensity01, pitchMul, worldPos, camPos, camRight, opts),
+        () => {
+          this.enqueueHostAudioEvent({
+            kind: 'glassImpact',
+            intensity01,
+            pitchMul,
+            worldPos,
+            impactSpeedMps: opts?.impactSpeedMps,
+            damage: opts?.damage,
+            surface: opts?.surface,
+          });
+        }
+      );
     };
 
     const origCrack = audioAny.playGlassCrack.bind(this.audio);
     audioAny.playGlassCrack = (damage01, worldPos, camPos, camRight) => {
-      origCrack(damage01, worldPos, camPos, camRight);
-      this.enqueueHostAudioEvent({ kind: 'glassCrack', damage01, worldPos });
+      runTopLevelGuarded(
+        () => origCrack(damage01, worldPos, camPos, camRight),
+        () => {
+          this.enqueueHostAudioEvent({ kind: 'glassCrack', damage01, worldPos });
+        }
+      );
     };
 
     const origShatter = audioAny.playGlassShatter.bind(this.audio);
     audioAny.playGlassShatter = (intensity01, hitTable = false, worldPos, camPos, camRight) => {
-      origShatter(intensity01, hitTable, worldPos, camPos, camRight);
-      this.enqueueHostAudioEvent({ kind: 'glassShatter', intensity01, hitTable, worldPos });
+      runTopLevelGuarded(
+        () => origShatter(intensity01, hitTable, worldPos, camPos, camRight),
+        () => {
+          this.enqueueHostAudioEvent({ kind: 'glassShatter', intensity01, hitTable, worldPos });
+        }
+      );
     };
 
     const origRanked = audioAny.playRankedShardCollisions.bind(this.audio);
     audioAny.playRankedShardCollisions = (events, camPos, camRight) => {
-      origRanked(events, camPos, camRight);
-      if (events.length > 0) {
-        this.enqueueHostAudioEvent({ kind: 'rankedShards', events: events.slice(0, 6) });
-      }
+      runTopLevelGuarded(
+        () => origRanked(events, camPos, camRight),
+        () => {
+          if (events.length > 0) {
+            this.enqueueHostAudioEvent({ kind: 'rankedShards', events: events.slice(0, 6) });
+          }
+        }
+      );
     };
 
     const origStack = audioAny.playStackSuccess.bind(this.audio);
     audioAny.playStackSuccess = (layerCount) => {
-      origStack(layerCount);
-      this.enqueueHostAudioEvent({ kind: 'stackSuccess', layerCount });
+      runTopLevelGuarded(
+        () => origStack(layerCount),
+        () => {
+          this.enqueueHostAudioEvent({ kind: 'stackSuccess', layerCount });
+        }
+      );
     };
 
     if (typeof audioAny.playShardImpacts === 'function') {
       const origShardImpacts = audioAny.playShardImpacts.bind(this.audio);
-      audioAny.playShardImpacts = (impacts, camPos, camRight) => {
-        const played = origShardImpacts(impacts, camPos, camRight);
-        if (impacts.length > 0) {
-          this.enqueueHostAudioEvent({ kind: 'shardImpacts', impacts: impacts.slice(0, 8) });
-        }
-        return played;
-      };
+      audioAny.playShardImpacts = (impacts, camPos, camRight) =>
+        runTopLevelGuarded(
+          () => origShardImpacts(impacts, camPos, camRight),
+          () => {
+            if (impacts.length > 0) {
+              this.enqueueHostAudioEvent({ kind: 'shardImpacts', impacts: impacts.slice(0, 8) });
+            }
+          }
+        );
     }
 
     if (typeof audioAny.playWobbleRock === 'function') {
       const origWobble = audioAny.playWobbleRock.bind(this.audio);
-      audioAny.playWobbleRock = (tilt, speed = 0, load = 0, worldPos = [0, 0, 0], opts) => {
-        const played = origWobble(tilt, speed, load, worldPos, opts);
-        this.enqueueHostAudioEvent({
-          kind: 'wobbleRock',
-          tiltAngleRad: tilt,
-          angularSpeedRadPerSec: speed,
-          clampingLoadN: load,
-          worldPos,
-          surface: opts?.surface ?? 'glass',
-          damage: opts?.damage ?? 0,
-        });
-        return played;
-      };
+      audioAny.playWobbleRock = (tilt, speed = 0, load = 0, worldPos = [0, 0, 0], opts) =>
+        runTopLevelGuarded(
+          () => origWobble(tilt, speed, load, worldPos, opts),
+          () => {
+            this.enqueueHostAudioEvent({
+              kind: 'wobbleRock',
+              tiltAngleRad: tilt,
+              angularSpeedRadPerSec: speed,
+              clampingLoadN: load,
+              worldPos,
+              surface: opts?.surface ?? 'glass',
+              damage: opts?.damage ?? 0,
+            });
+          }
+        );
     }
   }
 
@@ -1444,9 +1543,26 @@ export class GameEngine {
     this.emitTelemetry(true);
   }
 
-  public setAiOpponentEnabled(enabled: boolean): void {
+  public setAiDifficulty(difficulty: AiDifficulty): void {
+    this.aiDifficulty = difficulty;
+    this.aiPlayerDifficulties[1] = difficulty;
+    if (this.aiStage === 'scouting' || this.aiStage === 'idle') {
+      this.resetAiController();
+    }
+    this.emitTelemetry(true);
+  }
+
+  public setAiOpponentEnabled(enabled: boolean, difficulty?: AiDifficulty): void {
+    if (difficulty) {
+      this.aiDifficulty = difficulty;
+      this.aiPlayerDifficulties[1] = difficulty;
+    }
     if (enabled && this.mpRole) {
       this.leaveOnlineRoom('party', 2);
+    }
+    if (!enabled) {
+      this.aiVsAiEnabled = false;
+      this.aiFastCadence = false;
     }
     this.aiOpponentEnabled = enabled;
     this.resetAiController();
@@ -1457,38 +1573,1005 @@ export class GameEngine {
     this.emitTelemetry(true);
   }
 
+  /**
+   * Configures autonomous 2-player AI-vs-AI play for headless 30-turn Vitest benchmarks or spectator matches.
+   */
+  public setAiVsAiMode(
+    enabled: boolean,
+    options?: {
+      fastCadence?: boolean;
+      p0Difficulty?: AiDifficulty;
+      p1Difficulty?: AiDifficulty;
+    }
+  ): void {
+    if (enabled && this.mpRole) {
+      this.leaveOnlineRoom('party', 2);
+    }
+    this.aiVsAiEnabled = enabled;
+    this.aiOpponentEnabled = enabled;
+    this.aiFastCadence = enabled ? Boolean(options?.fastCadence) : false;
+    if (options?.p0Difficulty) {
+      this.aiPlayerDifficulties[0] = options.p0Difficulty;
+    }
+    if (options?.p1Difficulty) {
+      this.aiPlayerDifficulties[1] = options.p1Difficulty;
+      this.aiDifficulty = options.p1Difficulty;
+    }
+    this.resetAiController();
+    if (enabled && this.physics && (this.physics.gameMode !== 'party' || this.physics.playerCount !== 2)) {
+      this.physics.rebuildTower('party', 2);
+    }
+    this.emitTelemetry(true);
+  }
+
+  private getActiveTurnAiDifficulty(): AiDifficulty {
+    if (this.aiVsAiEnabled && this.physics) {
+      return this.aiPlayerDifficulties[this.physics.currentPlayer === 0 ? 0 : 1];
+    }
+    return this.aiDifficulty;
+  }
+
   private resetAiController(): void {
     this.aiStage = 'idle';
     this.aiTimerSec = 0;
+    this.aiPullProgressSec = 0;
     this.aiTargetBlockId = null;
+    this.aiTargetYawOffsetRad = 0;
     this.aiThinking = false;
     this.aiActionLabel = null;
   }
 
   private isAiTurnActive(): boolean {
-    return (
-      !this.mpRole &&
-      this.aiOpponentEnabled &&
-      !this.modalOpen &&
-      Boolean(this.physics) &&
-      this.physics.gameMode === 'party' &&
-      this.physics.currentPlayer === 1 &&
-      this.physics.turnPhase !== 'COLLAPSED' &&
-      this.physics.turnPhase !== 'SETTLING'
-    );
+    if (this.mpRole || !this.aiOpponentEnabled || this.modalOpen || !this.physics) {
+      return false;
+    }
+    if (this.physics.gameMode !== 'party') return false;
+    if (this.physics.turnPhase === 'COLLAPSED' || this.physics.turnPhase === 'SETTLING') {
+      return false;
+    }
+    if (this.aiVsAiEnabled) {
+      return this.physics.currentPlayer === 0 || this.physics.currentPlayer === 1;
+    }
+    return this.physics.currentPlayer === 1;
   }
 
-  private requestAiCounterfactualOracle(): Promise<BlockCriticalityCandidate[]> {
+  /**
+   * Computes exact per-course beveled 2D convex support margins across every active course `k`
+   * when `excludeBlockId` is removed and an optional prospective top block is stacked at `extraTopXZ`.
+   */
+  private evaluateCourseSupportMargins(
+    excludeBlockId: number | null,
+    extraTopXZ?: [number, number]
+  ): {
+    valid: boolean;
+    minMarginDm: number;
+    postComXZDm: [number, number];
+    weakestLayer: number;
+  } {
+    const blocks = this.physics.blocks;
+    const excludedLayer =
+      excludeBlockId != null && blocks[excludeBlockId]
+        ? blocks[excludeBlockId].assignedLayer
+        : -1;
+    const byLayer = new Map<number, typeof blocks>();
+    let maxLayer = 0;
+    let totalMass = 0;
+    let sumX = 0;
+    let sumZ = 0;
+
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      if (b.shattered || b.extracted || b.id === excludeBlockId) continue;
+      if (Math.hypot(b.position[0], b.position[2]) > 1.25) continue;
+      let arr = byLayer.get(b.assignedLayer);
+      if (!arr) {
+        arr = [];
+        byLayer.set(b.assignedLayer, arr);
+      }
+      arr.push(b);
+      if (b.assignedLayer > maxLayer) maxLayer = b.assignedLayer;
+      totalMass += 1;
+      sumX += b.position[0];
+      sumZ += b.position[2];
+    }
+
+    const topTargetLayer = this.physics.topSupportFrame.targetLayer;
+    if (extraTopXZ) {
+      totalMass += 1;
+      sumX += extraTopXZ[0];
+      sumZ += extraTopXZ[1];
+      if (topTargetLayer > maxLayer) maxLayer = topTargetLayer;
+    }
+
+    if (totalMass <= 0) {
+      return { valid: false, minMarginDm: -1, postComXZDm: [0, 0], weakestLayer: 0 };
+    }
+
+    const postComXZDm: [number, number] = [sumX / totalMass, sumZ / totalMass];
+    const effHx = Math.max(0.1, BLOCK_HALF_X - 0.018);
+    const effHz = Math.max(0.05, BLOCK_HALF_Z - 0.018);
+
+    let minMarginDm = Infinity;
+    let weakestLayer = 0;
+
+    for (let k = 0; k <= maxLayer; k++) {
+      const courseBlocks = byLayer.get(k);
+      let aboveCount = 0;
+      let aboveX = 0;
+      let aboveZ = 0;
+
+      for (let m = k + 1; m <= maxLayer; m++) {
+        const upper = byLayer.get(m);
+        if (!upper) continue;
+        for (let j = 0; j < upper.length; j++) {
+          aboveCount += 1;
+          aboveX += upper[j].position[0];
+          aboveZ += upper[j].position[2];
+        }
+      }
+      if (extraTopXZ && topTargetLayer > k) {
+        aboveCount += 1;
+        aboveX += extraTopXZ[0];
+        aboveZ += extraTopXZ[1];
+      }
+
+      if (aboveCount === 0) continue;
+      if (!courseBlocks || courseBlocks.length === 0) {
+        return { valid: false, minMarginDm: -1, postComXZDm, weakestLayer: k };
+      }
+
+      const refAxisX = quatRotateVec3(courseBlocks[0].rotation, [1, 0, 0]);
+      const lenX = Math.hypot(refAxisX[0], refAxisX[2]) || 1.0;
+      const vAxisX = refAxisX[0] / lenX;
+      const vAxisZ = refAxisX[2] / lenX;
+      const uAxisX = -vAxisZ;
+      const uAxisZ = vAxisX;
+
+      let uMin = Infinity;
+      let uMax = -Infinity;
+      let vMin = Infinity;
+      let vMax = -Infinity;
+
+      for (let j = 0; j < courseBlocks.length; j++) {
+        const cb = courseBlocks[j];
+        const bx = quatRotateVec3(cb.rotation, [1, 0, 0]);
+        const bz = quatRotateVec3(cb.rotation, [0, 0, 1]);
+        const cU = cb.position[0] * uAxisX + cb.position[2] * uAxisZ;
+        const cV = cb.position[0] * vAxisX + cb.position[2] * vAxisZ;
+        const spanU =
+          effHx * Math.abs(bx[0] * uAxisX + bx[2] * uAxisZ) +
+          effHz * Math.abs(bz[0] * uAxisX + bz[2] * uAxisZ);
+        const spanV =
+          effHx * Math.abs(bx[0] * vAxisX + bx[2] * vAxisZ) +
+          effHz * Math.abs(bz[0] * vAxisX + bz[2] * vAxisZ);
+        if (cU - spanU < uMin) uMin = cU - spanU;
+        if (cU + spanU > uMax) uMax = cU + spanU;
+        if (cV - spanV < vMin) vMin = cV - spanV;
+        if (cV + spanV > vMax) vMax = cV + spanV;
+      }
+
+      const comAboveX = aboveX / aboveCount;
+      const comAboveZ = aboveZ / aboveCount;
+      const comU = comAboveX * uAxisX + comAboveZ * uAxisZ;
+      const comV = comAboveX * vAxisX + comAboveZ * vAxisZ;
+      const marginK = Math.min(comU - uMin, uMax - comU, comV - vMin, vMax - comV);
+
+      if (marginK < minMarginDm) {
+        minMarginDm = marginK;
+        weakestLayer = k;
+      }
+
+      // Dry-masonry contact-patch check: each unbonded prism in layer `k + 1` only receives upward
+      // normal force from blocks in layer `k` whose 2D footprint actually overlaps that prism!
+      const minIndivSupportDm = 0.048;
+      const evalPrismContactMargin = (
+        pU: number,
+        pV: number,
+        pSpanU: number,
+        pSpanV: number
+      ): number => {
+        let patchUMin = Infinity;
+        let patchUMax = -Infinity;
+        let patchVMin = Infinity;
+        let patchVMax = -Infinity;
+        for (let ci = 0; ci < courseBlocks.length; ci++) {
+          const cb = courseBlocks[ci];
+          const bx = quatRotateVec3(cb.rotation, [1, 0, 0]);
+          const bz = quatRotateVec3(cb.rotation, [0, 0, 1]);
+          const cU = cb.position[0] * uAxisX + cb.position[2] * uAxisZ;
+          const cV = cb.position[0] * vAxisX + cb.position[2] * vAxisZ;
+          const spanU =
+            effHx * Math.abs(bx[0] * uAxisX + bx[2] * uAxisZ) +
+            effHz * Math.abs(bz[0] * uAxisX + bz[2] * uAxisZ);
+          const spanV =
+            effHx * Math.abs(bx[0] * vAxisX + bx[2] * vAxisZ) +
+            effHz * Math.abs(bz[0] * vAxisX + bz[2] * vAxisZ);
+          const iu0 = Math.max(cU - spanU, pU - pSpanU);
+          const iu1 = Math.min(cU + spanU, pU + pSpanU);
+          const iv0 = Math.max(cV - spanV, pV - pSpanV);
+          const iv1 = Math.min(cV + spanV, pV + pSpanV);
+          if (iu0 < iu1 && iv0 < iv1) {
+            if (iu0 < patchUMin) patchUMin = iu0;
+            if (iu1 > patchUMax) patchUMax = iu1;
+            if (iv0 < patchVMin) patchVMin = iv0;
+            if (iv1 > patchVMax) patchVMax = iv1;
+          }
+        }
+        if (!Number.isFinite(patchUMin)) return -0.5;
+        return Math.min(pU - patchUMin, patchUMax - pU, pV - patchVMin, patchVMax - pV);
+      };
+
+      const directAbove = k === excludedLayer ? byLayer.get(k + 1) : undefined;
+      if (directAbove) {
+        for (let j = 0; j < directAbove.length; j++) {
+          const db = directAbove[j];
+          const dbx = quatRotateVec3(db.rotation, [1, 0, 0]);
+          const dbz = quatRotateVec3(db.rotation, [0, 0, 1]);
+          const dbU = db.position[0] * uAxisX + db.position[2] * uAxisZ;
+          const dbV = db.position[0] * vAxisX + db.position[2] * vAxisZ;
+          const dbSpanU =
+            effHx * Math.abs(dbx[0] * uAxisX + dbx[2] * uAxisZ) +
+            effHz * Math.abs(dbz[0] * uAxisX + dbz[2] * uAxisZ);
+          const dbSpanV =
+            effHx * Math.abs(dbx[0] * vAxisX + dbx[2] * vAxisZ) +
+            effHz * Math.abs(dbz[0] * vAxisX + dbz[2] * vAxisZ);
+          const indivMargin = evalPrismContactMargin(dbU, dbV, dbSpanU, dbSpanV);
+          if (indivMargin < minIndivSupportDm) {
+            const deficit = indivMargin - minIndivSupportDm;
+            if (deficit < minMarginDm) {
+              minMarginDm = deficit;
+              weakestLayer = k;
+            }
+          }
+        }
+      }
+      if (extraTopXZ && topTargetLayer === k + 1) {
+        // Orthogonal top course has length along course k's spacing axis `u` (`effHx`) and width along `v` (`effHz`)
+        const exU = extraTopXZ[0] * uAxisX + extraTopXZ[1] * uAxisZ;
+        const exV = extraTopXZ[0] * vAxisX + extraTopXZ[1] * vAxisZ;
+        const exMargin = evalPrismContactMargin(exU, exV, effHx, effHz);
+        if (exMargin < minIndivSupportDm) {
+          const deficit = exMargin - minIndivSupportDm;
+          if (deficit < minMarginDm) {
+            minMarginDm = deficit;
+            weakestLayer = k;
+          }
+        }
+      }
+    }
+
+    if (!Number.isFinite(minMarginDm)) {
+      minMarginDm = 0.25;
+    }
+
+    return {
+      valid: minMarginDm > 0,
+      minMarginDm,
+      postComXZDm,
+      weakestLayer,
+    };
+  }
+
+  /**
+   * Optimizes continuous extraction azimuth (`pullDirXZ`) and grab end (`dirSign`) for a target block.
+   * `Master Glazier` combines Brewster photoelastic end-bearing wrenches with continuous OBB neighbor-channel
+   * clearance sweeping (`±13.75 deg`) so asymmetric or micro-rotated courses extract without lateral rubbing.
+   */
+  public computeOptimalExtractionPlan(
+    blockId: number,
+    difficulty: AiDifficulty = this.getActiveTurnAiDifficulty()
+  ): TouchExtractionPlan | null {
+    if (!this.physics) return null;
+    const blk = this.physics.blocks[blockId];
+    if (!blk || blk.shattered) return null;
+
+    const axisX = quatRotateVec3(blk.rotation, [1, 0, 0]);
+    const horizLen = Math.hypot(axisX[0], axisX[2]) || 1.0;
+    const ux = axisX[0] / horizLen;
+    const uz = axisX[2] / horizLen;
+
+    const sameLayerNeighbors = this.physics.blocks.filter(
+      (nb) =>
+        !nb.shattered &&
+        !nb.extracted &&
+        nb.id !== blk.id &&
+        nb.assignedLayer === blk.assignedLayer &&
+        Math.hypot(nb.position[0] - blk.position[0], nb.position[2] - blk.position[2]) < 0.85
+    );
+
+    let layerCenterX = blk.position[0];
+    let layerCenterZ = blk.position[2];
+    if (sameLayerNeighbors.length > 0) {
+      for (let i = 0; i < sameLayerNeighbors.length; i++) {
+        layerCenterX += sameLayerNeighbors[i].position[0];
+        layerCenterZ += sameLayerNeighbors[i].position[2];
+      }
+      layerCenterX /= sameLayerNeighbors.length + 1;
+      layerCenterZ /= sameLayerNeighbors.length + 1;
+    }
+
+    if (difficulty === 'apprentice') {
+      const dirSign: 1 | -1 =
+        blk.position[0] * ux + blk.position[2] * uz >= 0 ? 1 : -1;
+      const pullX = ux * dirSign;
+      const pullZ = uz * dirSign;
+      const localGrab: Vec3 = [BLOCK_HALF_X * 0.84 * dirSign, 0, 0];
+      const grabOffset = quatRotateVec3(blk.rotation, localGrab);
+      return {
+        blockId: blk.id,
+        pullDirXZ: [pullX, pullZ],
+        azimuthRad: Math.atan2(pullZ, pullX),
+        azimuthOffsetDeg: 0,
+        dirSign,
+        localGrab,
+        startWorld: [
+          blk.position[0] + grabOffset[0],
+          blk.position[1] + grabOffset[1],
+          blk.position[2] + grabOffset[2],
+        ],
+        minNeighborClearanceDm: 0.02,
+      };
+    }
+
+    // Master Glazier: inspect photoelastic end-bearing wrench [-X, mid, +X, bend] + continuous azimuth clearance
+    this.scratchWrench4.fill(0);
+    if (typeof this.physics.writeBlockPhotoelasticWrench === 'function') {
+      this.physics.writeBlockPhotoelasticWrench(blk.id, this.scratchWrench4, 0);
+    }
+    const wNeg = this.scratchWrench4[0];
+    const wPos = this.scratchWrench4[2];
+
+    const blkAxisZ = quatRotateVec3(blk.rotation, [0, 0, 1]);
+    const bzHorizLen = Math.hypot(blkAxisZ[0], blkAxisZ[2]) || 1.0;
+    const wzX = blkAxisZ[0] / bzHorizLen;
+    const wzZ = blkAxisZ[2] / bzHorizLen;
+    const effHx = BLOCK_HALF_X - 0.002;
+    const effHz = BLOCK_HALF_Z - 0.002;
+
+    const evaluateSlideClearance = (dirX: number, dirZ: number): number => {
+      if (sameLayerNeighbors.length === 0) return 0.35;
+      let worstClearance = Infinity;
+      const samples = [0.06, 0.18, 0.34, 0.52, 0.68];
+      for (let si = 0; si < samples.length; si++) {
+        const s = samples[si];
+        const cx = blk.position[0] + dirX * s;
+        const cz = blk.position[2] + dirZ * s;
+        for (let ni = 0; ni < sameLayerNeighbors.length; ni++) {
+          const nb = sameLayerNeighbors[ni];
+          const nbxRaw = quatRotateVec3(nb.rotation, [1, 0, 0]);
+          const nbzRaw = quatRotateVec3(nb.rotation, [0, 0, 1]);
+          const nbxLen = Math.hypot(nbxRaw[0], nbxRaw[2]) || 1.0;
+          const nbzLen = Math.hypot(nbzRaw[0], nbzRaw[2]) || 1.0;
+          const nxX = nbxRaw[0] / nbxLen;
+          const nxZ = nbxRaw[2] / nbxLen;
+          const nzX = nbzRaw[0] / nbzLen;
+          const nzZ = nbzRaw[2] / nbzLen;
+
+          const relX = nb.position[0] - cx;
+          const relZ = nb.position[2] - cz;
+
+          // Exact 4-axis 2D Separating Axis Theorem signed OBB-to-OBB clearance across {bx, bz, nbx, nbz}
+          const axes: ReadonlyArray<[number, number]> = [
+            [ux, uz],
+            [wzX, wzZ],
+            [nxX, nxZ],
+            [nzX, nzZ],
+          ];
+          let satGap = -Infinity;
+          for (let ai = 0; ai < 4; ai++) {
+            const ax = axes[ai][0];
+            const az = axes[ai][1];
+            const centerProj = Math.abs(relX * ax + relZ * az);
+            const rBlk =
+              effHx * Math.abs(ux * ax + uz * az) + effHz * Math.abs(wzX * ax + wzZ * az);
+            const rNb =
+              effHx * Math.abs(nxX * ax + nxZ * az) + effHz * Math.abs(nzX * ax + nzZ * az);
+            const axisGap = centerProj - rBlk - rNb;
+            if (axisGap > satGap) {
+              satGap = axisGap;
+            }
+          }
+
+          if (satGap < worstClearance) {
+            worstClearance = satGap;
+          }
+        }
+      }
+      return Number.isFinite(worstClearance) ? worstClearance : 0.35;
+    };
+
+    let bestSign: 1 | -1 = 1;
+    let bestAzimuthRad = Math.atan2(uz, ux);
+    let bestOffsetRad = 0;
+    let bestScore = -Infinity;
+    let bestMinClearance = 0;
+
+    const signs: Array<1 | -1> = [1, -1];
+    const maxSweepRad = 0.24; // ±13.75 deg continuous azimuth search
+    const sweepSteps = 32;
+
+    for (let si = 0; si < signs.length; si++) {
+      const sign = signs[si];
+      const baseAz = Math.atan2(uz * sign, ux * sign);
+      const protrusion =
+        (blk.position[0] - layerCenterX) * (ux * sign) +
+        (blk.position[2] - layerCenterZ) * (uz * sign);
+      // Prefer pulling toward the end that already protrudes and away from heavier trailing pinch
+      const wrenchBias = (wPos - wNeg) * sign * 0.08;
+
+      for (let k = 0; k <= sweepSteps; k++) {
+        const deltaAz = -maxSweepRad + (2 * maxSweepRad * k) / sweepSteps;
+        const candAz = baseAz + deltaAz;
+        const dirX = Math.cos(candAz);
+        const dirZ = Math.sin(candAz);
+        const minClear = evaluateSlideClearance(dirX, dirZ);
+
+        // Steep penalty if trajectory grazes an adjacent neighbor (< 1.5 mm), smooth reward for wider channel up to 12 mm
+        const contactPenalty = minClear < 0.015 ? (minClear - 0.015) * 18.0 : 0;
+        const channelReward = Math.min(0.12, Math.max(-0.12, minClear)) * 2.2;
+        const axialReg = -0.32 * deltaAz * deltaAz;
+
+        const totalScore =
+          protrusion * 0.65 + wrenchBias + contactPenalty + channelReward + axialReg;
+
+        if (totalScore > bestScore) {
+          bestScore = totalScore;
+          bestSign = sign;
+          bestAzimuthRad = candAz;
+          bestOffsetRad = deltaAz;
+          bestMinClearance = minClear;
+        }
+      }
+    }
+
+    const pullDirXZ: [number, number] = [Math.cos(bestAzimuthRad), Math.sin(bestAzimuthRad)];
+    const localGrab: Vec3 = [BLOCK_HALF_X * 0.84 * bestSign, 0, 0];
+    const grabOffset = quatRotateVec3(blk.rotation, localGrab);
+    return {
+      blockId: blk.id,
+      pullDirXZ,
+      azimuthRad: bestAzimuthRad,
+      azimuthOffsetDeg: +((bestOffsetRad * 180) / Math.PI).toFixed(2),
+      dirSign: bestSign,
+      localGrab,
+      startWorld: [
+        blk.position[0] + grabOffset[0],
+        blk.position[1] + grabOffset[1],
+        blk.position[2] + grabOffset[2],
+      ],
+      minNeighborClearanceDm: +bestMinClearance.toFixed(4),
+    };
+  }
+
+  /**
+   * Computes top-course placement pose `(targetXZ, localVU, yawOffsetRad)`.
+   * - `Apprentice`: counterbalances global CoM toward `[0, 0]` to stabilize the stack.
+   * - `Master Glazier`: searches continuous eccentric longitudinal & lateral poses `(v, u, yaw)` that
+   *   MAXIMIZE surviving global CoM eccentricity & opponent bottleneck stress while guaranteeing both
+   *   local beveled support on `targetLayer - 1` and global `P-Delta` stability across every course `0..targetLayer-1`.
+   */
+  public computeAdversarialTopPlacement(
+    excludeBlockId?: number | null,
+    difficulty: AiDifficulty = this.getActiveTurnAiDifficulty()
+  ): AdversarialPlacementPlan {
+    const frame = this.physics.topSupportFrame;
+    const lc = frame.layerCenter;
+    const activeExcludeId =
+      excludeBlockId !== undefined ? excludeBlockId : this.physics.activeBlockId;
+
+    if (difficulty === 'apprentice') {
+      const slots = this.physics.openTopSlots;
+      let bestXZ: [number, number] = [lc[0], lc[2]];
+      if (slots.length > 0) {
+        let bestSlotScore = -Infinity;
+        for (let i = 0; i < slots.length; i++) {
+          const sl = slots[i];
+          const candXZ: [number, number] = [sl.position[0], sl.position[2]];
+          const postCand = this.evaluateCourseSupportMargins(activeExcludeId, candXZ);
+          const candEccDm = Math.hypot(postCand.postComXZDm[0], postCand.postComXZDm[1]);
+          const slotScore =
+            (postCand.valid ? 0 : -2.0) + postCand.minMarginDm * 1.5 - candEccDm * 4.5;
+          if (slotScore > bestSlotScore) {
+            bestSlotScore = slotScore;
+            bestXZ = candXZ;
+          }
+        }
+      }
+      const rx = bestXZ[0] - lc[0];
+      const rz = bestXZ[1] - lc[2];
+      const v = rx * frame.lengthAxis[0] + rz * frame.lengthAxis[2];
+      const u = rx * frame.spacingAxis[0] + rz * frame.spacingAxis[2];
+      const post = this.evaluateCourseSupportMargins(activeExcludeId, bestXZ);
+      return {
+        targetXZ: bestXZ,
+        localVU: [v, u],
+        yawOffsetRad: 0,
+        predictedComXZCm: [post.postComXZDm[0] * 10, post.postComXZDm[1] * 10],
+        predictedMinCourseMarginDm: post.minMarginDm,
+      };
+    }
+
+    // Master Glazier adversarial eccentric search
+    const sameLayerObstacles = this.physics.blocks.filter(
+      (b) =>
+        !b.shattered &&
+        !b.extracted &&
+        b.id !== activeExcludeId &&
+        b.assignedLayer === frame.targetLayer &&
+        Math.hypot(b.position[0] - lc[0], b.position[2] - lc[2]) < 0.95
+    );
+
+    const supportBelowBlocks = this.physics.blocks.filter(
+      (b) =>
+        !b.shattered &&
+        !b.extracted &&
+        b.id !== activeExcludeId &&
+        b.assignedLayer === frame.targetLayer - 1 &&
+        Math.hypot(b.position[0] - lc[0], b.position[2] - lc[2]) < 0.95
+    );
+
+    // Compute local beveled support envelope on `targetLayer - 1` in `(v, u)` coordinates
+    let supVMin = -0.34;
+    let supVMax = 0.34;
+    let supUMin = -0.34;
+    let supUMax = 0.34;
+    if (supportBelowBlocks.length > 0) {
+      supVMin = Infinity;
+      supVMax = -Infinity;
+      supUMin = Infinity;
+      supUMax = -Infinity;
+      const effHx = BLOCK_HALF_X - 0.022;
+      const effHz = BLOCK_HALF_Z - 0.022;
+      for (let i = 0; i < supportBelowBlocks.length; i++) {
+        const sb = supportBelowBlocks[i];
+        const bx = quatRotateVec3(sb.rotation, [1, 0, 0]);
+        const bz = quatRotateVec3(sb.rotation, [0, 0, 1]);
+        const rx = sb.position[0] - lc[0];
+        const rz = sb.position[2] - lc[2];
+        const sv = rx * frame.lengthAxis[0] + rz * frame.lengthAxis[2];
+        const su = rx * frame.spacingAxis[0] + rz * frame.spacingAxis[2];
+        const spanV =
+          effHx * Math.abs(bx[0] * frame.lengthAxis[0] + bx[2] * frame.lengthAxis[2]) +
+          effHz * Math.abs(bz[0] * frame.lengthAxis[0] + bz[2] * frame.lengthAxis[2]);
+        const spanU =
+          effHx * Math.abs(bx[0] * frame.spacingAxis[0] + bx[2] * frame.spacingAxis[2]) +
+          effHz * Math.abs(bz[0] * frame.spacingAxis[0] + bz[2] * frame.spacingAxis[2]);
+        if (sv - spanV < supVMin) supVMin = sv - spanV;
+        if (sv + spanV > supVMax) supVMax = sv + spanV;
+        if (su - spanU < supUMin) supUMin = su - spanU;
+        if (su + spanU > supUMax) supUMax = su + spanU;
+      }
+    }
+
+    const obstacleUs = sameLayerObstacles.map((ob) => {
+      const rx = ob.position[0] - lc[0];
+      const rz = ob.position[2] - lc[2];
+      return rx * frame.spacingAxis[0] + rz * frame.spacingAxis[2];
+    });
+
+    const minObstacleGapU = 2 * BLOCK_HALF_Z + 0.010; // >= 2.60 cm center-to-center (~1.0 mm clear gap)
+    const leanDeg = this.physics.getTelemetry().leanAngleDeg;
+    const minRequiredCourseMarginDm = Math.min(
+      0.132,
+      0.068 + 0.006 * leanDeg + this.physics.blocksStacked * 0.0014
+    );
+    // P-Delta elastic compliance envelope in decimeters (0.058 dm = 0.58 cm up to 21L, tapering to 0.38 cm at 28L+):
+    // drives CoM strongly into the adversarial danger band while preventing runaway uphill-hollowing collapse
+    const maxSafeGlobalEccDm = Math.max(
+      0.038,
+      0.058 - Math.max(0, this.physics.currentLayers - 21) * 0.0028 - leanDeg * 0.015
+    );
+
+    // Keep lateral u aligned with clean 3-block course lanes (+/- eccentric outer edge shifts) so courses pack 3 blocks cleanly
+    const candidateUs: number[] = [
+      -0.285, -0.268, -0.25, -0.232,
+      -0.025, 0.0, 0.025,
+      0.232, 0.25, 0.268, 0.285,
+    ];
+    for (let i = 0; i < this.physics.openTopSlots.length; i++) {
+      const sl = this.physics.openTopSlots[i];
+      const rx = sl.position[0] - lc[0];
+      const rz = sl.position[2] - lc[2];
+      candidateUs.push(rx * frame.spacingAxis[0] + rz * frame.spacingAxis[2]);
+    }
+
+    const candidateVs: number[] = [
+      -0.175, -0.145, -0.11, -0.075, -0.035, 0.0, 0.035, 0.075, 0.11, 0.145, 0.175,
+    ];
+    const yawCandidates = sameLayerObstacles.length >= 2 ? [-0.075, 0, 0.075] : [0];
+
+    let bestPlan: AdversarialPlacementPlan | null = null;
+    let bestScore = -Infinity;
+
+    for (let iu = 0; iu < candidateUs.length; iu++) {
+      const cu = candidateUs[iu];
+      if (cu < supUMin + 0.065 || cu > supUMax - 0.065) continue;
+
+      let collidesSameLayer = false;
+      for (let oi = 0; oi < obstacleUs.length; oi++) {
+        if (Math.abs(cu - obstacleUs[oi]) < minObstacleGapU) {
+          collidesSameLayer = true;
+          break;
+        }
+      }
+      if (collidesSameLayer) continue;
+
+      for (let iv = 0; iv < candidateVs.length; iv++) {
+        const cv = candidateVs[iv];
+        if (cv < supVMin + 0.085 || cv > supVMax - 0.085) continue;
+
+        const px = lc[0] + frame.lengthAxis[0] * cv + frame.spacingAxis[0] * cu;
+        const pz = lc[2] + frame.lengthAxis[2] * cv + frame.spacingAxis[2] * cu;
+        if (Math.hypot(px, pz) > 0.44) continue;
+        const post = this.evaluateCourseSupportMargins(activeExcludeId, [px, pz]);
+        if (!post.valid || post.minMarginDm < minRequiredCourseMarginDm) continue;
+
+        const postEccDm = Math.hypot(post.postComXZDm[0], post.postComXZDm[1]);
+        if (postEccDm > maxSafeGlobalEccDm) continue;
+
+        const localEccDm = Math.hypot(cv, cu);
+        // Reward driving global CoM eccentricity outward while preserving safe settling margin
+        const marginSafetyBonus = Math.min(0.045, post.minMarginDm - minRequiredCourseMarginDm) * 1.4;
+
+        for (let iy = 0; iy < yawCandidates.length; iy++) {
+          const candYaw = yawCandidates[iy];
+          let yawClearOk = true;
+          if (Math.abs(candYaw) > 1e-4 && obstacleUs.length > 0) {
+            const extraWidth = BLOCK_HALF_X * Math.abs(Math.sin(candYaw));
+            for (let oi = 0; oi < obstacleUs.length; oi++) {
+              if (Math.abs(cu - obstacleUs[oi]) < minObstacleGapU + extraWidth) {
+                yawClearOk = false;
+                break;
+              }
+            }
+          }
+          if (!yawClearOk) continue;
+
+          const score =
+            postEccDm * 2.4 +
+            localEccDm * 0.42 +
+            marginSafetyBonus +
+            Math.abs(candYaw) * 0.12;
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestPlan = {
+              targetXZ: [px, pz],
+              localVU: [cv, cu],
+              yawOffsetRad: candYaw,
+              predictedComXZCm: [
+                +(post.postComXZDm[0] * 10).toFixed(3),
+                +(post.postComXZDm[1] * 10).toFixed(3),
+              ],
+              predictedMinCourseMarginDm: +post.minMarginDm.toFixed(4),
+            };
+          }
+        }
+      }
+    }
+
+    if (bestPlan) {
+      return bestPlan;
+    }
+
+    // Fallback when tower is already at/above its P-Delta envelope: hold near maxSafeGlobalEccDm with high course margin
+    let safestPlan: AdversarialPlacementPlan = this.computeAdversarialTopPlacement(
+      activeExcludeId,
+      'apprentice'
+    );
+    const initFallbackEccDm =
+      Math.hypot(safestPlan.predictedComXZCm[0], safestPlan.predictedComXZCm[1]) * 0.1;
+    let safestScore =
+      safestPlan.predictedMinCourseMarginDm * 2.4 -
+      Math.max(0, initFallbackEccDm - maxSafeGlobalEccDm) * 6.0 -
+      initFallbackEccDm * 1.2;
+
+    for (let iu = 0; iu < candidateUs.length; iu++) {
+      const cu = candidateUs[iu];
+      if (cu < supUMin + 0.065 || cu > supUMax - 0.065) continue;
+      let collides = false;
+      for (let oi = 0; oi < obstacleUs.length; oi++) {
+        if (Math.abs(cu - obstacleUs[oi]) < minObstacleGapU) {
+          collides = true;
+          break;
+        }
+      }
+      if (collides) continue;
+      for (let iv = 0; iv < candidateVs.length; iv++) {
+        const cv = candidateVs[iv];
+        if (cv < supVMin + 0.085 || cv > supVMax - 0.085) continue;
+        const px = lc[0] + frame.lengthAxis[0] * cv + frame.spacingAxis[0] * cu;
+        const pz = lc[2] + frame.lengthAxis[2] * cv + frame.spacingAxis[2] * cu;
+        const post = this.evaluateCourseSupportMargins(activeExcludeId, [px, pz]);
+        if (!post.valid) continue;
+        const postEccDm = Math.hypot(post.postComXZDm[0], post.postComXZDm[1]);
+        const candScore =
+          post.minMarginDm * 2.4 -
+          Math.max(0, postEccDm - maxSafeGlobalEccDm) * 6.0 -
+          postEccDm * 1.2;
+        if (candScore > safestScore) {
+          safestScore = candScore;
+          safestPlan = {
+            targetXZ: [px, pz],
+            localVU: [cv, cu],
+            yawOffsetRad: 0,
+            predictedComXZCm: [
+              +(post.postComXZDm[0] * 10).toFixed(3),
+              +(post.postComXZDm[1] * 10).toFixed(3),
+            ],
+            predictedMinCourseMarginDm: +post.minMarginDm.toFixed(4),
+          };
+        }
+      }
+    }
+
+    return safestPlan;
+  }
+
+  private selectAiTargetFromOracle(
+    candidates: BlockCriticalityCandidate[],
+    difficulty: AiDifficulty
+  ): BlockCriticalityCandidate | undefined {
+    const rawLegal = candidates.filter((c) => {
+      const b = this.physics.blocks[c.blockId];
+      return Boolean(b && !b.shattered && !b.extracted && b.isLegalTarget);
+    });
+    if (rawLegal.length === 0) return undefined;
+    const nonAborted = rawLegal.filter((c) => !this.aiAbortedBlockIds.has(c.blockId));
+    const legal = nonAborted.length > 0 ? nonAborted : rawLegal;
+
+    // Count active blocks per layer so we know which lower courses are narrow 1-prism hinges
+    const layerCounts = new Map<number, number>();
+    for (let i = 0; i < this.physics.blocks.length; i++) {
+      const b = this.physics.blocks[i];
+      if (!b || b.shattered || b.extracted) continue;
+      layerCounts.set(b.assignedLayer, (layerCounts.get(b.assignedLayer) ?? 0) + 1);
+    }
+    const countCrossHingesBelow = (layer: number): number => {
+      let hinges = 0;
+      for (let m = 0; m < layer; m++) {
+        if ((layerCounts.get(m) ?? 0) === 1 && m % 2 !== layer % 2) {
+          hinges++;
+        }
+      }
+      return hinges;
+    };
+
+    const leanDeg = this.physics.getTelemetry().leanAngleDeg;
+    const minExtractMarginDm = Math.min(
+      0.122,
+      0.078 + 0.005 * leanDeg + this.physics.blocksStacked * 0.0008
+    );
+
+    const topClampFloorLayer = Math.max(2, this.physics.currentLayers - 3);
+
+    if (difficulty === 'apprentice') {
+      // Apprentice prioritizes wide remaining course support, free-sliding prisms (predictedSlideMm >= 0.35), and low CoM drift
+      let bestApp = legal[0];
+      let bestAppScore = -Infinity;
+      for (let i = 0; i < legal.length; i++) {
+        const c = legal[i];
+        const blk = this.physics.blocks[c.blockId];
+        const surv = this.evaluateCourseSupportMargins(c.blockId);
+        const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
+        const underClampedTopPen =
+          (blk.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
+          (blk.assignedLayer >= 18 ? -0.55 : 0) -
+          countCrossHingesBelow(blk.assignedLayer) * 0.48;
+        const jammedOrUnsafe =
+          c.collapseTriggered ||
+          !surv.valid ||
+          surv.minMarginDm < minExtractMarginDm ||
+          c.safetyScore01 < 0.45 ||
+          c.predictedSlideMm < 0.35;
+        const safeGatePenalty = jammedOrUnsafe ? -3.2 : 0;
+        const s =
+          safeGatePenalty +
+          underClampedTopPen +
+          Math.min(0.36, surv.minMarginDm) * 2.8 +
+          c.safetyScore01 * 0.95 -
+          survEccDm * 3.8;
+        if (s > bestAppScore) {
+          bestAppScore = s;
+          bestApp = c;
+        }
+      }
+      return bestApp;
+    }
+
+    // Master Glazier 2-ply joint (extractCandidate + adversarialTopPlacement) evaluation
+    const maxSafeGlobalEccDm = Math.max(
+      0.038,
+      0.058 - Math.max(0, this.physics.currentLayers - 21) * 0.0028 - leanDeg * 0.015
+    );
+    let bestCand: BlockCriticalityCandidate | undefined;
+    let best2PlyScore = -Infinity;
+
+    for (let i = 0; i < legal.length; i++) {
+      const cand = legal[i];
+      const blk = this.physics.blocks[cand.blockId];
+      if (cand.collapseTriggered || cand.safetyScore01 < 0.45 || cand.predictedSlideMm < 0.35) {
+        continue;
+      }
+      const midExtract = this.evaluateCourseSupportMargins(cand.blockId);
+      if (!midExtract.valid || midExtract.minMarginDm < minExtractMarginDm) continue;
+
+      const plan = this.computeAdversarialTopPlacement(cand.blockId, 'master');
+      if (plan.predictedMinCourseMarginDm < minExtractMarginDm) continue;
+
+      const postEccDm =
+        Math.hypot(plan.predictedComXZCm[0], plan.predictedComXZCm[1]) * 0.1;
+      const extractPlan = this.computeOptimalExtractionPlan(cand.blockId, 'master');
+      const channelBonus = extractPlan
+        ? Math.min(0.08, Math.max(-0.08, extractPlan.minNeighborClearanceDm)) * 1.5
+        : 0;
+      const eccReward =
+        postEccDm <= maxSafeGlobalEccDm
+          ? postEccDm * 2.4
+          : maxSafeGlobalEccDm * 2.4 - (postEccDm - maxSafeGlobalEccDm) * 5.5;
+      const underClampedTopPen =
+        (blk.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
+        (blk.assignedLayer >= 18 ? -0.55 : 0) -
+        countCrossHingesBelow(blk.assignedLayer) * 0.48;
+
+      const score2Ply =
+        eccReward +
+        underClampedTopPen +
+        cand.safetyScore01 * 0.92 +
+        Math.min(0.32, midExtract.minMarginDm) * 1.65 +
+        channelBonus;
+
+      if (score2Ply > best2PlyScore) {
+        best2PlyScore = score2Ply;
+        bestCand = cand;
+      }
+    }
+
+    if (bestCand) return bestCand;
+
+    // High-stress late-game fallback: maximize combined survival margin + actual slide ease while avoiding cross-axis hinges
+    let fallbackCand = legal[0];
+    let fallbackScore = -Infinity;
+    for (let i = 0; i < legal.length; i++) {
+      const cand = legal[i];
+      const blk = this.physics.blocks[cand.blockId];
+      const surv = this.evaluateCourseSupportMargins(cand.blockId);
+      const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
+      const underClampedTopPen =
+        (blk.assignedLayer >= topClampFloorLayer ? -1.4 : 0) -
+        countCrossHingesBelow(blk.assignedLayer) * 0.45;
+      const jamPen = cand.predictedSlideMm < 0.25 ? -1.8 : 0;
+      const s =
+        (cand.collapseTriggered ? -2.5 : 0) +
+        (surv.valid ? 0 : -1.8) +
+        jamPen +
+        underClampedTopPen +
+        surv.minMarginDm * 3.5 +
+        cand.safetyScore01 * 1.3 -
+        survEccDm * 2.2;
+      if (s > fallbackScore) {
+        fallbackScore = s;
+        fallbackCand = cand;
+      }
+    }
+    return fallbackCand;
+  }
+
+  private applyAiOracleDecision(candidates: BlockCriticalityCandidate[]): void {
+    if (!this.isAiTurnActive() || this.aiStage !== 'awaiting_oracle') return;
+    const difficulty = this.getActiveTurnAiDifficulty();
+    const labelPrefix = difficulty === 'master' ? 'Master Glazier' : 'Apprentice AI';
+    const chosen = this.selectAiTargetFromOracle(candidates, difficulty);
+    const blk = chosen ? this.physics.blocks[chosen.blockId] : undefined;
+    if (!chosen || !blk || blk.shattered || !blk.isLegalTarget) {
+      this.resetAiController();
+      return;
+    }
+    this.aiTargetBlockId = blk.id;
+
+    if (!this.aiFastCadence) {
+      const tighterProbe = candidates.find(
+        (c) =>
+          c.blockId !== blk.id &&
+          this.physics.blocks[c.blockId] &&
+          !this.physics.blocks[c.blockId].shattered &&
+          this.physics.blocks[c.blockId].isLegalTarget &&
+          (c.safetyScore01 < chosen.safetyScore01 - 0.14 ||
+            this.physics.blocks[c.blockId].assignedLayer !== blk.assignedLayer)
+      );
+      if (tighterProbe) {
+        this.physics.hoveredBlockId = tighterProbe.blockId;
+        this.physics.tapNudgeBlock(tighterProbe.blockId, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
+        this.aiStage = 'probe_tight';
+        this.aiTimerSec = 0;
+        this.aiActionLabel = `${labelPrefix} Testing Column…`;
+        this.emitTelemetry(true);
+        return;
+      }
+    }
+
+    this.physics.hoveredBlockId = blk.id;
+    if (!this.aiFastCadence) {
+      this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
+    }
+    this.aiStage = 'post_tap';
+    this.aiTimerSec = 0;
+    this.aiActionLabel = `${labelPrefix} Selecting Prism…`;
+    this.emitTelemetry(true);
+  }
+
+  private dispatchAiCounterfactualOracle(difficulty: AiDifficulty): void {
+    const maxC = this.aiFastCadence
+      ? difficulty === 'master'
+        ? 10
+        : 8
+      : difficulty === 'master'
+        ? 14
+        : 10;
+    // Keep >= 6 solver steps so `predictedSlideMm / 1.8` cleanly separates free prisms from jammed bearing columns
+    const rolloutSteps = 6;
     const maybeWorker = this.physics as unknown as {
       evaluateCounterfactualBlockCriticalityAsync?: (
-        maxC: number,
-        steps: number
+        c: number,
+        s: number
       ) => Promise<BlockCriticalityCandidate[]>;
     };
     if (typeof maybeWorker.evaluateCounterfactualBlockCriticalityAsync === 'function') {
-      return maybeWorker.evaluateCounterfactualBlockCriticalityAsync(12, 8);
+      void maybeWorker
+        .evaluateCounterfactualBlockCriticalityAsync(maxC, rolloutSteps)
+        .then((candidates) => this.applyAiOracleDecision(candidates));
+      return;
     }
-    return Promise.resolve(this.physics.evaluateCounterfactualBlockCriticality(12, 8));
+
+    const layerCounts = new Map<number, number>();
+    for (let i = 0; i < this.physics.blocks.length; i++) {
+      const b = this.physics.blocks[i];
+      if (!b || b.shattered || b.extracted) continue;
+      layerCounts.set(b.assignedLayer, (layerCounts.get(b.assignedLayer) ?? 0) + 1);
+    }
+
+    const topClampFloorLayer = Math.max(2, this.physics.currentLayers - 3);
+    const scoredLegal: Array<{ id: number; rankScore: number }> = [];
+    for (let i = 0; i < this.physics.blocks.length; i++) {
+      const b = this.physics.blocks[i];
+      if (!b || b.shattered || b.extracted || !b.isLegalTarget) continue;
+      if (this.aiAbortedBlockIds.has(b.id)) continue;
+      const surv = this.evaluateCourseSupportMargins(b.id);
+      if (!surv.valid) continue;
+      this.scratchWrench4.fill(0);
+      if (typeof this.physics.writeBlockPhotoelasticWrench === 'function') {
+        this.physics.writeBlockPhotoelasticWrench(b.id, this.scratchWrench4, 0);
+      }
+      const clampStress =
+        this.scratchWrench4[0] + this.scratchWrench4[1] + this.scratchWrench4[2];
+      let crossHinges = 0;
+      for (let m = 0; m < b.assignedLayer; m++) {
+        if ((layerCounts.get(m) ?? 0) === 1 && m % 2 !== b.assignedLayer % 2) {
+          crossHinges++;
+        }
+      }
+      const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
+      const underClampedTopPen =
+        (b.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
+        (b.assignedLayer >= 18 ? -0.55 : 0) -
+        crossHinges * 0.48;
+      const rankScore =
+        underClampedTopPen +
+        Math.min(0.36, surv.minMarginDm) * 2.4 -
+        survEccDm * 2.0 -
+        clampStress * 0.45;
+      scoredLegal.push({ id: b.id, rankScore });
+    }
+    scoredLegal.sort((a, b) => b.rankScore - a.rankScore);
+    const candidateIds =
+      scoredLegal.length > 0 ? scoredLegal.slice(0, maxC).map((s) => s.id) : undefined;
+
+    const syncCandidates = this.physics.evaluateCounterfactualBlockCriticality(
+      maxC,
+      rolloutSteps,
+      candidateIds
+    );
+    this.applyAiOracleDecision(syncCandidates);
   }
 
   private updateMasterGlazierAi(dt: number): void {
@@ -1499,62 +2582,38 @@ export class GameEngine {
       return;
     }
 
+    if (this.physics.blocksStacked !== this.aiLastBlocksStacked) {
+      this.aiLastBlocksStacked = this.physics.blocksStacked;
+      this.aiAbortedBlockIds.clear();
+    }
+
+    const difficulty = this.getActiveTurnAiDifficulty();
+    const labelPrefix = difficulty === 'master' ? 'Master Glazier' : 'Apprentice AI';
+    const scoutDelay = this.aiFastCadence ? 0.02 : 0.72;
+    const probeDelay = this.aiFastCadence ? 0.02 : 0.88;
+    const postTapDelay = this.aiFastCadence ? 0.02 : 0.82;
+
     if (this.aiStage === 'idle' && this.physics.turnPhase === 'SELECT_BLOCK') {
       this.aiStage = 'scouting';
       this.aiTimerSec = 0;
       this.aiThinking = true;
-      this.aiActionLabel = 'Glazier AI Reading Stack…';
+      this.aiActionLabel = `${labelPrefix} Reading Stack…`;
       this.emitTelemetry(true);
       return;
     }
 
     if (this.aiStage === 'scouting') {
       this.aiTimerSec += dt;
-      if (this.aiTimerSec >= 0.80) {
+      if (this.aiTimerSec >= scoutDelay) {
         this.aiStage = 'awaiting_oracle';
-        void this.requestAiCounterfactualOracle().then((candidates) => {
-          if (!this.isAiTurnActive() || this.aiStage !== 'awaiting_oracle') return;
-          const chosen =
-            candidates.find((c) => !c.collapseTriggered && c.safetyScore01 > 0.35) ?? candidates[0];
-          const blk = chosen ? this.physics.blocks[chosen.blockId] : undefined;
-          if (!blk || blk.shattered || !blk.isLegalTarget) {
-            this.resetAiController();
-            return;
-          }
-          this.aiTargetBlockId = blk.id;
-
-          // Pick a tighter/distinct candidate first so the player sees & hears the AI probe and reject a bearing column!
-          const tighterProbe = candidates.find(
-            (c) =>
-              c.blockId !== blk.id &&
-              this.physics.blocks[c.blockId] &&
-              !this.physics.blocks[c.blockId].shattered &&
-              this.physics.blocks[c.blockId].isLegalTarget &&
-              (c.safetyScore01 < chosen.safetyScore01 - 0.14 ||
-                this.physics.blocks[c.blockId].assignedLayer !== blk.assignedLayer)
-          );
-          if (tighterProbe) {
-            this.physics.hoveredBlockId = tighterProbe.blockId;
-            this.physics.tapNudgeBlock(tighterProbe.blockId, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
-            this.aiStage = 'probe_tight';
-            this.aiTimerSec = 0;
-            this.aiActionLabel = 'Glazier AI Testing Column…';
-          } else {
-            this.physics.hoveredBlockId = blk.id;
-            this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
-            this.aiStage = 'post_tap';
-            this.aiTimerSec = 0;
-            this.aiActionLabel = 'Glazier AI Selecting Prism…';
-          }
-          this.emitTelemetry(true);
-        });
+        this.dispatchAiCounterfactualOracle(difficulty);
       }
       return;
     }
 
     if (this.aiStage === 'probe_tight') {
       this.aiTimerSec += dt;
-      if (this.aiTimerSec >= 0.95) {
+      if (this.aiTimerSec >= probeDelay) {
         const blk = this.aiTargetBlockId !== null ? this.physics.blocks[this.aiTargetBlockId] : undefined;
         if (!blk || blk.shattered || !blk.isLegalTarget) {
           this.resetAiController();
@@ -1564,7 +2623,7 @@ export class GameEngine {
         this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
         this.aiStage = 'post_tap';
         this.aiTimerSec = 0;
-        this.aiActionLabel = 'Glazier AI Selecting Prism…';
+        this.aiActionLabel = `${labelPrefix} Selecting Prism…`;
         this.emitTelemetry(true);
       }
       return;
@@ -1572,32 +2631,22 @@ export class GameEngine {
 
     if (this.aiStage === 'post_tap') {
       this.aiTimerSec += dt;
-      if (this.aiTimerSec >= 0.90 && this.aiTargetBlockId !== null) {
-        const blk = this.physics.blocks[this.aiTargetBlockId];
-        if (!blk || blk.shattered) {
+      if (this.aiTimerSec >= postTapDelay && this.aiTargetBlockId !== null) {
+        const plan = this.computeOptimalExtractionPlan(this.aiTargetBlockId, difficulty);
+        if (!plan) {
           this.resetAiController();
           return;
         }
-        const axisX = quatRotateVec3(blk.rotation, [1, 0, 0]);
-        const horizLen = Math.hypot(axisX[0], axisX[2]) || 1.0;
-        const dirSign =
-          blk.position[0] * axisX[0] + blk.position[2] * axisX[2] >= 0 ? 1.0 : -1.0;
-        const pullX = (axisX[0] / horizLen) * dirSign;
-        const pullZ = (axisX[2] / horizLen) * dirSign;
-        const localGrab: Vec3 = [BLOCK_HALF_X * 0.84 * dirSign, 0, 0];
-        const grabOffset = quatRotateVec3(blk.rotation, localGrab);
-        const startWorld: Vec3 = [
-          blk.position[0] + grabOffset[0],
-          blk.position[1] + grabOffset[1],
-          blk.position[2] + grabOffset[2],
-        ];
-        if (this.physics.startGrabBlock(blk.id, localGrab, startWorld)) {
-          this.aiPullStartWorld = startWorld;
-          this.aiPullDirXZ = [pullX, pullZ];
+        const blkRef = this.physics.blocks[plan.blockId];
+        if (blkRef && this.physics.startGrabBlock(plan.blockId, plan.localGrab, plan.startWorld)) {
+          this.aiPullStartWorld = plan.startWorld;
+          this.aiPullBlockInitXZ = [blkRef.position[0], blkRef.position[2]];
+          this.aiPullDirXZ = plan.pullDirXZ;
           this.aiStage = 'pulling';
           this.aiTimerSec = 0;
+          this.aiPullProgressSec = 0;
           this.aiThinking = false;
-          this.aiActionLabel = 'Glazier AI Drawing…';
+          this.aiActionLabel = `${labelPrefix} Drawing…`;
           this.emitTelemetry(true);
         } else {
           this.resetAiController();
@@ -1608,51 +2657,66 @@ export class GameEngine {
 
     if (this.aiStage === 'pulling') {
       if (this.physics.turnPhase === 'EXTRACTED') {
-        const comCm = this.physics.centerOfMassXZCm;
-        const slots = this.physics.openTopSlots;
-        let bestXZ: [number, number] = [
-          this.physics.topSupportFrame.layerCenter[0],
-          this.physics.topSupportFrame.layerCenter[2],
-        ];
-        if (slots.length > 0) {
-          // Choose the open top slot that best counterbalances current tower CoM eccentricity
-          let bestScore = Infinity;
-          for (const sl of slots) {
-            const projX = comCm[0] + sl.position[0] * 1.8;
-            const projZ = comCm[1] + sl.position[2] * 1.8;
-            const err = Math.hypot(projX, projZ);
-            if (err < bestScore) {
-              bestScore = err;
-              bestXZ = [sl.position[0], sl.position[2]];
-            }
-          }
-        }
+        const placePlan = this.computeAdversarialTopPlacement(
+          this.physics.activeBlockId,
+          difficulty
+        );
         this.aiHoverCurrentXZ = [
           this.physics.carriedTargetPos[0],
           this.physics.carriedTargetPos[2],
         ];
-        this.aiHoverTargetXZ = bestXZ;
+        this.aiHoverTargetXZ = placePlan.targetXZ;
+        this.aiTargetYawOffsetRad = placePlan.yawOffsetRad;
+        this.physics.resetCarriedBlockRotation();
         this.aiStage = 'placing';
         this.aiTimerSec = 0;
-        this.aiActionLabel = 'Glazier AI Stacking…';
+        this.aiActionLabel = `${labelPrefix} Stacking…`;
         this.emitTelemetry(true);
         return;
       }
 
+      // Bind-and-release tactician reflex: if a grabbed prism binds hard (< 8 mm slide after 0.14 s)
+      // while tension or tower sway rises, release gently before clearing the channel and pick a looser prism
+      const pulledBlk =
+        this.aiTargetBlockId !== null ? this.physics.blocks[this.aiTargetBlockId] : undefined;
+      if (pulledBlk && this.aiTimerSec >= 0.14 && this.physics.turnPhase === 'PULLING') {
+        const movedDm = Math.hypot(
+          pulledBlk.position[0] - this.aiPullBlockInitXZ[0],
+          pulledBlk.position[2] - this.aiPullBlockInitXZ[1]
+        );
+        const liveLeanDeg = this.physics.getTelemetry().leanAngleDeg;
+        if (movedDm < 0.08 && (this.physics.grabResistance01 > 0.72 || liveLeanDeg > 0.90)) {
+          this.aiAbortedBlockIds.add(pulledBlk.id);
+          this.physics.endGrab(false);
+          this.resetAiController();
+          return;
+        }
+      }
+
       this.aiTimerSec += dt;
-      const tPull = Math.min(1.0, this.aiTimerSec / 1.58);
+      const resistanceThrottle = this.physics.grabResistance01 > 0.55 ? 0.55 : 1.0;
+      this.aiPullProgressSec += dt * resistanceThrottle;
+
+      const nominalPullDur = this.aiFastCadence ? 0.56 : 1.52;
+      const tPull = Math.min(1.0, this.aiPullProgressSec / nominalPullDur);
       const easePull = tPull * tPull * (3.0 - 2.0 * tPull);
-      const pullDistDm = 1.38 * easePull;
+      const extraReach =
+        this.aiPullProgressSec > nominalPullDur
+          ? Math.min(0.45, (this.aiPullProgressSec - nominalPullDur) * 0.35)
+          : 0;
+      const pullDistDm = 1.62 * easePull + extraReach;
       const targetWorld: Vec3 = [
         this.aiPullStartWorld[0] + this.aiPullDirXZ[0] * pullDistDm,
         this.aiPullStartWorld[1],
         this.aiPullStartWorld[2] + this.aiPullDirXZ[1] * pullDistDm,
       ];
       this.physics.updateGrabTarget(targetWorld);
-      if (this.aiTimerSec > 3.8 && this.physics.turnPhase === 'PULLING') {
-        // If unexpectedly jammed, abort cleanly and re-scout
+      if (this.aiTimerSec > (this.aiFastCadence ? 2.4 : 4.2) && this.physics.turnPhase === 'PULLING') {
+        if (this.aiTargetBlockId !== null) {
+          this.aiAbortedBlockIds.add(this.aiTargetBlockId);
+        }
         this.physics.endGrab(false);
-        this.aiStage = 'idle';
+        this.resetAiController();
       }
       return;
     }
@@ -1663,7 +2727,9 @@ export class GameEngine {
         return;
       }
       this.aiTimerSec += dt;
-      const u = Math.min(1.0, this.aiTimerSec / 0.95);
+      const hoverDur = this.aiFastCadence ? 0.09 : 0.92;
+      const releaseTime = this.aiFastCadence ? 0.13 : 1.42;
+      const u = Math.min(1.0, this.aiTimerSec / hoverDur);
       const smoothU = u * u * (3.0 - 2.0 * u);
       const hx =
         this.aiHoverCurrentXZ[0] + (this.aiHoverTargetXZ[0] - this.aiHoverCurrentXZ[0]) * smoothU;
@@ -1671,8 +2737,15 @@ export class GameEngine {
         this.aiHoverCurrentXZ[1] + (this.aiHoverTargetXZ[1] - this.aiHoverCurrentXZ[1]) * smoothU;
       const topY = this.physics.topSupportFrame.layerCenter[1] + 1.0;
       this.physics.updateCarriedHover([hx, topY, hz], [0, -1, 0]);
-      // Hold a visible 0.50 s alignment poise over the chosen landing slot before releasing (`0.95s -> 1.45s`)
-      if (this.aiTimerSec >= 1.45 && this.physics.isExtractionLiftReady) {
+
+      if (Math.abs(this.aiTargetYawOffsetRad) > 1e-4 && u >= 0.85) {
+        const deltaYaw = this.aiTargetYawOffsetRad - this.physics.carriedYawOffsetRad;
+        if (Math.abs(deltaYaw) > 1e-3) {
+          this.physics.rotateCarriedBlock(deltaYaw);
+        }
+      }
+
+      if (this.aiTimerSec >= releaseTime && this.physics.isExtractionLiftReady) {
         this.physics.releaseExtractedBlockOntoTop();
         this.resetAiController();
         this.emitTelemetry(true);
@@ -1699,9 +2772,13 @@ export class GameEngine {
     this.resetAiController();
     if (mode !== undefined && mode !== 'party') {
       this.aiOpponentEnabled = false;
+      this.aiVsAiEnabled = false;
+      this.aiFastCadence = false;
     }
     if (players !== undefined && players !== 2) {
       this.aiOpponentEnabled = false;
+      this.aiVsAiEnabled = false;
+      this.aiFastCadence = false;
     }
     if (this.renderer) {
       this.renderer.lightingOverride = null;
@@ -1711,7 +2788,9 @@ export class GameEngine {
     this.interactionMode = 'none';
     this.activePointerId = null;
     this.activeTouches.clear();
+    this.primaryTouchDownMs = -Infinity;
     this.lastPinchDist = 0;
+    this.lastPinchMidpoint = [0, 0];
     this.pendingTapHit = null;
     this.audio.updateSlideFriction(0, 0);
     this.physics.rebuildTower(mode, players);
@@ -2063,16 +3142,151 @@ export class GameEngine {
     return this.intersectHorizontalPlane(rayOrigin, rayDir, lc[1] || 2.7);
   }
 
+  /**
+   * Resolves a 1-finger / pointer ray against the top placement zone without requiring prior hover.
+   * Combines direct OBB picking against open top guide slots and the floating carried prism with
+   * grazing-safe plane projection so 1-finger placement works reliably across mobile, iPad, and desktop
+   * even before camera elevation smoothing finishes.
+   */
+  private resolveTopPlacementRay(
+    rayOrigin: Vec3,
+    rayDir: Vec3,
+    maxRadiusDm: number = 1.18
+  ): { hitPoint: Vec3; synthOrigin: Vec3; synthDir: Vec3 } | null {
+    const frame = this.physics.topSupportFrame;
+    const lc = frame.layerCenter;
+    const n = frame.upNormal;
+
+    const makeVerticalRay = (pt: Vec3) => ({
+      hitPoint: pt,
+      synthOrigin: [pt[0] + n[0], pt[1] + n[1], pt[2] + n[2]] as Vec3,
+      synthDir: [-n[0], -n[1], -n[2]] as Vec3,
+    });
+
+    const denom = rayDir[0] * n[0] + rayDir[1] * n[1] + rayDir[2] * n[2];
+
+    // 1. For all downward-pointing rays (>= ~4.6 deg onto top support plane, including 10 deg grazing),
+    // intersect the exact top support plane first so outer-slot front-face OBBs never introduce overhang parallax.
+    if (denom <= -0.08) {
+      const ptTop = this.intersectTopSupportPlane(rayOrigin, rayDir);
+      if (ptTop && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < maxRadiusDm) {
+        return makeVerticalRay([ptTop[0], lc[1], ptTop[2]]);
+      }
+    }
+
+    // 2. For upward/horizon rays (e.g. tall 24L+ tower viewed from below), pick open top slot OBBs and snap to slot center
+    const slotHalfExt: Vec3 = [BLOCK_HALF_X * 1.12, BLOCK_HALF_Y * 1.65, BLOCK_HALF_Z * 1.24];
+    let bestSlotT = Infinity;
+    let bestSlotPt: Vec3 | null = null;
+    for (let i = 0; i < this.physics.openTopSlots.length; i++) {
+      const sl = this.physics.openTopSlots[i];
+      const hit = intersectRayOBB(rayOrigin, rayDir, sl.position, sl.rotation, slotHalfExt);
+      if (hit && hit.t < bestSlotT) {
+        bestSlotT = hit.t;
+        bestSlotPt = [sl.position[0], lc[1], sl.position[2]];
+      }
+    }
+    if (bestSlotPt && Math.hypot(bestSlotPt[0] - lc[0], bestSlotPt[2] - lc[2]) < maxRadiusDm) {
+      return makeVerticalRay(bestSlotPt);
+    }
+
+    // 3. Direct OBB hit on the floating carried prism itself -> use its clamped landing pose
+    const carriedHit = intersectRayOBB(
+      rayOrigin,
+      rayDir,
+      this.physics.carriedTargetPos,
+      this.physics.carriedTargetQuat,
+      slotHalfExt
+    );
+    if (carriedHit) {
+      const pt: Vec3 = [this.physics.carriedLandingPos[0], lc[1], this.physics.carriedLandingPos[2]];
+      if (Math.hypot(pt[0] - lc[0], pt[2] - lc[2]) < maxRadiusDm) {
+        return makeVerticalRay(pt);
+      }
+    }
+
+    // 4. Horizon / upward drag-plane projection fallback
+    const ptProj = this.projectBlockDragPlane(rayOrigin, rayDir, lc);
+    if (ptProj && Math.hypot(ptProj[0] - lc[0], ptProj[2] - lc[2]) < maxRadiusDm) {
+      return makeVerticalRay([ptProj[0], lc[1], ptProj[2]]);
+    }
+
+    return null;
+  }
+
+  public getInteractionMode(): string {
+    return this.interactionMode;
+  }
+
+  public getActiveTouchCount(): number {
+    return this.activeTouches.size;
+  }
+
+  private cancelActiveSinglePointerForPinch(): void {
+    if (this.interactionMode === 'block') {
+      if (this.mpRole === 'guest') {
+        this.mpPendingPullTarget = null;
+        this.guestWorld?.setOptimisticGuestPullAnchor(null);
+        this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: false });
+      } else {
+        this.physics.endGrab(false);
+        this.mpForceImmediateSnapshot = true;
+      }
+    }
+    if (this.physics) {
+      this.physics.hoveredBlockId = null;
+    }
+    this.camera.isUserOrbiting = false;
+    this.activePointerId = null;
+    this.pendingTapHit = null;
+  }
+
   public handlePointerDown(
     clientX: number,
     clientY: number,
     pointerId: number = 1,
     button: number = 0,
     altKey: boolean = false,
-    overrideRect?: { left: number; top: number; width: number; height: number }
+    overrideRect?: { left: number; top: number; width: number; height: number },
+    pointerType: 'mouse' | 'touch' | 'pen' = 'mouse',
+    timestampMs?: number
   ): void {
     this.audio.unlock();
-    if (this.activePointerId !== null) return;
+    const nowMs =
+      timestampMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+    if (pointerType === 'touch') {
+      if (this.activeTouches.size === 0) {
+        this.activeTouches.set(pointerId, [clientX, clientY]);
+        this.primaryTouchDownMs = nowMs;
+      } else {
+        const elapsedSincePrimaryMs = nowMs - this.primaryTouchDownMs;
+        // Protect established (> 80 ms) deliberate block pulls from accidental secondary bezel/palm touches
+        if (
+          this.interactionMode === 'block' &&
+          elapsedSincePrimaryMs > GameEngine.MULTI_TOUCH_GRAB_CANCEL_WINDOW_MS
+        ) {
+          return;
+        }
+
+        this.activeTouches.set(pointerId, [clientX, clientY]);
+        if (this.activeTouches.size >= 2) {
+          this.cancelActiveSinglePointerForPinch();
+          const pts = Array.from(this.activeTouches.values());
+          this.lastPinchDist = Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
+          this.lastPinchMidpoint = [
+            (pts[0][0] + pts[1][0]) * 0.5,
+            (pts[0][1] + pts[1][1]) * 0.5,
+          ];
+          this.interactionMode = 'pinch_pan';
+          this.updateCursorStyle();
+          this.emitTelemetry(true);
+          return;
+        }
+      }
+    }
+
+    if (this.interactionMode === 'pinch_pan' || this.activePointerId !== null) return;
 
     this.activePointerId = pointerId;
     this.pointerDownPos = [clientX, clientY];
@@ -2090,20 +3304,16 @@ export class GameEngine {
     }
 
     if (this.physics.turnPhase === 'EXTRACTED') {
-      const lc = this.physics.topSupportFrame.layerCenter;
-      const ptTop = this.intersectTopSupportPlane(origin, dir);
-      const nearTopTower =
-        ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 1.15;
-
-      if (nearTopTower) {
+      const resolvedTop = this.resolveTopPlacementRay(origin, dir, 1.18);
+      if (resolvedTop) {
         if (this.mpRole === 'guest') {
           this.sendGuestRemoteCommand({
             kind: 'nudge_placement',
-            rayOrigin: origin,
-            rayDir: dir,
+            rayOrigin: resolvedTop.synthOrigin,
+            rayDir: resolvedTop.synthDir,
           });
         } else {
-          this.physics.updateCarriedHover(origin, dir);
+          this.physics.updateCarriedHover(resolvedTop.synthOrigin, resolvedTop.synthDir);
         }
         this.interactionMode = 'place_top';
       } else {
@@ -2114,7 +3324,7 @@ export class GameEngine {
       return;
     }
 
-    // Defer SELECT_BLOCK -> PULLING until >= 5.0 px drag so clicks tap-test blocks without locking in a turn!
+    // Defer SELECT_BLOCK -> PULLING until >= 5.0 px drag so clicks/taps tap-test blocks without locking in a turn!
     const pick = this.raycastIntactBlocks(origin, dir);
     if (pick) {
       const blk = this.physics.blocks[pick.blockId];
@@ -2151,11 +3361,53 @@ export class GameEngine {
     clientX: number,
     clientY: number,
     pointerId: number = 1,
-    overrideRect?: { left: number; top: number; width: number; height: number }
+    overrideRect?: { left: number; top: number; width: number; height: number },
+    pointerType: 'mouse' | 'touch' | 'pen' = 'mouse',
+    timestampMs?: number
   ): void {
     const rect = this.getViewportRect(overrideRect);
+    const now =
+      timestampMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+    if (pointerType === 'touch') {
+      if (this.activeTouches.has(pointerId)) {
+        this.activeTouches.set(pointerId, [clientX, clientY]);
+      }
+      if (this.interactionMode === 'pinch_pan') {
+        if (this.activeTouches.size >= 2) {
+          const pts = Array.from(this.activeTouches.values());
+          const midX = (pts[0][0] + pts[1][0]) * 0.5;
+          const midY = (pts[0][1] + pts[1][1]) * 0.5;
+          const dist = Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
+
+          const dMidX = midX - this.lastPinchMidpoint[0];
+          const dMidY = midY - this.lastPinchMidpoint[1];
+          if (Math.abs(dMidX) > 0.01 || Math.abs(dMidY) > 0.01) {
+            this.camera.panBy(dMidX, dMidY, rect.height);
+          }
+
+          if (this.lastPinchDist > 8 && dist > 8) {
+            const scaleDelta = Math.max(
+              -0.22,
+              Math.min(0.22, this.lastPinchDist / dist - 1.0)
+            );
+            if (Math.abs(scaleDelta) > 1e-4) {
+              this.camera.zoomBy(scaleDelta);
+            }
+          }
+
+          this.lastPinchDist = dist;
+          this.lastPinchMidpoint = [midX, midY];
+        }
+        return;
+      }
+      // Touch input has no passive hover state when no primary touch is active
+      if (this.activePointerId === null || pointerId !== this.activePointerId) {
+        return;
+      }
+    }
+
     const { origin, dir } = this.camera.screenToRay(clientX, clientY, rect);
-    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
     if (this.activePointerId === null || pointerId !== this.activePointerId) {
       if (!this.canLocalPlayerManipulateBlocks()) {
@@ -2222,20 +3474,23 @@ export class GameEngine {
     }
 
     if (!this.canLocalPlayerManipulateBlocks()) {
-      this.handlePointerCancel(pointerId);
+      this.handlePointerCancel(pointerId, pointerType);
       return;
     }
 
     if (this.interactionMode === 'place_top' && this.physics.turnPhase === 'EXTRACTED') {
+      const resolvedTop = this.resolveTopPlacementRay(origin, dir, 1.45);
+      const rOrig = resolvedTop ? resolvedTop.synthOrigin : origin;
+      const rDir = resolvedTop ? resolvedTop.synthDir : dir;
       if (this.mpRole === 'guest') {
         if (now - this.mpLastGuestCmdSentMs >= 15) {
           this.sendGuestRemoteCommand(
-            { kind: 'nudge_placement', rayOrigin: origin, rayDir: dir },
+            { kind: 'nudge_placement', rayOrigin: rOrig, rayDir: rDir },
             now
           );
         }
       } else {
-        this.physics.updateCarriedHover(origin, dir);
+        this.physics.updateCarriedHover(rOrig, rDir);
       }
       this.updateCursorStyle();
       return;
@@ -2273,20 +3528,21 @@ export class GameEngine {
 
     if (this.interactionMode === 'block') {
       if (this.physics.turnPhase === 'EXTRACTED') {
-        const lc = this.physics.topSupportFrame.layerCenter;
-        const ptTop = this.intersectTopSupportPlane(origin, dir);
-        const nearTopPlane =
-          ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 1.35;
-        if (this.physics.isExtractionLiftReady && nearTopPlane) {
+        const resolvedTop = this.resolveTopPlacementRay(origin, dir, 1.35);
+        if (this.physics.isExtractionLiftReady && resolvedTop) {
           if (this.mpRole === 'guest') {
             if (now - this.mpLastGuestCmdSentMs >= 15) {
               this.sendGuestRemoteCommand(
-                { kind: 'nudge_placement', rayOrigin: origin, rayDir: dir },
+                {
+                  kind: 'nudge_placement',
+                  rayOrigin: resolvedTop.synthOrigin,
+                  rayDir: resolvedTop.synthDir,
+                },
                 now
               );
             }
           } else {
-            this.physics.updateCarriedHover(origin, dir);
+            this.physics.updateCarriedHover(resolvedTop.synthOrigin, resolvedTop.synthDir);
           }
         }
       } else {
@@ -2317,28 +3573,50 @@ export class GameEngine {
     clientX: number,
     clientY: number,
     pointerId: number = 1,
-    overrideRect?: { left: number; top: number; width: number; height: number }
+    overrideRect?: { left: number; top: number; width: number; height: number },
+    pointerType: 'mouse' | 'touch' | 'pen' = 'mouse',
+    timestampMs?: number
   ): void {
+    void timestampMs;
+    if (pointerType === 'touch') {
+      this.activeTouches.delete(pointerId);
+      if (this.interactionMode === 'pinch_pan') {
+        if (this.activeTouches.size < 2) {
+          this.lastPinchDist = 0;
+        }
+        if (this.activeTouches.size === 0) {
+          this.interactionMode = 'none';
+          this.primaryTouchDownMs = -Infinity;
+          this.updateCursorStyle();
+        }
+        return;
+      }
+      if (this.activeTouches.size === 0) {
+        this.primaryTouchDownMs = -Infinity;
+      }
+    }
+
     if (this.activePointerId === null || pointerId !== this.activePointerId) return;
 
     const rect = this.getViewportRect(overrideRect);
     const { origin, dir } = this.camera.screenToRay(clientX, clientY, rect);
 
     if (this.interactionMode === 'place_top') {
-      const lc = this.physics.topSupportFrame.layerCenter;
-      const ptTop = this.intersectTopSupportPlane(origin, dir);
-      const stillOverTop =
-        ptTop !== null && Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 0.95;
-      if (this.pointerMovedDist < 18.0 || stillOverTop) {
+      const resolvedTop = this.resolveTopPlacementRay(origin, dir, 1.05);
+      if (this.pointerMovedDist < 18.0 || resolvedTop !== null) {
+        const rOrig = resolvedTop ? resolvedTop.synthOrigin : origin;
+        const rDir = resolvedTop ? resolvedTop.synthDir : dir;
         if (this.mpRole === 'guest') {
           this.sendGuestRemoteCommand({
             kind: 'nudge_placement',
-            rayOrigin: origin,
-            rayDir: dir,
+            rayOrigin: rOrig,
+            rayDir: rDir,
           });
           this.sendGuestRemoteCommand({ kind: 'confirm_placement' });
         } else {
-          this.physics.updateCarriedHover(origin, dir);
+          if (resolvedTop) {
+            this.physics.updateCarriedHover(rOrig, rDir);
+          }
           this.physics.releaseExtractedBlockOntoTop();
           this.mpForceImmediateSnapshot = true;
         }
@@ -2371,21 +3649,21 @@ export class GameEngine {
           this.mpPendingPullTarget = null;
           this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: finalTarget });
         }
-        const lc = this.physics.topSupportFrame.layerCenter;
-        const ptTop = this.intersectTopSupportPlane(origin, dir);
+        const resolvedTop =
+          this.physics.turnPhase === 'EXTRACTED'
+            ? this.resolveTopPlacementRay(origin, dir, 0.82)
+            : null;
         const overTop =
           this.physics.turnPhase === 'EXTRACTED' &&
           this.physics.isExtractionLiftReady &&
-          ptTop !== null &&
-          Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 0.78;
+          resolvedTop !== null;
         this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: overTop });
       } else if (this.physics.turnPhase === 'EXTRACTED') {
-        const lc = this.physics.topSupportFrame.layerCenter;
-        const ptTop = this.intersectTopSupportPlane(origin, dir);
-        const overTop =
-          this.physics.isExtractionLiftReady &&
-          ptTop !== null &&
-          Math.hypot(ptTop[0] - lc[0], ptTop[2] - lc[2]) < 0.78;
+        const resolvedTop = this.resolveTopPlacementRay(origin, dir, 0.82);
+        const overTop = this.physics.isExtractionLiftReady && resolvedTop !== null;
+        if (overTop && resolvedTop) {
+          this.physics.updateCarriedHover(resolvedTop.synthOrigin, resolvedTop.synthDir);
+        }
         this.physics.endGrab(overTop);
         this.mpForceImmediateSnapshot = true;
       } else {
@@ -2402,7 +3680,37 @@ export class GameEngine {
     this.emitTelemetry(true);
   }
 
-  public handlePointerCancel(pointerId?: number): void {
+  public handlePointerCancel(
+    pointerId?: number,
+    pointerType: 'mouse' | 'touch' | 'pen' = 'mouse'
+  ): void {
+    if (pointerId === undefined) {
+      this.activeTouches.clear();
+      this.primaryTouchDownMs = -Infinity;
+      this.lastPinchDist = 0;
+      if (this.interactionMode === 'pinch_pan') {
+        this.interactionMode = 'none';
+        this.updateCursorStyle();
+        return;
+      }
+    } else if (pointerType === 'touch') {
+      this.activeTouches.delete(pointerId);
+      if (this.interactionMode === 'pinch_pan') {
+        if (this.activeTouches.size < 2) {
+          this.lastPinchDist = 0;
+        }
+        if (this.activeTouches.size === 0) {
+          this.interactionMode = 'none';
+          this.primaryTouchDownMs = -Infinity;
+          this.updateCursorStyle();
+        }
+        return;
+      }
+      if (this.activeTouches.size === 0) {
+        this.primaryTouchDownMs = -Infinity;
+      }
+    }
+
     if (this.activePointerId === null) return;
     if (pointerId !== undefined && pointerId !== this.activePointerId) return;
 
@@ -2425,12 +3733,25 @@ export class GameEngine {
     this.emitTelemetry(true);
   }
 
+  private syncCarriedHoverToCurrentLanding(): void {
+    const physicsAny = this.physics as unknown as { hasCustomCarriedHover?: boolean };
+    if (physicsAny.hasCustomCarriedHover) return;
+    const land = this.physics.carriedLandingPos;
+    const n = this.physics.topSupportFrame.upNormal;
+    this.physics.updateCarriedHover(
+      [land[0] + n[0], land[1] + n[1], land[2] + n[2]],
+      [-n[0], -n[1], -n[2]]
+    );
+  }
+
   public handleRotateCarried(deltaYawRad: number): void {
     if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
+    this.audio.unlock();
     if (this.mpRole === 'guest') {
       this.sendGuestRemoteCommand({ kind: 'rotate_placement', deltaYawRad });
       return;
     }
+    this.syncCarriedHoverToCurrentLanding();
     this.physics.rotateCarriedBlock(deltaYawRad);
     this.mpForceImmediateSnapshot = true;
     this.emitTelemetry(true);
@@ -2438,10 +3759,12 @@ export class GameEngine {
 
   public handleResetCarriedRotation(): void {
     if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
+    this.audio.unlock();
     if (this.mpRole === 'guest') {
       this.sendGuestRemoteCommand({ kind: 'reset_rotation' });
       return;
     }
+    this.syncCarriedHoverToCurrentLanding();
     this.physics.resetCarriedBlockRotation();
     this.mpForceImmediateSnapshot = true;
     this.emitTelemetry(true);
@@ -2449,6 +3772,7 @@ export class GameEngine {
 
   public handleReleaseOntoTop(): void {
     if (!this.canLocalPlayerManipulateBlocks() || this.physics.turnPhase !== 'EXTRACTED') return;
+    this.audio.unlock();
     if (this.mpRole === 'guest') {
       this.sendGuestRemoteCommand({ kind: 'confirm_placement' });
       return;
@@ -2458,6 +3782,10 @@ export class GameEngine {
     this.emitTelemetry(true);
   }
 
+  private onFirstGestureUnlock = (): void => {
+    this.audio.unlock();
+  };
+
   private onPointerDown = (e: PointerEvent): void => {
     if ((e as unknown as { _vitrailHandled?: boolean })._vitrailHandled) return;
     (e as unknown as { _vitrailHandled?: boolean })._vitrailHandled = true;
@@ -2466,63 +3794,60 @@ export class GameEngine {
     } catch {
       // Synthetic pointer events may not have an active pointerId
     }
-    if (e.pointerType === 'touch') {
-      this.activeTouches.set(e.pointerId, [e.clientX, e.clientY]);
-      if (this.activeTouches.size === 2) {
-        const pts = Array.from(this.activeTouches.values());
-        this.lastPinchDist = Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
-        if (this.interactionMode === 'orbit' || this.interactionMode === 'block_pending') {
-          this.handlePointerCancel();
-        }
-        return;
-      }
-    }
-    this.handlePointerDown(e.clientX, e.clientY, e.pointerId, e.button, e.altKey);
+    const pType = (e.pointerType as 'mouse' | 'touch' | 'pen') || 'mouse';
+    this.handlePointerDown(
+      e.clientX,
+      e.clientY,
+      e.pointerId,
+      e.button,
+      e.altKey,
+      undefined,
+      pType,
+      e.timeStamp
+    );
   };
 
   private onPointerMove = (e: PointerEvent): void => {
-    if (e.pointerType === 'touch' && this.activeTouches.has(e.pointerId)) {
-      this.activeTouches.set(e.pointerId, [e.clientX, e.clientY]);
-      if (this.activeTouches.size >= 2) {
-        const pts = Array.from(this.activeTouches.values());
-        const dist = Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
-        if (this.lastPinchDist > 4) {
-          const pinchDelta = (this.lastPinchDist - dist) * 0.014;
-          this.camera.zoomBy(Math.max(-0.22, Math.min(0.22, pinchDelta)));
-        }
-        this.lastPinchDist = dist;
-        return;
-      }
-    }
-    if (this.activePointerId === null && e.target !== this.canvas) {
+    const pType = (e.pointerType as 'mouse' | 'touch' | 'pen') || 'mouse';
+    if (
+      this.activePointerId === null &&
+      this.activeTouches.size === 0 &&
+      e.target !== this.canvas
+    ) {
       return;
     }
-    this.handlePointerMove(e.clientX, e.clientY, e.pointerId);
+    this.handlePointerMove(
+      e.clientX,
+      e.clientY,
+      e.pointerId,
+      undefined,
+      pType,
+      e.timeStamp
+    );
   };
 
   private onPointerUp = (e: PointerEvent): void => {
-    if (e.pointerType === 'touch') {
-      this.activeTouches.delete(e.pointerId);
-      if (this.activeTouches.size < 2) {
-        this.lastPinchDist = 0;
-      }
-    }
-    this.handlePointerUp(e.clientX, e.clientY, e.pointerId);
+    const pType = (e.pointerType as 'mouse' | 'touch' | 'pen') || 'mouse';
+    this.handlePointerUp(
+      e.clientX,
+      e.clientY,
+      e.pointerId,
+      undefined,
+      pType,
+      e.timeStamp
+    );
   };
 
   private onPointerCancel = (e: PointerEvent): void => {
-    if (e.pointerType === 'touch') {
-      this.activeTouches.delete(e.pointerId);
-      if (this.activeTouches.size < 2) {
-        this.lastPinchDist = 0;
-      }
-    }
-    this.handlePointerCancel(e.pointerId);
+    const pType = (e.pointerType as 'mouse' | 'touch' | 'pen') || 'mouse';
+    this.handlePointerCancel(e.pointerId, pType);
   };
 
   private onWindowBlur = (): void => {
     this.activeTouches.clear();
+    this.primaryTouchDownMs = -Infinity;
     this.lastPinchDist = 0;
+    this.lastPinchMidpoint = [0, 0];
     this.handlePointerCancel();
   };
 
@@ -2552,7 +3877,7 @@ export class GameEngine {
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
     if (e.code === 'Escape') {
-      if (this.activePointerId !== null) {
+      if (this.activePointerId !== null || this.activeTouches.size > 0) {
         e.preventDefault();
         this.handlePointerCancel();
       }
@@ -2605,6 +3930,28 @@ export class GameEngine {
     this.canvas.addEventListener('contextmenu', this.onContextMenu);
     window.addEventListener('pagehide', this.onPageHide);
 
+    // iOS/WebKit CoreAudio first-gesture unlock across both canvas and HUD controls
+    window.addEventListener('touchstart', this.onFirstGestureUnlock, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('touchend', this.onFirstGestureUnlock, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('pointerdown', this.onFirstGestureUnlock, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('pointerup', this.onFirstGestureUnlock, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('keydown', this.onFirstGestureUnlock, {
+      capture: true,
+      passive: true,
+    });
+
     this.resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
@@ -2635,6 +3982,11 @@ export class GameEngine {
       window.removeEventListener('blur', this.onWindowBlur);
       window.removeEventListener('keydown', this.onKeyDown);
       window.removeEventListener('pagehide', this.onPageHide);
+      window.removeEventListener('touchstart', this.onFirstGestureUnlock, true);
+      window.removeEventListener('touchend', this.onFirstGestureUnlock, true);
+      window.removeEventListener('pointerdown', this.onFirstGestureUnlock, true);
+      window.removeEventListener('pointerup', this.onFirstGestureUnlock, true);
+      window.removeEventListener('keydown', this.onFirstGestureUnlock, true);
     }
     this.resizeObserver?.disconnect();
 
