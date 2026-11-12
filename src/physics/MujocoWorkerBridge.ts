@@ -1,16 +1,29 @@
 import { GlassAudioEngine } from '../audio/GlassAudioEngine';
-import { Quat, Vec3 } from '../math/vecMat';
+import { Quat, quatInverseRotateVec3, quatRotateVec3, Vec3 } from '../math/vecMat';
 import {
+  BLOCK_HALF_X,
   BLOCK_HALF_Y,
+  BLOCK_HALF_Z,
   BLOCK_HEIGHT,
   INITIAL_LAYERS,
   MAX_ACTIVE_SHARDS,
   SHARD_SLOT_STRIDE_VERTS,
+  TABLE_RADIUS,
+  TABLE_THICKNESS,
   TARGET_BLOCK_MASS_KG,
   TraceryMotif,
 } from './constants';
-import { BlockCriticalityCandidate } from './MujocoPhysicsEngine';
+import type {
+  AdversarialPlacementPlan,
+  BlockCriticalityCandidate,
+  SceneRaycastHit,
+  SceneRaycastOptions,
+} from './MujocoPhysicsEngine';
 import {
+  buildNominalGlassBlocks,
+  buildNominalTopSupportFrameAndSlots,
+} from './mujocoTowerBuilder';
+import type {
   WorkerAudioEvent,
   WorkerInboundMessage,
   WorkerOutboundMessage,
@@ -34,12 +47,25 @@ import {
   WobbleRockEvent,
 } from './PhysicsWorld';
 
+export interface WorkerEndpointLike {
+  onmessage: ((ev: MessageEvent<WorkerOutboundMessage>) => void) | null;
+  postMessage(message: WorkerInboundMessage, transfer?: Transferable[]): void;
+  terminate?(): void;
+  addEventListener?(
+    type: 'error',
+    listener: (ev: ErrorEvent) => void,
+    options?: { once?: boolean }
+  ): void;
+  removeEventListener?(type: 'error', listener: (ev: ErrorEvent) => void): void;
+}
+
 /**
  * Main-thread Non-Blocking Physics Mirror (`MujocoWorkerBridge`)
  *
  * Runs Google DeepMind's `@mujoco/mujoco@4.0.0` (`/mt` multi-threaded WASM island threadpool)
- * inside a dedicated ES Module Web Worker so main-thread WebGPU `requestAnimationFrame`
- * submits draw calls at `0.0 ms` solver stall on desktop and iPad Pro.
+ * inside a dedicated ES Module Web Worker (or `MessageChannel` endpoint in tests) with
+ * monotonic `epoch` + `ackSeq` fencing so main-thread WebGPU `requestAnimationFrame`
+ * submits draw calls at `0.0 ms` solver stall and zero stale-snapshot races.
  */
 export class MujocoWorkerBridge {
   public readonly isWorkerBacked = true;
@@ -109,10 +135,17 @@ export class MujocoWorkerBridge {
   public peakHeightCm: number = INITIAL_LAYERS * BLOCK_HEIGHT * 10;
   public lockedMinRow: number | null = INITIAL_LAYERS;
 
-  private worker: Worker;
+  private worker: WorkerEndpointLike;
   private audio: GlassAudioEngine;
+  private epoch: number = 1;
+  private commandSeq: number = 0;
+  private grabLockUntilSeq: number = 0;
+  private releaseLockUntilSeq: number = 0;
+  private preGrabTurnPhase: TurnPhase = 'SELECT_BLOCK';
   private simTime: number = 0;
   private initialLayers: number = INITIAL_LAYERS;
+  private solverWarningCount: number = 0;
+  private mechanicalEnergyJ: number = 0;
   private shardMetaById = new Map<number, WorkerShardStaticMeta>();
   private slotRenderVertices: Array<Float32Array | null> = new Array(MAX_ACTIVE_SHARDS).fill(null);
   private exportedShardIds = new Set<number>();
@@ -127,9 +160,11 @@ export class MujocoWorkerBridge {
   private accumDtWhileInFlight: number = 0;
   private nextReqId: number = 1;
   private oracleCallbacks = new Map<number, (res: BlockCriticalityCandidate[]) => void>();
+  private placementCallbacks = new Map<number, (res: AdversarialPlacementPlan[]) => void>();
+  private raycastCallbacks = new Map<number, (res: SceneRaycastHit | null) => void>();
   private disposed: boolean = false;
 
-  private constructor(worker: Worker, audio: GlassAudioEngine) {
+  private constructor(worker: WorkerEndpointLike, audio: GlassAudioEngine) {
     this.worker = worker;
     this.audio = audio;
     this.worker.onmessage = (ev: MessageEvent<WorkerOutboundMessage>) => {
@@ -140,29 +175,35 @@ export class MujocoWorkerBridge {
   public static async create(
     audio: GlassAudioEngine,
     initialLayers: number = INITIAL_LAYERS,
-    seed?: number
+    seed?: number,
+    customWorker?: WorkerEndpointLike
   ): Promise<MujocoWorkerBridge> {
-    const worker = new Worker(new URL('./mujocoWorker.ts', import.meta.url), {
-      type: 'module',
-    });
+    const worker: WorkerEndpointLike =
+      customWorker ??
+      new Worker(new URL('./mujocoWorker.ts', import.meta.url), {
+        type: 'module',
+      });
     const bridge = new MujocoWorkerBridge(worker, audio);
     bridge.initialLayers = initialLayers;
     if (seed !== undefined) {
       bridge.towerSeed = seed >>> 0;
     }
 
+    const initEpoch = bridge.epoch;
+    const initSeq = ++bridge.commandSeq;
+
     await new Promise<void>((resolve, reject) => {
       const onError = (err: ErrorEvent) => {
-        worker.removeEventListener('error', onError);
+        worker.removeEventListener?.('error', onError);
         reject(new Error(err.message || 'MuJoCo physics worker failed to initialize'));
       };
-      worker.addEventListener('error', onError, { once: true });
+      worker.addEventListener?.('error', onError, { once: true });
 
       const prevHandler = worker.onmessage;
       worker.onmessage = (ev: MessageEvent<WorkerOutboundMessage>) => {
         const msg = ev.data;
-        if (msg.type === 'ready') {
-          worker.removeEventListener('error', onError);
+        if (msg.type === 'ready' && msg.epoch === initEpoch) {
+          worker.removeEventListener?.('error', onError);
           bridge.workerThreadingMode = msg.threadingMode;
           bridge.workerThreadCount = msg.threadCount;
           bridge.applySnapshot(msg.snapshot);
@@ -173,11 +214,50 @@ export class MujocoWorkerBridge {
         }
       };
 
-      const initMsg: WorkerInboundMessage = { type: 'init', initialLayers, seed };
+      const initMsg: WorkerInboundMessage = {
+        type: 'init',
+        epoch: initEpoch,
+        seq: initSeq,
+        initialLayers,
+        seed,
+      };
       worker.postMessage(initMsg);
     });
 
     return bridge;
+  }
+
+  public getEpoch(): number {
+    return this.epoch;
+  }
+
+  public getSolverWarningCount(): number {
+    return this.solverWarningCount;
+  }
+
+  public computeMechanicalEnergyJ(): number {
+    return this.mechanicalEnergyJ;
+  }
+
+  private bumpEpoch(): number {
+    this.epoch++;
+    this.stepInFlight = false;
+    this.accumDtWhileInFlight = 0;
+    this.grabLockUntilSeq = 0;
+    this.releaseLockUntilSeq = 0;
+    for (const cb of this.oracleCallbacks.values()) {
+      cb([]);
+    }
+    this.oracleCallbacks.clear();
+    for (const cb of this.placementCallbacks.values()) {
+      cb([]);
+    }
+    this.placementCallbacks.clear();
+    for (const cb of this.raycastCallbacks.values()) {
+      cb(null);
+    }
+    this.raycastCallbacks.clear();
+    return this.epoch;
   }
 
   private post(msg: WorkerInboundMessage): void {
@@ -187,6 +267,9 @@ export class MujocoWorkerBridge {
 
   private handleWorkerMessage(msg: WorkerOutboundMessage): void {
     if (this.disposed) return;
+    // Monotonic epoch fence: strictly discard stale snapshots & RPC responses from superseded epochs
+    if (msg.epoch !== this.epoch) return;
+
     if (msg.type === 'snapshot') {
       this.stepInFlight = false;
       this.applySnapshot(msg);
@@ -200,9 +283,42 @@ export class MujocoWorkerBridge {
       }
       return;
     }
-    if (msg.type === 'grabStarted' && !msg.started) {
-      this.isPointerDraggingBlock = false;
-      this.activeBlockId = null;
+    if (msg.type === 'placementResult') {
+      const cb = this.placementCallbacks.get(msg.reqId);
+      if (cb) {
+        this.placementCallbacks.delete(msg.reqId);
+        cb(msg.plans);
+      }
+      return;
+    }
+    if (msg.type === 'raycastResult') {
+      const cb = this.raycastCallbacks.get(msg.reqId);
+      if (cb) {
+        this.raycastCallbacks.delete(msg.reqId);
+        cb(msg.hit);
+      }
+      return;
+    }
+    if (msg.type === 'grabStarted') {
+      if (msg.seq >= this.grabLockUntilSeq) {
+        this.grabLockUntilSeq = 0;
+      }
+      if (!msg.started) {
+        this.isPointerDraggingBlock = false;
+        this.activeBlockId = null;
+        this.grabResistance01 = 0;
+        if (this.turnPhase === 'PULLING') {
+          this.turnPhase = this.preGrabTurnPhase;
+        }
+        if (this.latestTelemetry) {
+          this.latestTelemetry = {
+            ...this.latestTelemetry,
+            turnPhase: this.turnPhase,
+            activeBlockId: null,
+            grabResistance01: 0,
+          };
+        }
+      }
     }
   }
 
@@ -212,6 +328,8 @@ export class MujocoWorkerBridge {
     this.simTime = snap.simTime;
     this.towerSeed = snap.towerSeed >>> 0;
     this.initialLayers = snap.initialLayers;
+    this.solverWarningCount = snap.solverWarningCount ?? 0;
+    this.mechanicalEnergyJ = snap.mechanicalEnergyJ ?? 0;
 
     if (snap.isFullRebuild && snap.initialBlocks) {
       this.blocks = snap.initialBlocks.map((b) => ({
@@ -349,7 +467,7 @@ export class MujocoWorkerBridge {
         firstVertex: meta.firstVertex,
         vertexCount: meta.vertexCount,
         quietSubsteps: 0,
-        spawnSimTime: this.simTime,
+        spawnSimTime: meta.spawnSimTime,
       });
     }
     this.shards = nextShards;
@@ -364,25 +482,52 @@ export class MujocoWorkerBridge {
     this.splinters = snap.splinters;
     this.openTopSlots = snap.openTopSlots;
     this.topSupportFrame = snap.topSupportFrame;
-    this.latestTelemetry = snap.telemetry;
 
-    this.turnPhase = snap.turnPhase;
+    const ackSeq = snap.ackSeq ?? 0;
+    if (this.releaseLockUntilSeq > 0 && ackSeq >= this.releaseLockUntilSeq) {
+      this.releaseLockUntilSeq = 0;
+    }
+    if (this.grabLockUntilSeq > 0 && ackSeq >= this.grabLockUntilSeq) {
+      this.grabLockUntilSeq = 0;
+    }
+
     this.gameMode = snap.gameMode;
     this.playerCount = snap.playerCount;
     this.currentPlayer = snap.currentPlayer;
     this.blocksStacked = snap.blocksStacked;
     this.shatteredCount = snap.shatteredCount;
     this.collapseReason = snap.collapseReason;
-
-    this.activeBlockId = snap.activeBlockId;
     this.hoveredSlotIndex = snap.hoveredSlotIndex;
-    this.grabLocalPoint = snap.grabLocalPoint;
-    this.grabWorldAnchor = snap.grabWorldAnchor;
-    this.grabCurrentWorldOnBlock = snap.grabCurrentWorldOnBlock;
-    this.grabPlaneY = snap.grabPlaneY;
-    this.grabResistance01 = snap.grabResistance01;
-    this.isPointerDraggingBlock = snap.isPointerDraggingBlock;
     this.isExtractionLiftReady = snap.isExtractionLiftReady;
+
+    if (this.releaseLockUntilSeq > 0) {
+      // Preserve optimistic `'SETTLING'` lock across pre-release in-flight `step` snapshots
+      this.turnPhase = snap.turnPhase === 'COLLAPSED' ? 'COLLAPSED' : 'SETTLING';
+      this.activeBlockId = null;
+      this.isPointerDraggingBlock = false;
+      this.latestTelemetry = {
+        ...snap.telemetry,
+        turnPhase: this.turnPhase,
+        activeBlockId: null,
+      };
+    } else if (this.grabLockUntilSeq > 0) {
+      // Preserve optimistic `'PULLING'` state until `startGrabBlock` is acknowledged by the worker
+      this.latestTelemetry = {
+        ...snap.telemetry,
+        turnPhase: this.turnPhase,
+        activeBlockId: this.activeBlockId,
+      };
+    } else {
+      this.turnPhase = snap.turnPhase;
+      this.activeBlockId = snap.activeBlockId;
+      this.grabLocalPoint = snap.grabLocalPoint;
+      this.grabWorldAnchor = snap.grabWorldAnchor;
+      this.grabCurrentWorldOnBlock = snap.grabCurrentWorldOnBlock;
+      this.grabPlaneY = snap.grabPlaneY;
+      this.grabResistance01 = snap.grabResistance01;
+      this.isPointerDraggingBlock = snap.isPointerDraggingBlock;
+      this.latestTelemetry = snap.telemetry;
+    }
 
     this.carriedLandingPos = snap.carriedLandingPos;
     this.carriedTargetPos = snap.carriedTargetPos;
@@ -410,7 +555,8 @@ export class MujocoWorkerBridge {
             ev.slideSpeedDmPerSec,
             ev.resistance01,
             ev.slipPowerMw,
-            ev.torsionRadPerSec
+            ev.torsionRadPerSec,
+            ev.clampingLoadN
           );
           break;
         case 'tapTest':
@@ -418,7 +564,8 @@ export class MujocoWorkerBridge {
             ev.pinch01,
             ev.worldPos,
             this.listenerCamPos,
-            this.listenerCamRight
+            this.listenerCamRight,
+            ev.damage ?? 0
           );
           break;
         case 'glassImpact':
@@ -427,7 +574,8 @@ export class MujocoWorkerBridge {
             ev.pitchMul,
             ev.worldPos,
             this.listenerCamPos,
-            this.listenerCamRight
+            this.listenerCamRight,
+            ev.options
           );
           break;
         case 'glassCrack':
@@ -579,6 +727,8 @@ export class MujocoWorkerBridge {
     this.stepInFlight = true;
     this.post({
       type: 'step',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
       dt: totalDt,
       camPos: [...this.listenerCamPos],
       camRight: [...this.listenerCamRight],
@@ -594,32 +744,88 @@ export class MujocoWorkerBridge {
   }
 
   public rebuildTower(mode?: GameMode, players?: number, layers?: number, seed?: number): void {
+    const epoch = this.bumpEpoch();
+    const seq = ++this.commandSeq;
     if (mode !== undefined) this.gameMode = mode;
     if (players !== undefined) this.playerCount = Math.max(2, Math.min(4, players));
     if (layers !== undefined) this.initialLayers = layers;
+    const targetLayers = Math.max(1, Math.min(32, Math.round(this.initialLayers)));
+    this.initialLayers = targetLayers;
     this.towerSeed = seed !== undefined ? seed >>> 0 : 0;
+
+    // Synchronous nominal reset: `blocks`, `shards`, `topSupportFrame`, `openTopSlots`,
+    // `getTelemetry()`, and `exportCompactSnapshot()` are 100% consistent on tick 0!
     this.simTime = 0;
+    this.blocks = buildNominalGlassBlocks(targetLayers, this.towerSeed);
+    this.shards = [];
+    this.splinters = [];
+    const nominalTop = buildNominalTopSupportFrameAndSlots(targetLayers);
+    this.topSupportFrame = nominalTop.topSupportFrame;
+    this.openTopSlots = nominalTop.openTopSlots;
+    this.blockPhotoelasticStress01 = new Float32Array(this.blocks.length);
+    this.blockPhotoelasticWrench = new Float32Array(this.blocks.length * 4);
+
     this.turnPhase = 'SELECT_BLOCK';
+    this.preGrabTurnPhase = 'SELECT_BLOCK';
     this.currentPlayer = 0;
     this.blocksStacked = 0;
     this.shatteredCount = 0;
     this.collapseReason = null;
     this.activeBlockId = null;
     this.hoveredBlockId = null;
+    this.hoveredSlotIndex = null;
+    this.grabLocalPoint = [0, 0, 0];
+    this.grabWorldAnchor = [0, 0, 0];
+    this.grabCurrentWorldOnBlock = [0, 0, 0];
+    this.grabPlaneY = 0;
+    this.grabResistance01 = 0;
     this.isPointerDraggingBlock = false;
+    this.isExtractionLiftReady = false;
+
+    this.carriedLandingPos = [...nominalTop.topSupportFrame.layerCenter];
+    this.carriedTargetPos = [0, targetLayers * BLOCK_HEIGHT + 0.5, 0];
+    this.carriedTargetQuat = [...nominalTop.topSupportFrame.defaultRotation];
+    this.carriedYawOffsetRad = 0;
+
+    this.leanAngleDeg = 0;
+    this.wobbleSpeedDegPerSec = 0;
+    this.centerOfMassXZCm = [0, 0];
+    this.currentLayers = targetLayers;
+    this.peakLayers = targetLayers;
+    this.liveHeightCm = +(targetLayers * BLOCK_HEIGHT * 10).toFixed(1);
+    this.peakHeightCm = this.liveHeightCm;
+    this.lockedMinRow = this.gameMode === 'sandbox' ? null : targetLayers;
+    this.latestTelemetry = null;
+    this.solverWarningCount = 0;
+    this.mechanicalEnergyJ = this.blocks.reduce(
+      (sum, b) => sum + TARGET_BLOCK_MASS_KG * 9.81 * (Math.max(-0.35, b.position[1] * 0.1) + 0.35),
+      0
+    );
+
+    this.shardMetaById.clear();
+    this.pendingShardUploads.length = 0;
     this.pendingShardImpacts.length = 0;
     this.pendingWobbleEvents.length = 0;
     this.stepResultShardQueue.length = 0;
     this.stepResultWobbleQueue.length = 0;
     this.exportedShardIds.clear();
     this.slotRenderVertices.fill(null);
+    this.shardBufferResetPending = true;
     this.lastStepResult = {
       substeps: 0,
       simTime: 0,
       shardImpacts: [],
       wobbleEvents: [],
     };
-    this.post({ type: 'rebuildTower', mode, players, layers, seed });
+    this.post({
+      type: 'rebuildTower',
+      epoch,
+      seq,
+      mode: this.gameMode,
+      players: this.playerCount,
+      layers: targetLayers,
+      seed: this.towerSeed,
+    });
   }
 
   public resetTower(layers?: number, seed?: number): void {
@@ -764,11 +970,14 @@ export class MujocoWorkerBridge {
   }
 
   public applyCompactSnapshot(snap: PhysicsNetworkSnapshot): void {
+    const epoch = this.bumpEpoch();
+    const seq = ++this.commandSeq;
     this.simTime = snap.simTime;
     this.towerSeed = snap.towerSeed >>> 0;
     this.initialLayers = snap.initialLayers;
     this.gameMode = snap.gameMode;
     this.turnPhase = snap.turnPhase;
+    this.preGrabTurnPhase = snap.turnPhase;
     this.currentPlayer = snap.currentPlayer;
     this.playerCount = snap.playerCount;
     this.blocksStacked = snap.blocksStacked;
@@ -785,6 +994,16 @@ export class MujocoWorkerBridge {
     this.carriedTargetQuat = [...snap.carriedTargetQuat];
     this.carriedLandingPos = [...snap.carriedLandingPos];
     this.carriedYawOffsetRad = snap.carriedYawOffsetRad;
+    this.latestTelemetry = null;
+    this.shardMetaById.clear();
+    this.slotRenderVertices.fill(null);
+    this.exportedShardIds.clear();
+    this.pendingShardUploads.length = 0;
+    this.pendingShardImpacts.length = 0;
+    this.pendingWobbleEvents.length = 0;
+    this.stepResultShardQueue.length = 0;
+    this.stepResultWobbleQueue.length = 0;
+    this.shardBufferResetPending = true;
 
     while (this.blocks.length < snap.blockCount) {
       const id = this.blocks.length;
@@ -862,6 +1081,7 @@ export class MujocoWorkerBridge {
       );
     }
 
+    const defaultSpawnTime = Math.max(0, this.simTime - 0.05);
     if (snap.shardMetas) {
       for (const meta of snap.shardMetas) {
         const firstVertex = meta.slotIndex * SHARD_SLOT_STRIDE_VERTS;
@@ -873,6 +1093,7 @@ export class MujocoWorkerBridge {
           rippleSeed: meta.rippleSeed,
           volume: meta.volume,
           massKg: meta.massKg,
+          spawnSimTime: defaultSpawnTime,
           firstVertex,
           vertexCount: meta.vertexCount,
           planeCount: meta.planeCount,
@@ -926,24 +1147,17 @@ export class MujocoWorkerBridge {
         firstVertex: slotIndex * SHARD_SLOT_STRIDE_VERTS,
         vertexCount: meta?.vertexCount ?? 0,
         quietSubsteps: 0,
-        spawnSimTime: this.simTime - 0.05,
+        spawnSimTime: meta?.spawnSimTime ?? defaultSpawnTime,
       });
     }
     this.shards = nextShards;
-    if (this.shardMetaById.size > 1024) {
-      const liveIds = new Set<number>();
-      for (let i = 0; i < nextShards.length; i++) liveIds.add(nextShards[i].id);
-      for (const id of this.shardMetaById.keys()) {
-        if (!liveIds.has(id)) this.shardMetaById.delete(id);
-      }
-    }
     this.lastStepResult = {
       substeps: 0,
       simTime: this.simTime,
       shardImpacts: [],
       wobbleEvents: [],
     };
-    this.post({ type: 'applyCompactSnapshot', snapshot: snap });
+    this.post({ type: 'applyCompactSnapshot', epoch, seq, snapshot: snap });
   }
 
   public tapNudgeBlock(blockId: number, localNormal: Vec3, localPoint: Vec3): boolean {
@@ -954,9 +1168,25 @@ export class MujocoWorkerBridge {
     }
     this.post({
       type: 'tapNudgeBlock',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
       blockId,
       localNormal: [...localNormal],
       localPoint: [...localPoint],
+    });
+    return true;
+  }
+
+  public nudgeShard(shardId: number, worldPoint: Vec3, impulse: Vec3): boolean {
+    const found = this.shards.some((s) => s.id === shardId);
+    if (!found) return false;
+    this.post({
+      type: 'nudgeShard',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+      shardId,
+      worldPoint: [...worldPoint],
+      impulse: [...impulse],
     });
     return true;
   }
@@ -967,6 +1197,7 @@ export class MujocoWorkerBridge {
     if (this.gameMode !== 'sandbox' && (!blk.isLegalTarget || this.turnPhase !== 'SELECT_BLOCK')) {
       return false;
     }
+    this.preGrabTurnPhase = this.turnPhase;
     // Optimistically mirror grab state for immediate spring-filament feedback on current frame
     this.activeBlockId = blockId;
     this.isPointerDraggingBlock = true;
@@ -974,12 +1205,23 @@ export class MujocoWorkerBridge {
     this.grabWorldAnchor = [...worldPoint];
     this.grabCurrentWorldOnBlock = [...worldPoint];
     this.grabPlaneY = worldPoint[1];
-    if (this.gameMode !== 'sandbox') {
+    if (!blk.extracted && this.turnPhase === 'SELECT_BLOCK') {
       this.turnPhase = 'PULLING';
     }
+    if (this.latestTelemetry) {
+      this.latestTelemetry = {
+        ...this.latestTelemetry,
+        turnPhase: this.turnPhase,
+        activeBlockId: blockId,
+      };
+    }
     const reqId = this.nextReqId++;
+    const seq = ++this.commandSeq;
+    this.grabLockUntilSeq = seq;
     this.post({
       type: 'startGrabBlock',
+      epoch: this.epoch,
+      seq,
       reqId,
       blockId,
       localPoint: [...localPoint],
@@ -990,12 +1232,19 @@ export class MujocoWorkerBridge {
 
   public updateGrabTarget(worldTargetOnPlane: Vec3): void {
     this.grabWorldAnchor = [...worldTargetOnPlane];
-    this.post({ type: 'updateGrabTarget', worldTargetOnPlane: [...worldTargetOnPlane] });
+    this.post({
+      type: 'updateGrabTarget',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+      worldTargetOnPlane: [...worldTargetOnPlane],
+    });
   }
 
   public updateCarriedHover(rayOrigin: Vec3, rayDir: Vec3): void {
     this.post({
       type: 'updateCarriedHover',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
       rayOrigin: [...rayOrigin],
       rayDir: [...rayDir],
     });
@@ -1003,28 +1252,78 @@ export class MujocoWorkerBridge {
 
   public rotateCarriedBlock(deltaYawRad: number): void {
     this.carriedYawOffsetRad += deltaYawRad;
-    this.post({ type: 'rotateCarriedBlock', deltaYawRad });
+    this.post({
+      type: 'rotateCarriedBlock',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+      deltaYawRad,
+    });
   }
 
   public resetCarriedBlockRotation(): void {
     this.carriedYawOffsetRad = 0;
-    this.post({ type: 'resetCarriedBlockRotation' });
+    this.post({
+      type: 'resetCarriedBlockRotation',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+    });
   }
 
   public endGrab(dropIfPoisedOverTower: boolean = false): void {
     this.isPointerDraggingBlock = false;
-    this.post({ type: 'endGrab', dropIfPoisedOverTower });
+    this.grabResistance01 = 0;
+    this.grabLockUntilSeq = 0;
+    if (this.turnPhase !== 'EXTRACTED') {
+      this.activeBlockId = null;
+      if (this.turnPhase === 'PULLING') {
+        this.turnPhase = 'SELECT_BLOCK';
+      }
+      if (this.latestTelemetry) {
+        this.latestTelemetry = {
+          ...this.latestTelemetry,
+          turnPhase: this.turnPhase,
+          activeBlockId: null,
+          grabResistance01: 0,
+        };
+      }
+    }
+    this.post({
+      type: 'endGrab',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+      dropIfPoisedOverTower,
+    });
   }
 
   public releaseExtractedBlockOntoTop(): boolean {
-    if (this.turnPhase !== 'EXTRACTED') return false;
+    if (this.turnPhase !== 'EXTRACTED' || this.activeBlockId === null) return false;
+    // Optimistically lock `'SETTLING'` immediately so back-to-back calls cannot double-release
+    this.turnPhase = 'SETTLING';
     this.isPointerDraggingBlock = false;
-    this.post({ type: 'releaseExtractedBlockOntoTop' });
+    this.activeBlockId = null;
+    if (this.latestTelemetry) {
+      this.latestTelemetry = {
+        ...this.latestTelemetry,
+        turnPhase: 'SETTLING',
+        activeBlockId: null,
+      };
+    }
+    const seq = ++this.commandSeq;
+    this.releaseLockUntilSeq = seq;
+    this.post({
+      type: 'releaseExtractedBlockOntoTop',
+      epoch: this.epoch,
+      seq,
+    });
     return true;
   }
 
   public triggerSandboxCollapseImpulse(): void {
-    this.post({ type: 'triggerSandboxCollapseImpulse' });
+    this.post({
+      type: 'triggerSandboxCollapseImpulse',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+    });
   }
 
   public evaluateCounterfactualBlockCriticalityAsync(
@@ -1034,16 +1333,299 @@ export class MujocoWorkerBridge {
   ): Promise<BlockCriticalityCandidate[]> {
     if (this.disposed) return Promise.resolve([]);
     const reqId = this.nextReqId++;
+    const epoch = this.epoch;
     return new Promise<BlockCriticalityCandidate[]>((resolve) => {
       this.oracleCallbacks.set(reqId, resolve);
       this.post({
         type: 'evaluateOracle',
+        epoch,
+        seq: ++this.commandSeq,
         reqId,
         maxCandidates,
         rolloutSteps,
         candidateBlockIds,
       });
     });
+  }
+
+  public evaluateAdversarialTopPlacementAsync(
+    blockId: number,
+    rolloutSteps: number = 4,
+    assumeAlreadyExtracted: boolean = true
+  ): Promise<AdversarialPlacementPlan[]> {
+    if (this.disposed) return Promise.resolve([]);
+    const reqId = this.nextReqId++;
+    const epoch = this.epoch;
+    return new Promise<AdversarialPlacementPlan[]>((resolve) => {
+      this.placementCallbacks.set(reqId, resolve);
+      this.post({
+        type: 'evaluateAdversarialPlacement',
+        epoch,
+        seq: ++this.commandSeq,
+        reqId,
+        blockId,
+        rolloutSteps,
+        assumeAlreadyExtracted,
+      });
+    });
+  }
+
+  /**
+   * Executes native WASM `mj_ray` inside the MuJoCo 4.0 worker thread, fenced by `epoch`.
+   */
+  public raycastSceneAsync(
+    rayOriginDm: Vec3,
+    rayDir: Vec3,
+    options?: SceneRaycastOptions
+  ): Promise<SceneRaycastHit | null> {
+    if (this.disposed) return Promise.resolve(null);
+    const reqId = this.nextReqId++;
+    const epoch = this.epoch;
+    return new Promise<SceneRaycastHit | null>((resolve) => {
+      this.raycastCallbacks.set(reqId, resolve);
+      this.post({
+        type: 'raycastScene',
+        epoch,
+        seq: ++this.commandSeq,
+        reqId,
+        rayOriginDm: [...rayOriginDm],
+        rayDir: [...rayDir],
+        options,
+      });
+    });
+  }
+
+  /**
+   * Zero-stall (`~0.01 ms`) synchronous raycast on the main-thread mirror across active blocks,
+   * 12-plane convex Voronoi shards, and the oak tabletop.
+   */
+  public raycastScene(
+    rayOriginDm: Vec3,
+    rayDir: Vec3,
+    options?: SceneRaycastOptions
+  ): SceneRaycastHit | null {
+    const dirLen = Math.hypot(rayDir[0], rayDir[1], rayDir[2]);
+    if (dirLen < 1e-9) return null;
+    const dx = rayDir[0] / dirLen;
+    const dy = rayDir[1] / dirLen;
+    const dz = rayDir[2] / dirLen;
+
+    const includeBlocks = options?.includeBlocks ?? true;
+    const includeShards = options?.includeShards ?? true;
+    const includeTable = options?.includeTable ?? true;
+    const maxDistDm = options?.maxDistanceDm ?? 200.0;
+
+    let bestT = maxDistDm;
+    let bestHit: SceneRaycastHit | null = null;
+
+    if (includeBlocks) {
+      const hx = BLOCK_HALF_X - 0.0008;
+      const hz = BLOCK_HALF_Z - 0.0014;
+      for (let i = 0; i < this.blocks.length; i++) {
+        const b = this.blocks[i];
+        if (b.shattered) continue;
+        if (b.extracted && this.activeBlockId !== b.id) continue;
+        const hy =
+          b.isLooseSlot && b.assignedLayer < this.initialLayers - 1
+            ? BLOCK_HALF_Y - 0.0018
+            : BLOCK_HALF_Y;
+
+        const rel: Vec3 = [
+          rayOriginDm[0] - b.position[0],
+          rayOriginDm[1] - b.position[1],
+          rayOriginDm[2] - b.position[2],
+        ];
+        const lOrig = quatInverseRotateVec3(b.rotation, rel);
+        const lDir = quatInverseRotateVec3(b.rotation, [dx, dy, dz]);
+
+        let tMin = 0.0;
+        let tMax = bestT;
+        let hitLocalN: Vec3 = [0, 1, 0];
+        let inside = true;
+        const halfs: [number, number, number] = [hx, hy, hz];
+        for (let a = 0; a < 3; a++) {
+          const o = lOrig[a];
+          const d = lDir[a];
+          const h = halfs[a];
+          if (Math.abs(d) > 1e-9) {
+            let t1 = (-h - o) / d;
+            let t2 = (h - o) / d;
+            let sgn = -1;
+            if (t1 > t2) {
+              const tmp = t1;
+              t1 = t2;
+              t2 = tmp;
+              sgn = 1;
+            }
+            if (t1 > tMin) {
+              tMin = t1;
+              hitLocalN = a === 0 ? [sgn, 0, 0] : a === 1 ? [0, sgn, 0] : [0, 0, sgn];
+            }
+            if (t2 < tMax) tMax = t2;
+            if (tMin > tMax) {
+              inside = false;
+              break;
+            }
+          } else if (Math.abs(o) > h) {
+            inside = false;
+            break;
+          }
+        }
+        if (inside && tMin >= 0 && tMin < bestT) {
+          bestT = tMin;
+          const worldPt: Vec3 = [
+            rayOriginDm[0] + dx * tMin,
+            rayOriginDm[1] + dy * tMin,
+            rayOriginDm[2] + dz * tMin,
+          ];
+          const localPt: Vec3 = [
+            lOrig[0] + lDir[0] * tMin,
+            lOrig[1] + lDir[1] * tMin,
+            lOrig[2] + lDir[2] * tMin,
+          ];
+          const worldN = quatRotateVec3(b.rotation, hitLocalN);
+          bestHit = {
+            kind: 'block',
+            distanceDm: tMin,
+            worldPointDm: worldPt,
+            localPointDm: localPt,
+            normal: worldN,
+            geomId: b.colliderHandle,
+            bodyId: b.bodyHandle,
+            blockId: b.id,
+          };
+        }
+      }
+    }
+
+    if (includeShards) {
+      for (let i = 0; i < this.shards.length; i++) {
+        const s = this.shards[i];
+        if (s.planeCount <= 0) continue;
+        const rel: Vec3 = [
+          rayOriginDm[0] - s.position[0],
+          rayOriginDm[1] - s.position[1],
+          rayOriginDm[2] - s.position[2],
+        ];
+        const lOrig = quatInverseRotateVec3(s.rotation, rel);
+        const lDir = quatInverseRotateVec3(s.rotation, [dx, dy, dz]);
+
+        let tEnter = 0.0;
+        let tExit = bestT;
+        let enterN: Vec3 = [0, 1, 0];
+        let valid = true;
+        const planes = s.planes;
+        const pCount = Math.min(s.planeCount, Math.floor(planes.length / 4));
+        for (let p = 0; p < pCount; p++) {
+          const nx = planes[p * 4 + 0];
+          const ny = planes[p * 4 + 1];
+          const nz = planes[p * 4 + 2];
+          const pw = planes[p * 4 + 3];
+          const num = pw - (nx * lOrig[0] + ny * lOrig[1] + nz * lOrig[2]);
+          const den = nx * lDir[0] + ny * lDir[1] + nz * lDir[2];
+          if (Math.abs(den) < 1e-9) {
+            if (num < 0) {
+              valid = false;
+              break;
+            }
+          } else {
+            const t = num / den;
+            if (den > 0) {
+              if (t < tExit) tExit = t;
+            } else if (t > tEnter) {
+              tEnter = t;
+              enterN = [nx, ny, nz];
+            }
+            if (tEnter > tExit) {
+              valid = false;
+              break;
+            }
+          }
+        }
+        if (valid && tEnter >= 0 && tEnter < bestT) {
+          bestT = tEnter;
+          const worldPt: Vec3 = [
+            rayOriginDm[0] + dx * tEnter,
+            rayOriginDm[1] + dy * tEnter,
+            rayOriginDm[2] + dz * tEnter,
+          ];
+          const localPt: Vec3 = [
+            lOrig[0] + lDir[0] * tEnter,
+            lOrig[1] + lDir[1] * tEnter,
+            lOrig[2] + lDir[2] * tEnter,
+          ];
+          const worldN = quatRotateVec3(s.rotation, enterN);
+          bestHit = {
+            kind: 'shard',
+            distanceDm: tEnter,
+            worldPointDm: worldPt,
+            localPointDm: localPt,
+            normal: worldN,
+            geomId: s.colliderHandle,
+            bodyId: s.bodyHandle,
+            shardId: s.id,
+          };
+        }
+      }
+    }
+
+    if (includeTable) {
+      const halfSpanDm = TABLE_RADIUS + 0.5;
+      const halfThickDm = TABLE_THICKNESS * 0.5;
+      const lOrig: Vec3 = [rayOriginDm[0], rayOriginDm[1] + halfThickDm, rayOriginDm[2]];
+      const halfs: [number, number, number] = [halfSpanDm, halfThickDm, halfSpanDm];
+      const lDir: [number, number, number] = [dx, dy, dz];
+      let tMin = 0.0;
+      let tMax = bestT;
+      let hitN: Vec3 = [0, 1, 0];
+      let inside = true;
+      for (let a = 0; a < 3; a++) {
+        const o = lOrig[a];
+        const d = lDir[a];
+        const h = halfs[a];
+        if (Math.abs(d) > 1e-9) {
+          let t1 = (-h - o) / d;
+          let t2 = (h - o) / d;
+          let sgn = -1;
+          if (t1 > t2) {
+            const tmp = t1;
+            t1 = t2;
+            t2 = tmp;
+            sgn = 1;
+          }
+          if (t1 > tMin) {
+            tMin = t1;
+            hitN = a === 0 ? [sgn, 0, 0] : a === 1 ? [0, sgn, 0] : [0, 0, sgn];
+          }
+          if (t2 < tMax) tMax = t2;
+          if (tMin > tMax) {
+            inside = false;
+            break;
+          }
+        } else if (Math.abs(o) > h) {
+          inside = false;
+          break;
+        }
+      }
+      if (inside && tMin >= 0 && tMin < bestT) {
+        const worldPt: Vec3 = [
+          rayOriginDm[0] + dx * tMin,
+          rayOriginDm[1] + dy * tMin,
+          rayOriginDm[2] + dz * tMin,
+        ];
+        bestHit = {
+          kind: 'table',
+          distanceDm: tMin,
+          worldPointDm: worldPt,
+          localPointDm: [worldPt[0], worldPt[1] + halfThickDm, worldPt[2]],
+          normal: hitN,
+          geomId: 0,
+          bodyId: 0,
+        };
+      }
+    }
+
+    return bestHit;
   }
 
   public getTelemetry(): TowerTelemetry {
@@ -1053,6 +1635,18 @@ export class MujocoWorkerBridge {
         hoveredBlockId: this.hoveredBlockId,
         physicsWorkerActive: true,
       };
+    }
+    let intactCount = 0;
+    let crazedCount = 0;
+    let shatteredCount = 0;
+    for (let i = 0; i < this.blocks.length; i++) {
+      const b = this.blocks[i];
+      if (b.shattered) {
+        shatteredCount++;
+      } else {
+        intactCount++;
+        if (b.damage > 0.02) crazedCount++;
+      }
     }
     return {
       turnPhase: this.turnPhase,
@@ -1067,9 +1661,9 @@ export class MujocoWorkerBridge {
       leanAngleDeg: +this.leanAngleDeg.toFixed(2),
       wobbleSpeedDegPerSec: +this.wobbleSpeedDegPerSec.toFixed(1),
       centerOfMassXZ: [...this.centerOfMassXZCm],
-      shatteredCount: this.shatteredCount,
-      crazedCount: 0,
-      intactCount: this.blocks.length,
+      shatteredCount,
+      crazedCount,
+      intactCount,
       activeShardCount: this.shards.length,
       grabResistance01: +this.grabResistance01.toFixed(2),
       hoveredBlockId: this.hoveredBlockId,
@@ -1077,7 +1671,7 @@ export class MujocoWorkerBridge {
       hoveredSlotIndex: this.hoveredSlotIndex,
       carriedYawDeg: Math.round((this.carriedYawOffsetRad * 180) / Math.PI),
       lockedMinRow: this.lockedMinRow,
-      settleProgress01: 0,
+      settleProgress01: 1,
       collapseReason: this.collapseReason,
       physicsWorkerActive: true,
     };
@@ -1086,13 +1680,10 @@ export class MujocoWorkerBridge {
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const cb of this.oracleCallbacks.values()) {
-      cb([]);
-    }
-    this.oracleCallbacks.clear();
+    this.bumpEpoch();
     try {
       this.worker.postMessage({ type: 'dispose' } satisfies WorkerInboundMessage);
-      this.worker.terminate();
+      this.worker.terminate?.();
     } catch {
       // Ignore already-terminated worker
     }

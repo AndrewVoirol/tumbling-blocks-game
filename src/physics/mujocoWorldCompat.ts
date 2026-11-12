@@ -9,6 +9,11 @@ import {
 import {
   MJ_CONAFFINITY_BLOCK_ON_TABLE,
   MJ_CONTYPE_BLOCK,
+  MJ_CONTYPE_CULLET_SHARD,
+  MJ_CONTYPE_HERO_SHARD,
+  MJ_GEOM_GROUP_BLOCK,
+  MJ_GEOM_GROUP_PARKED,
+  MJ_GEOM_GROUP_SHARD,
   MujocoTowerIndexMap,
 } from './mujocoTowerBuilder';
 
@@ -400,6 +405,14 @@ export function setBodyGeomCollisionMask(
 ): void {
   model.geom_contype[geomId] = contype;
   model.geom_conaffinity[geomId] = conaffinity;
+  // Keep `geom_group` synchronized so native WASM `mj_ray` skips parked shelf geoms (`contype === 0`) in O(1)
+  if (contype === 0) {
+    model.geom_group[geomId] = MJ_GEOM_GROUP_PARKED;
+  } else if ((contype & (MJ_CONTYPE_HERO_SHARD | MJ_CONTYPE_CULLET_SHARD)) !== 0) {
+    model.geom_group[geomId] = MJ_GEOM_GROUP_SHARD;
+  } else {
+    model.geom_group[geomId] = MJ_GEOM_GROUP_BLOCK;
+  }
   // Critical MuJoCo broadphase invariant: mj_collideTree filters dynamic body pairs by body_contype & body_conaffinity!
   if (bodyId > 0) {
     model.body_contype[bodyId] = contype;
@@ -414,7 +427,8 @@ export function updateFreeBodyMassAndInertiaO1(
   massKg: number,
   ixSi: number,
   iySi: number,
-  izSi: number
+  izSi: number,
+  rotDampingRateSecInv: number = 0
 ): void {
   const safeM = Math.max(1e-5, massKg);
   const safeIx = Math.max(1e-10, ixSi);
@@ -439,13 +453,29 @@ export function updateFreeBodyMassAndInertiaO1(
   // Critical for `body_simple == 1` free joints in MuJoCo 4.0: `mj_crb` / `mj_factorM` populates `qM`
   // directly from `model.dof_M0[dofAdr + 0..5]`, while `mj_rne` gyroscopic `ω × (I ω)` reads `body_inertia`.
   // Keeping both synchronized with `r_gyr >= 5 mm` (`2.5e-5 * m`) preserves exact 1.000g free-fall and
-  // prevents explicit-Euler gyroscopic divergence on 0.2 g splinters at 360 Hz!
+  // prevents gyroscopic divergence on 0.2 g splinters!
   model.dof_M0[dofAdr + 0] = safeM;
   model.dof_M0[dofAdr + 1] = safeM;
   model.dof_M0[dofAdr + 2] = safeM;
   model.dof_M0[dofAdr + 3] = effIx;
   model.dof_M0[dofAdr + 4] = effIy;
   model.dof_M0[dofAdr + 5] = effIz;
+
+  // Under MuJoCo 4.0 `integrator="implicitfast"` (`mjINT_IMPLICITFAST === 3`), `M + dt * D` is unconditionally
+  // L-stable for any `D >= 0`. Keep linear `dof_damping[0..2] === 0` so 1.000g ballistic free-fall is untouched,
+  // while applying passive proportional angular damping (`b_rot = rate * I_eff`) on Voronoi shards!
+  model.dof_damping[dofAdr + 0] = 0;
+  model.dof_damping[dofAdr + 1] = 0;
+  model.dof_damping[dofAdr + 2] = 0;
+  if (rotDampingRateSecInv > 0 && model.opt.integrator === 3) {
+    model.dof_damping[dofAdr + 3] = rotDampingRateSecInv * effIx;
+    model.dof_damping[dofAdr + 4] = rotDampingRateSecInv * effIy;
+    model.dof_damping[dofAdr + 5] = rotDampingRateSecInv * effIz;
+  } else {
+    model.dof_damping[dofAdr + 3] = 0;
+    model.dof_damping[dofAdr + 4] = 0;
+    model.dof_damping[dofAdr + 5] = 0;
+  }
 
   const invM = 1.0 / safeM;
   const invIx = 1.0 / effIx;
@@ -621,6 +651,69 @@ export class MujocoRigidBodyCompat {
     qvel[dof + 4] = wLocalSi[1];
     qvel[dof + 5] = wLocalSi[2];
     if (wake && (wSimWorld.x !== 0 || wSimWorld.y !== 0 || wSimWorld.z !== 0)) {
+      this.world.wakeBody(this.info.bodyId);
+    }
+  }
+
+  /**
+   * Applies a Vitrail Froude-scaled impulse (`kg * dm / s_sim`) at `worldPointDm` (`dm`),
+   * updating linear `qvel[0..2]` and principal-frame angular `qvel[3..5]` with `|ω| <= 55 rad/s` Euler guard.
+   */
+  public applyImpulseAtPoint(impulseSim: Vec3Obj, worldPointDm: Vec3Obj, wake: boolean = true): void {
+    const dof = this.info.dofAdr;
+    const adr = this.info.qposAdr;
+    const qpos = this.data.qpos;
+    const qvel = this.data.qvel;
+    const dofM0 = this.model.dof_M0;
+
+    const jxSi = impulseSim.x * INV_FROUDE_VEL_SCALE;
+    const jySi = impulseSim.y * INV_FROUDE_VEL_SCALE;
+    const jzSi = impulseSim.z * INV_FROUDE_VEL_SCALE;
+    if (jxSi === 0 && jySi === 0 && jzSi === 0) return;
+
+    const invM = 1.0 / Math.max(1e-5, dofM0[dof + 0] || this.model.body_mass[this.info.bodyId]);
+    qvel[dof + 0] += jxSi * invM;
+    qvel[dof + 1] += jySi * invM;
+    qvel[dof + 2] += jzSi * invM;
+
+    const rxM = worldPointDm.x * M_PER_DM - qpos[adr + 0];
+    const ryM = worldPointDm.y * M_PER_DM - qpos[adr + 1];
+    const rzM = worldPointDm.z * M_PER_DM - qpos[adr + 2];
+    const dLxWorld = ryM * jzSi - rzM * jySi;
+    const dLyWorld = rzM * jxSi - rxM * jzSi;
+    const dLzWorld = rxM * jySi - ryM * jxSi;
+
+    const qBody: [number, number, number, number] = [
+      qpos[adr + 4],
+      qpos[adr + 5],
+      qpos[adr + 6],
+      qpos[adr + 3],
+    ];
+    const dLBody = quatInverseRotateVec3(qBody, [dLxWorld, dLyWorld, dLzWorld]);
+    const bid4 = this.info.bodyId * 4;
+    const qInert: [number, number, number, number] = [
+      this.model.body_iquat[bid4 + 1],
+      this.model.body_iquat[bid4 + 2],
+      this.model.body_iquat[bid4 + 3],
+      this.model.body_iquat[bid4 + 0],
+    ];
+    const dLPrin = quatInverseRotateVec3(qInert, dLBody);
+
+    let wx = qvel[dof + 3] + dLPrin[0] / Math.max(1e-8, dofM0[dof + 3]);
+    let wy = qvel[dof + 4] + dLPrin[1] / Math.max(1e-8, dofM0[dof + 4]);
+    let wz = qvel[dof + 5] + dLPrin[2] / Math.max(1e-8, dofM0[dof + 5]);
+    const wNorm = Math.hypot(wx, wy, wz);
+    if (wNorm > 55.0) {
+      const cap = 55.0 / wNorm;
+      wx *= cap;
+      wy *= cap;
+      wz *= cap;
+    }
+    qvel[dof + 3] = wx;
+    qvel[dof + 4] = wy;
+    qvel[dof + 5] = wz;
+
+    if (wake) {
       this.world.wakeBody(this.info.bodyId);
     }
   }
