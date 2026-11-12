@@ -24,6 +24,7 @@ interface MinimalChildProcessModule {
 }
 
 interface MinimalFsModule {
+  existsSync(filePath: string): boolean;
   readFileSync(filePath: string, encoding: 'utf8'): string;
   mkdtempSync(prefix: string): string;
   rmSync(target: string, opts: { recursive: boolean; force: boolean }): void;
@@ -935,8 +936,25 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
       const vitePort = typeof addr === 'object' && addr ? addr.port : 0;
       expect(vitePort).toBeGreaterThan(0);
 
-      chromeProc = cpMod.spawn(
+      const envChrome = (
+        globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }
+      ).process?.env?.CHROME_PATH;
+      const chromeCandidates = [
+        ...(envChrome ? [envChrome] : []),
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
         '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+      ];
+      const chromeBin =
+        chromeCandidates.find((candidate) => fsMod.existsSync(candidate)) ??
+        '/usr/bin/google-chrome';
+
+      chromeProc = cpMod.spawn(
+        chromeBin,
         [
           '--headless=new',
           '--no-sandbox',

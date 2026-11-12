@@ -524,6 +524,7 @@ export class MujocoPhysicsEngine {
       this.model.opt.timestep = this.cfg.timestepSec;
       this.model.opt.iterations = this.cfg.solverIterations;
       this.model.opt.ls_iterations = this.cfg.lsIterations;
+      this.model.opt.disableflags &= ~this.mj.mjtDisableBit.mjDSBL_MULTICCD.value;
       this.model.body_contype.set(snap.body_contype);
       this.model.body_conaffinity.set(snap.body_conaffinity);
       this.model.body_mass.set(snap.body_mass);
@@ -2375,8 +2376,7 @@ export class MujocoPhysicsEngine {
     if (!m || !d) return;
 
     let didAnyFractureSyncNeeded = false;
-    const useFrameShatterCap = this.sandboxCollapseActive || this.shards.length >= 160;
-    const maxShattersPerFrame = useFrameShatterCap ? 2 : 5;
+    const maxShattersPerFrame = this.shards.length >= 160 ? 2 : 5;
     if (this.deferredFractures.length > 0 && this.frameShatterCount < maxShattersPerFrame) {
       while (
         this.deferredFractures.length > 0 &&
@@ -2956,8 +2956,8 @@ export class MujocoPhysicsEngine {
       const cascadeGraceWeight =
         inSameSlapWindow
           ? 0.0
-          : (this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) && dtSinceCraze < 2.5
-            ? 0.12
+          : (this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) && dtSinceCraze < 4.0
+            ? 0.08
             : dtSinceCraze < 0.65
               ? 0.30
               : 1.0;
@@ -3022,7 +3022,11 @@ export class MujocoPhysicsEngine {
       ];
 
       const effCrazeSpeed = CRAZE_IMPACT_SPEED * 0.72 * (1.0 - 0.12 * clampedPriorDamage);
-      const freshShatterSpeed = isAnvilCrush ? SHATTER_IMPACT_SPEED : 14.3;
+      const freshShatterSpeed = isAnvilCrush
+        ? SHATTER_IMPACT_SPEED
+        : this.turnPhase === 'COLLAPSED'
+          ? 15.8
+          : 14.3;
       const shatterThreshold = freshShatterSpeed * griffithWeakening;
 
       const inRockingSequence =
@@ -3193,8 +3197,20 @@ export class MujocoPhysicsEngine {
       }
     }
 
+    let anySleepingIntactBlock = false;
+    for (let i = 0; i < this.blocks.length; i++) {
+      const ob = this.blocks[i];
+      if (!ob.shattered && !ob.extracted) {
+        const oTree = bodyTreeId[ob.bodyHandle];
+        if (oTree >= 0 && treeAsleep[oTree] >= 0) {
+          anySleepingIntactBlock = true;
+          break;
+        }
+      }
+    }
+
     const ncon = d.ncon;
-    if (ncon > 0) {
+    if (anySleepingIntactBlock && ncon > 0) {
       const contacts = d.contact;
       const geomBody = m.geom_bodyid;
       const qpos = d.qpos;
@@ -4163,20 +4179,40 @@ export class MujocoPhysicsEngine {
       this.shards.length > 32 ||
       this.shatteredCount >= 1;
     const isCollapseCascade =
-      ((this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) &&
-        hasCascadeCollapseMotion) ||
+      this.sandboxCollapseActive ||
+      (this.turnPhase === 'COLLAPSED' && hasCascadeCollapseMotion) ||
       this.shards.length > 48 ||
       (this.shatteredCount >= 2 && this.shards.length >= 32);
+    const isSandboxHeavyCascade = this.sandboxCollapseActive && this.shards.length >= 325;
     const isActivelyToppling =
       isCollapseCascade ||
       (this.gameMode !== 'sandbox' && this.solverLeanAngleDeg >= 6.5);
     const subDt = isCollapseCascade ? 1.0 / 360.0 : this.cfg.timestepSec;
     this.model.opt.timestep = subDt;
-    this.model.opt.iterations = isActivelyToppling ? 8 : this.cfg.solverIterations;
-    this.model.opt.ls_iterations = isActivelyToppling ? 4 : this.cfg.lsIterations;
+    const disableMulticcdBit = this.mj.mjtDisableBit.mjDSBL_MULTICCD.value;
+    if (isSandboxHeavyCascade && this.data.ntree_awake > 24) {
+      this.model.opt.disableflags |= disableMulticcdBit;
+    } else {
+      this.model.opt.disableflags &= ~disableMulticcdBit;
+    }
+    this.model.opt.iterations = isSandboxHeavyCascade
+      ? 4
+      : isActivelyToppling
+        ? 8
+        : this.cfg.solverIterations;
+    this.model.opt.ls_iterations = isSandboxHeavyCascade
+      ? 2
+      : this.sandboxCollapseActive
+        ? 3
+        : isActivelyToppling
+          ? 4
+          : this.cfg.lsIterations;
 
     const maxSubsteps = isCollapseCascade ? 32 : 52;
     this.accumulatorSec = Math.min(maxSubsteps * subDt, this.accumulatorSec + clampedDt);
+
+    const qfrcApplied = this.data.qfrc_applied;
+    const xfrcApplied = this.data.xfrc_applied;
 
     let substeps = 0;
     let hadAwakeSubstep = false;
@@ -4189,19 +4225,19 @@ export class MujocoPhysicsEngine {
       const maxSpeedReal = this.snapshotPreStepVelocities();
       this.mj.mj_step(this.model, this.data);
       // Clear ephemeral wake nudges and per-step external forces immediately after mj_step consumes them
-      this.data.qfrc_applied.fill(0);
-      this.data.xfrc_applied.fill(0);
+      qfrcApplied.fill(0);
+      xfrcApplied.fill(0);
 
       if (this.data.ntree_awake > 0) {
         hadAwakeSubstep = true;
         this.dampGroundedMicroJitterShardsSubstep();
       }
 
-      if (
-        maxSpeedReal > 0.32 ||
+      const runWrenchThisSubstep =
+        this.deferredFractures.length > 0 ||
         this.extraPreStep.size > 0 ||
-        this.deferredFractures.length > 0
-      ) {
+        (maxSpeedReal > 0.32 && (!isSandboxHeavyCascade || (substeps & 1) === 0 || isLastSubstep));
+      if (runWrenchThisSubstep) {
         this.processWrenchCollisionsAndFractures(subDt);
       }
 

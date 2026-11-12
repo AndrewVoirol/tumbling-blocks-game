@@ -76,6 +76,13 @@ interface ExtendedGuestAudioHooks {
       surface?: 'glass' | 'wood';
     }
   ) => void;
+  playBlockThud?: (
+    impactSpeedMps: number,
+    worldPos?: Vec3,
+    camPosOrOptions?: Vec3 | { damage?: number; camPos?: Vec3; camRight?: Vec3 },
+    camRight?: Vec3,
+    damage?: number
+  ) => void;
   playTapTestResonance: (
     pinch01: number,
     worldPos?: Vec3,
@@ -533,8 +540,8 @@ export class MultiplayerGuestWorld {
         preQuat: entry.currentQuat,
         preLinVel: [0, 0, 0],
         preAngVel: [0, 0, 0],
-        volume: 0.001,
-        massKg: 0.0025,
+        volume: entry.meta.volume ?? 0.001,
+        massKg: entry.meta.massKg ?? 0.0025,
         preVy: 0,
         impactLocalPos: entry.meta.impactLocalPos,
         planes: entry.planesFloat32,
@@ -655,6 +662,17 @@ export class MultiplayerGuestWorld {
               impactSpeedMps: ev.impactSpeedMps,
               damage: ev.damage,
               surface: ev.surface,
+            }
+          );
+          break;
+        case 'blockThud':
+          ext.playBlockThud?.(
+            ev.impactSpeedMps,
+            ev.worldPos,
+            {
+              camPos: this.listenerCamPos,
+              camRight: this.listenerCamRight,
+              damage: ev.damage,
             }
           );
           break;

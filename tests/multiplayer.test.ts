@@ -1274,4 +1274,325 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   }, 15000);
+
+  it('T-MP9: Public PeerJS signaling handshake complies with strict 0.peerjs.com DataConnection schema, blockThud forwards once, and Sandbox shard tap-to-flick works', async () => {
+    const origWS = globalThis.WebSocket;
+    const origRTC = (globalThis as unknown as { RTCPeerConnection?: unknown }).RTCPeerConnection;
+
+    const peerSockets = new Map<string, MockPeerJsSocket>();
+    const validatedUrls: string[] = [];
+    let schemaRejections = 0;
+    let offerForwarded = 0;
+    let answerForwarded = 0;
+    let candidateForwarded = 0;
+
+    class MockPeerJsSocket {
+      public static readonly OPEN = 1;
+      public static readonly CLOSED = 3;
+      public readyState = 0;
+      public peerId = '';
+      public onopen: (() => void) | null = null;
+      public onmessage: ((ev: { data: string }) => void) | null = null;
+      public onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+      public onerror: (() => void) | null = null;
+
+      constructor(url: string) {
+        validatedUrls.push(url);
+        const u = new URL(url);
+        this.peerId = u.searchParams.get('id') ?? '';
+        const version = u.searchParams.get('version');
+        queueMicrotask(() => {
+          if (this.readyState === MockPeerJsSocket.CLOSED) return;
+          if (!version) {
+            schemaRejections++;
+            this.close(1000, 'missing version');
+            return;
+          }
+          this.readyState = MockPeerJsSocket.OPEN;
+          peerSockets.set(this.peerId, this);
+          this.onopen?.();
+          this.onmessage?.({ data: JSON.stringify({ type: 'OPEN' }) });
+        });
+      }
+
+      public send(raw: string): void {
+        if (this.readyState !== MockPeerJsSocket.OPEN) return;
+        const msg = JSON.parse(raw) as {
+          type: string;
+          dst?: string;
+          payload?: Record<string, unknown>;
+        };
+        if (msg.type === 'HEARTBEAT') return;
+        if (msg.type === 'OFFER') {
+          const p = msg.payload ?? {};
+          // Enforce strict 0.peerjs.com DataConnection schema (closes 1000 if missing label/reliable/serialization/browser)
+          if (
+            p.type !== 'data' ||
+            typeof p.label !== 'string' ||
+            typeof p.connectionId !== 'string' ||
+            typeof p.reliable !== 'boolean' ||
+            typeof p.serialization !== 'string' ||
+            typeof p.browser !== 'string' ||
+            !p.sdp
+          ) {
+            schemaRejections++;
+            this.close(1000, 'invalid OFFER schema');
+            return;
+          }
+          const target = msg.dst ? peerSockets.get(msg.dst) : undefined;
+          if (target) {
+            offerForwarded++;
+            queueMicrotask(() =>
+              target.onmessage?.({
+                data: JSON.stringify({ ...msg, src: this.peerId }),
+              })
+            );
+          }
+        } else if (msg.type === 'ANSWER') {
+          const p = msg.payload ?? {};
+          if (
+            p.type !== 'data' ||
+            typeof p.connectionId !== 'string' ||
+            typeof p.browser !== 'string' ||
+            !p.sdp
+          ) {
+            schemaRejections++;
+            this.close(1000, 'invalid ANSWER schema');
+            return;
+          }
+          const target = msg.dst ? peerSockets.get(msg.dst) : undefined;
+          if (target) {
+            answerForwarded++;
+            queueMicrotask(() =>
+              target.onmessage?.({
+                data: JSON.stringify({ ...msg, src: this.peerId }),
+              })
+            );
+          }
+        } else if (msg.type === 'CANDIDATE') {
+          const target = msg.dst ? peerSockets.get(msg.dst) : undefined;
+          if (target) {
+            candidateForwarded++;
+            queueMicrotask(() =>
+              target.onmessage?.({
+                data: JSON.stringify({ ...msg, src: this.peerId }),
+              })
+            );
+          }
+        }
+      }
+
+      public close(code: number = 1000, reason: string = ''): void {
+        if (this.readyState === MockPeerJsSocket.CLOSED) return;
+        this.readyState = MockPeerJsSocket.CLOSED;
+        peerSockets.delete(this.peerId);
+        this.onclose?.({ code, reason });
+      }
+    }
+
+    const activePcs: MockRTC[] = [];
+    class MockDataChannel {
+      public binaryType = 'arraybuffer';
+      public readyState: 'connecting' | 'open' | 'closed' = 'connecting';
+      public onopen: (() => void) | null = null;
+      public onmessage: ((ev: { data: unknown }) => void) | null = null;
+      public onclose: (() => void) | null = null;
+      public peerChannel: MockDataChannel | null = null;
+
+      constructor(public readonly label: string, public readonly id: number) {}
+
+      public send(data: unknown): void {
+        if (this.readyState === 'open' && this.peerChannel?.readyState === 'open') {
+          const peer = this.peerChannel;
+          queueMicrotask(() => peer.onmessage?.({ data }));
+        }
+      }
+
+      public close(): void {
+        this.readyState = 'closed';
+        this.onclose?.();
+      }
+    }
+
+    class MockRTC {
+      public signalingState: RTCSignalingState = 'stable';
+      public connectionState: RTCPeerConnectionState = 'new';
+      public iceConnectionState: RTCIceConnectionState = 'new';
+      public localDescription: RTCSessionDescriptionInit | null = null;
+      public remoteDescription: RTCSessionDescriptionInit | null = null;
+      public onicecandidate: ((ev: { candidate: { toJSON: () => RTCIceCandidateInit } | null }) => void) | null = null;
+      public onconnectionstatechange: (() => void) | null = null;
+      public oniceconnectionstatechange: (() => void) | null = null;
+      public channels = new Map<number, MockDataChannel>();
+
+      constructor() {
+        activePcs.push(this);
+      }
+
+      public createDataChannel(label: string, opts: { id?: number }): MockDataChannel {
+        const ch = new MockDataChannel(label, opts.id ?? 0);
+        this.channels.set(ch.id, ch);
+        return ch;
+      }
+
+      public async createOffer(): Promise<RTCSessionDescriptionInit> {
+        return { type: 'offer', sdp: 'v=0\r\n' };
+      }
+
+      public async createAnswer(): Promise<RTCSessionDescriptionInit> {
+        return { type: 'answer', sdp: 'v=0\r\n' };
+      }
+
+      public async setLocalDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+        this.localDescription = desc;
+        this.signalingState = desc.type === 'offer' ? 'have-local-offer' : 'stable';
+        queueMicrotask(() => {
+          this.onicecandidate?.({
+            candidate: {
+              toJSON: () => ({
+                candidate: 'candidate:1 1 udp 2130706431 127.0.0.1 9999 typ host',
+                sdpMid: '0',
+                sdpMLineIndex: 0,
+              }),
+            },
+          });
+        });
+      }
+
+      public async setRemoteDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+        this.remoteDescription = desc;
+        if (desc.type === 'answer' && activePcs.length >= 2) {
+          this.signalingState = 'stable';
+          const [pcA, pcB] = activePcs.slice(-2);
+          for (const [id, chA] of pcA.channels.entries()) {
+            const chB = pcB.channels.get(id);
+            if (chB) {
+              chA.peerChannel = chB;
+              chB.peerChannel = chA;
+              chA.readyState = 'open';
+              chB.readyState = 'open';
+              queueMicrotask(() => {
+                chA.onopen?.();
+                chB.onopen?.();
+              });
+            }
+          }
+        }
+      }
+
+      public async addIceCandidate(): Promise<void> {}
+
+      public close(): void {
+        this.connectionState = 'closed';
+        for (const ch of this.channels.values()) ch.close();
+      }
+    }
+
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = MockPeerJsSocket;
+    (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = MockRTC;
+
+    const host = new GameEngine();
+    const guest = new GameEngine();
+    await host.initHeadless();
+    await guest.initHeadless();
+
+    let guestThuds = 0;
+    let guestImpacts = 0;
+
+    try {
+      const code = host.startOnlineHost('PJS99', {
+        relayUrl: null,
+        peerJsUrl: 'wss://0.peerjs.com/peerjs',
+        enablePeerJsFallback: true,
+        roomSeed: 0x424242,
+      });
+      guest.joinOnlineRoom(code, {
+        relayUrl: null,
+        peerJsUrl: 'wss://0.peerjs.com/peerjs',
+        enablePeerJsFallback: true,
+        roomSeed: 0x424242,
+      });
+
+      const origGuestThud = guest.audio.playBlockThud.bind(guest.audio);
+      guest.audio.playBlockThud = (...args) => {
+        guestThuds++;
+        origGuestThud(...args);
+      };
+      const origGuestImpact = guest.audio.playGlassImpact.bind(guest.audio);
+      guest.audio.playGlassImpact = (...args) => {
+        guestImpacts++;
+        origGuestImpact(...args);
+      };
+
+      await waitUntil(
+        () =>
+          host.getTelemetrySnapshot().mpTransport === 'webrtc-p2p' &&
+          guest.getTelemetrySnapshot().mpTransport === 'webrtc-p2p',
+        2000
+      );
+
+      expect(schemaRejections).toBe(0);
+      expect(validatedUrls.every((u) => u.includes('version=1.5.4'))).toBe(true);
+      expect(offerForwarded).toBeGreaterThanOrEqual(1);
+      expect(answerForwarded).toBeGreaterThanOrEqual(1);
+      expect(candidateForwarded).toBeGreaterThanOrEqual(1);
+
+      // Pause background physics settle and flush any initial tower-settle audio before testing isolated playBlockThud
+      host.benchPaused = true;
+      host.stepHeadless(1 / 60);
+      await sleepMs(25);
+      guest.stepHeadless(1 / 60);
+      guestThuds = 0;
+      guestImpacts = 0;
+
+      // Trigger playBlockThud on Host -> must emit exactly 1 blockThud to Guest and 0 duplicate glassImpacts
+      host.audio.playBlockThud(0.95, [0.4, 0.08, -0.3], { damage: 0.5 });
+      host.stepHeadless(1 / 60);
+      await sleepMs(20);
+      guest.stepHeadless(1 / 60);
+
+      expect(guestThuds).toBe(1);
+      expect(guestImpacts).toBe(0);
+
+      // Leave online room into Sandbox mode, shatter an isolated 1L block on the oak table, and tap-flick a Voronoi shard!
+      host.benchPaused = false;
+      host.leaveOnlineRoom('sandbox', 2);
+      host.physics.rebuildTower('sandbox', 2, 1, 777);
+      for (const b of host.physics.blocks) {
+        host.physics.shatterBlock(b, [0, 0, 0], 16.0, [0, 1, 0], true);
+      }
+      for (let f = 0; f < 120; f++) host.stepHeadless(1 / 60);
+      expect(host.physics.shards.length).toBeGreaterThan(0);
+
+      const targetShard = host.physics.shards.reduce((best, s) =>
+        s.massKg > best.massKg ? s : best
+      );
+      const vp = { left: 0, top: 0, width: 1280, height: 800 };
+      host.camera.setPoseImmediate(
+        0,
+        0.75,
+        2.2,
+        [...targetShard.position],
+        vp.width / vp.height
+      );
+      const [sx, sy] = worldToScreenPx(host, targetShard.position, vp.width, vp.height);
+      const prePos: [number, number, number] = [...targetShard.position];
+
+      host.handlePointerDown(sx, sy, 1, 0, false, vp);
+      host.handlePointerUp(sx + 1, sy, 1, vp);
+      host.stepHeadless(1 / 60);
+
+      const movedDist = Math.hypot(
+        targetShard.position[0] - prePos[0],
+        targetShard.position[1] - prePos[1],
+        targetShard.position[2] - prePos[2]
+      );
+      expect(movedDist).toBeGreaterThan(0.001);
+    } finally {
+      guest.dispose();
+      host.dispose();
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket = origWS;
+      (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = origRTC;
+    }
+  });
 });

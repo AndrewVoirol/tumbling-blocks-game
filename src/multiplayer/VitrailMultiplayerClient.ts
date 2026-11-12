@@ -134,7 +134,7 @@ function buildPeerJsSocketUrl(baseUrl: string, peerId: string, token: string): s
   const sep = clean.includes('?') ? '&' : '?';
   return `${clean}${sep}key=peerjs&id=${encodeURIComponent(peerId)}&token=${encodeURIComponent(
     token
-  )}`;
+  )}&version=1.5.4`;
 }
 
 /**
@@ -735,8 +735,12 @@ export class VitrailMultiplayerClient {
               type: 'OFFER',
               dst: this.hostTargetPeerId,
               payload: {
+                label: 'ctrl',
                 connectionId: this.activeConnectionId,
                 type: 'data',
+                reliable: true,
+                serialization: 'binary',
+                browser: 'Chrome',
                 sdp: sdpInit,
               },
             })
@@ -787,6 +791,7 @@ export class VitrailMultiplayerClient {
               payload: {
                 connectionId: this.activeConnectionId,
                 type: 'data',
+                browser: 'Chrome',
                 sdp: sdpInit,
               },
             })

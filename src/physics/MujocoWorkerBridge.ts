@@ -1177,7 +1177,12 @@ export class MujocoWorkerBridge {
     return true;
   }
 
-  public nudgeShard(shardId: number, worldPoint: Vec3, impulse: Vec3): boolean {
+  public nudgeShard(
+    shardId: number,
+    worldPoint: Vec3,
+    impulse: Vec3,
+    impulseSim?: number
+  ): boolean {
     const found = this.shards.some((s) => s.id === shardId);
     if (!found) return false;
     this.post({
@@ -1187,6 +1192,7 @@ export class MujocoWorkerBridge {
       shardId,
       worldPoint: [...worldPoint],
       impulse: [...impulse],
+      impulseSim,
     });
     return true;
   }

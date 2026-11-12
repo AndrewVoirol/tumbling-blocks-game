@@ -200,6 +200,7 @@ export type WorkerInboundMessage =
       shardId: number;
       worldPoint: Vec3;
       impulse: Vec3;
+      impulseSim?: number;
     }
   | {
       type: 'evaluateOracle';
@@ -736,7 +737,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         break;
       }
       case 'nudgeShard': {
-        engine.nudgeShard(msg.shardId, msg.worldPoint, msg.impulse);
+        engine.nudgeShard(msg.shardId, msg.worldPoint, msg.impulse, msg.impulseSim);
         postSnapshot(false);
         break;
       }

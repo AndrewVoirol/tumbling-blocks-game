@@ -756,6 +756,13 @@ export class GameEngine {
         camRight?: Vec3,
         options?: { impactSpeedMps?: number; damage?: number; surface?: 'glass' | 'wood' }
       ) => void;
+      playBlockThud?: (
+        impactSpeedMps: number,
+        worldPos?: Vec3,
+        camPosOrOptions?: Vec3 | { damage?: number; camPos?: Vec3; camRight?: Vec3 },
+        camRight?: Vec3,
+        damage?: number
+      ) => void;
       playGlassCrack: (
         damage01: number,
         worldPos?: Vec3,
@@ -847,6 +854,27 @@ export class GameEngine {
         }
       );
     };
+
+    if (typeof audioAny.playBlockThud === 'function') {
+      const origThud = audioAny.playBlockThud.bind(this.audio);
+      audioAny.playBlockThud = (impactSpeedMps, worldPos, camPosOrOptions, camRight, damage = 0) => {
+        runTopLevelGuarded(
+          () => origThud(impactSpeedMps, worldPos, camPosOrOptions, camRight, damage),
+          () => {
+            const resolvedDamage =
+              camPosOrOptions && !Array.isArray(camPosOrOptions)
+                ? camPosOrOptions.damage ?? damage
+                : damage;
+            this.enqueueHostAudioEvent({
+              kind: 'blockThud',
+              impactSpeedMps,
+              worldPos,
+              damage: resolvedDamage,
+            });
+          }
+        );
+      };
+    }
 
     const origCrack = audioAny.playGlassCrack.bind(this.audio);
     audioAny.playGlassCrack = (damage01, worldPos, camPos, camRight) => {
@@ -1149,6 +1177,8 @@ export class GameEngine {
           ],
           planeCount: s.planeCount,
           planes,
+          volume: +s.volume.toFixed(6),
+          massKg: +s.massKg.toFixed(6),
         };
         this.hostActiveShardMetas.set(s.id, meta);
         spawned.push(meta);
@@ -2414,12 +2444,18 @@ export class GameEngine {
         (blk.assignedLayer >= 18 ? -0.55 : 0) -
         countCrossHingesBelow(blk.assignedLayer) * 0.48;
 
+      const cemTwoPlyBonus =
+        cand.adversarialPlacement?.collapseTriggered
+          ? -0.35
+          : (cand.twoPlyMasterScore01 ?? cand.safetyScore01) * 0.05;
+
       const score2Ply =
         eccReward +
         underClampedTopPen +
         cand.safetyScore01 * 0.92 +
         Math.min(0.32, midExtract.minMarginDm) * 1.65 +
-        channelBonus;
+        channelBonus +
+        cemTwoPlyBonus;
 
       if (score2Ply > best2PlyScore) {
         best2PlyScore = score2Ply;
@@ -3671,6 +3707,39 @@ export class GameEngine {
       } else {
         this.physics.endGrab(false);
         this.mpForceImmediateSnapshot = true;
+      }
+    } else if (
+      this.interactionMode === 'orbit' &&
+      this.pointerMovedDist < 5.0 &&
+      !this.mpRole &&
+      this.physics.gameMode === 'sandbox' &&
+      typeof this.physics.raycastScene === 'function' &&
+      typeof this.physics.nudgeShard === 'function'
+    ) {
+      const shardHit = this.physics.raycastScene(origin, dir, {
+        includeBlocks: false,
+        includeShards: true,
+        includeTable: false,
+      });
+      if (shardHit?.kind === 'shard' && shardHit.shardId !== undefined) {
+        const nudged = this.physics.nudgeShard(shardHit.shardId, shardHit.worldPointDm, dir);
+        if (nudged) {
+          const shd = this.physics.shards.find((s) => s.id === shardHit.shardId);
+          const audioHooks = this.audio as unknown as OptionalAcousticsHooks;
+          audioHooks.playShardImpacts?.(
+            [
+              {
+                pos: shardHit.worldPointDm,
+                speed: 0.42,
+                massKg: shd?.massKg ?? 0.0025,
+                surface: 'wood',
+                slotIndex: shd?.slotIndex ?? 0,
+              },
+            ],
+            this.camera.position,
+            this.camera.getRightVector()
+          );
+        }
       }
     }
 

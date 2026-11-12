@@ -39,9 +39,10 @@ Use this playbook and its executable 7-probe dynamical harness (`scripts/audit-d
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `34/34` Vitest Suite (`4` suites: `T1–T9`, `C1–C6`, Acoustics & Multiplayer, `~44 s`)**:
+5. **Complete `46/46` Vitest Suite (`6` suites: `T1–T9`, `C1–C7`, `520`-Seed Stateful Fuzzer, iPad Touch/HUD, Acoustics & Multiplayer, `~45 s`) + Standalone Stateful Trajectory Fuzzer**:
    ```bash
    npx vitest run
+   node scripts/fuzz-stateful-trajectories.mjs --seeds 500 --actions 80
    ```
 
 ---

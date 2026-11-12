@@ -61,6 +61,8 @@ export interface SerializedShardMeta {
   planeCount: number;
   /** Length = planeCount * 4: [nx, ny, nz, signedD] */
   planes: number[];
+  volume?: number;
+  massKg?: number;
 }
 
 export type NetworkAudioEvent =
@@ -86,6 +88,12 @@ export type NetworkAudioEvent =
       impactSpeedMps?: number;
       damage?: number;
       surface?: 'glass' | 'wood';
+    }
+  | {
+      kind: 'blockThud';
+      impactSpeedMps: number;
+      worldPos?: Vec3;
+      damage?: number;
     }
   | {
       kind: 'glassCrack';
