@@ -12,6 +12,7 @@
     "test:blast": "node \"$HOME/.gemini/config/skills/gpu-project-modernizer/scripts/test-blast.mjs\"",
     "test": "vitest run",
     "calibrate:physics": "node scripts/calibrate-mujoco-physics.mjs",
+    "chaos:mp": "node scripts/chaos-multiplayer-sim.mjs",
     "bench:optical": "node scripts/optical-bench.mjs"
   },
   "dependencies": {
