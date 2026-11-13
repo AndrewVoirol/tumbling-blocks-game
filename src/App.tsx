@@ -1637,9 +1637,10 @@ export const App: React.FC = () => {
                   <p>
                     Each 3-prism course has micro-tolerance variance: 1 prism sits free while 2
                     bear the column load. <strong>Tap or click</strong> any prism below the highest
-                    completed course without locking your turn — free glass rings clearly at{' '}
-                    <strong>2.3 kHz</strong>, while pinned glass ticks dryly at{' '}
-                    <strong>3.8 kHz</strong>.
+                    completed course without locking your turn — free glass rings clearly near{' '}
+                    <strong>2.87 kHz</strong>, while pinned glass ticks dryly near{' '}
+                    <strong>4.21 kHz</strong> (or toggle <strong>Polariscope</strong> to inspect
+                    live photoelastic force chains).
                   </p>
                 </div>
               </div>
