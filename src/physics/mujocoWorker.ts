@@ -23,6 +23,7 @@ import {
   TurnPhase,
   WobbleRockEvent,
 } from './PhysicsWorld';
+import { type PhysicsFidelityConfig } from './physicsFidelityProfile';
 
 export type WorkerAudioEvent =
   | {
@@ -45,6 +46,12 @@ export type WorkerAudioEvent =
       pitchMul: number;
       worldPos?: [number, number, number];
       options?: GlassImpactOptions;
+    }
+  | {
+      kind: 'blockThud';
+      impactSpeedMps: number;
+      worldPos?: [number, number, number];
+      damage?: number;
     }
   | {
       kind: 'glassCrack';
@@ -144,6 +151,13 @@ export interface WorkerSnapshotPayload {
   lockedMinRow: number | null;
   solverWarningCount: number;
   mechanicalEnergyJ: number;
+  solverDiagnostics?: {
+    timestepHz: number;
+    solverIterations: number;
+    lsIterations: number;
+    lastCullShardStats: { total: number; hero: number; cullet: number };
+    phantomAirClinkCount: number;
+  };
   audioEvents: WorkerAudioEvent[];
 }
 
@@ -229,6 +243,12 @@ export type WorkerInboundMessage =
       rayDir: Vec3;
       options?: SceneRaycastOptions;
     }
+  | {
+      type: 'setFidelityConfig';
+      epoch: number;
+      seq?: number;
+      config: Partial<PhysicsFidelityConfig>;
+    }
   | { type: 'dispose' };
 
 export type WorkerOutboundMessage =
@@ -306,6 +326,21 @@ class WorkerAudioProxy extends GlassAudioEngine {
       pitchMul,
       worldPos: worldPos ? [...worldPos] : undefined,
       options: options ? { ...options } : undefined,
+    });
+  }
+
+  public override playBlockThud(
+    impactSpeedMps: number = 0.35,
+    worldPos?: [number, number, number],
+    _camPos?: [number, number, number],
+    _camRight?: [number, number, number],
+    damage: number = 0
+  ): void {
+    this.pendingEvents.push({
+      kind: 'blockThud',
+      impactSpeedMps,
+      worldPos: worldPos ? [...worldPos] : undefined,
+      damage,
     });
   }
 
@@ -577,6 +612,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
       lockedMinRow: eng.lockedMinRow,
       solverWarningCount: eng.getSolverWarningCount(),
       mechanicalEnergyJ: eng.computeMechanicalEnergyJ(),
+      solverDiagnostics: eng.getSolverDiagnostics(),
       audioEvents: audio.flush(),
     };
 
@@ -777,6 +813,11 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
           reqId: msg.reqId,
           hit,
         } satisfies WorkerOutboundMessage);
+        break;
+      }
+      case 'setFidelityConfig': {
+        engine.setFidelityConfig(msg.config);
+        postSnapshot(false);
         break;
       }
     }

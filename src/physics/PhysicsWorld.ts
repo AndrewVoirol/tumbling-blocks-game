@@ -17,6 +17,13 @@ export type {
   SceneRaycastOptions,
 };
 
+export {
+  type PhysicsFidelityConfig,
+  SHIPPED_FIDELITY_CONFIG,
+  FAITHFUL_GLASS_FIDELITY_CONFIG,
+  cloneFidelityConfig,
+} from './physicsFidelityProfile';
+
 export type GameMode = 'solo' | 'party' | 'sandbox';
 
 export type TurnPhase =

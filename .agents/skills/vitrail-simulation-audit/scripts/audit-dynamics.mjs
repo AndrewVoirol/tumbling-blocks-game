@@ -413,7 +413,9 @@ async function runAudit() {
         if (sy <= 0.26 || (!isAsleep && speed > 0.12)) continue;
         let supported = false;
         const ctype = world.model.geom_contype[s.colliderHandle];
-        if (ctype === 4) {
+        const collidesWithBlocks =
+          ctype === 4 || (world.model.geom_conaffinity[s.colliderHandle] & 2) !== 0;
+        if (collidesWithBlocks) {
           for (const b of world.blocks) {
             if (b.shattered || b.extracted) continue;
             const dy = sy - b.position[1];
@@ -422,7 +424,7 @@ async function runAudit() {
               break;
             }
           }
-          if (!supported) {
+          if (!supported && ctype === 4) {
             for (const os of world.shards) {
               if (os.id === s.id || world.model.geom_contype[os.colliderHandle] !== 4) continue;
               const dy = sy - os.position[1];

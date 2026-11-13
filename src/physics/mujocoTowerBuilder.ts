@@ -43,8 +43,10 @@ export const MJ_CONAFFINITY_HERO_SHARD_ON_TABLE = 0x26; // Shard Table (0x20) + 
 export const MJ_CONAFFINITY_HERO_SHARD_OFF_RIM = 0x06;  // Excludes Shard Table (0x20) once past circular rim!
 
 export const MJ_CONTYPE_CULLET_SHARD = 0x08;
-export const MJ_CONAFFINITY_CULLET_ON_TABLE = 0x20;     // Shard Table (0x20): bounces on oak table without carpeting falling bricks
-export const MJ_CONAFFINITY_CULLET_OFF_RIM = 0x00;      // Excludes Shard Table (0x20) once past circular rim!
+export const MJ_CONAFFINITY_CULLET_ON_TABLE = 0x20;           // Shard Table (0x20): legacy table-only cullet
+export const MJ_CONAFFINITY_CULLET_OFF_RIM = 0x00;            // Excludes Shard Table (0x20) once past circular rim!
+export const MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE = MJ_CONTYPE_SHARD_TABLE | MJ_CONTYPE_BLOCK; // 0x22: solid against oak table + intact blocks
+export const MJ_CONAFFINITY_SOLID_CULLET_OFF_RIM = MJ_CONTYPE_BLOCK;                          // 0x02: solid against blocks, falls freely past circular rim
 
 export const MJ_CONTYPE_PARKING = 0x10;
 export const MJ_CONAFFINITY_PARKING = 0x10;

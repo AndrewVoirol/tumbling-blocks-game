@@ -10,6 +10,7 @@ import {
   mat4LookAt,
   mat4Multiply,
   mat4OrthoZO,
+  Quat,
   Vec3,
 } from '../math/vecMat';
 import {
@@ -36,6 +37,41 @@ const MAX_SHARD_VERTICES = 67584; // 512 slots * 132 vertices/slot
 const SHARD_VERTEX_FLOATS = 10; // 40 bytes per shard vertex
 const MAX_SPLINTERS_GPU = 320; // Grounded glass cullet chips
 const SPLINTER_FLOATS = 8; // 32 bytes per GPUSplinter
+
+function slerpQuatInto(out: Quat, a: Quat, b: Quat, t: number): void {
+  let bx = b[0];
+  let by = b[1];
+  let bz = b[2];
+  let bw = b[3];
+  let cosHalfTheta = a[0] * bx + a[1] * by + a[2] * bz + a[3] * bw;
+  if (cosHalfTheta < 0) {
+    bx = -bx;
+    by = -by;
+    bz = -bz;
+    bw = -bw;
+    cosHalfTheta = -cosHalfTheta;
+  }
+  if (cosHalfTheta >= 0.9995) {
+    const x = a[0] + (bx - a[0]) * t;
+    const y = a[1] + (by - a[1]) * t;
+    const z = a[2] + (bz - a[2]) * t;
+    const w = a[3] + (bw - a[3]) * t;
+    const inv = 1.0 / (Math.hypot(x, y, z, w) || 1.0);
+    out[0] = x * inv;
+    out[1] = y * inv;
+    out[2] = z * inv;
+    out[3] = w * inv;
+    return;
+  }
+  const halfTheta = Math.acos(Math.min(1, cosHalfTheta));
+  const sinHalfTheta = Math.sqrt(Math.max(1e-8, 1.0 - cosHalfTheta * cosHalfTheta));
+  const ratioA = Math.sin((1.0 - t) * halfTheta) / sinHalfTheta;
+  const ratioB = Math.sin(t * halfTheta) / sinHalfTheta;
+  out[0] = a[0] * ratioA + bx * ratioB;
+  out[1] = a[1] * ratioA + by * ratioB;
+  out[2] = a[2] * ratioA + bz * ratioB;
+  out[3] = a[3] * ratioA + bw * ratioB;
+}
 
 export class WebGPURenderer {
   public device!: GPUDevice;
@@ -172,6 +208,8 @@ export class WebGPURenderer {
   private sunViewProjMatrix = mat4Create();
   private tmpMatA = mat4Create();
   private tmpMatB = mat4Create();
+  private tmpPosInterp: Vec3 = [0, 0, 0];
+  private tmpQuatInterp: Quat = [0, 0, 0, 1];
 
   public lightingPreset: LightingPreset = LIGHTING_PRESETS[0];
   public lightingOverride: Partial<LightingPreset> | null = null;
@@ -1076,11 +1114,36 @@ export class WebGPURenderer {
         this.blockSortOrder[j + 1] = keyIdx;
       }
 
+      const poseAlphaRaw =
+        typeof (physics as unknown as { getRenderPoseAlpha?: (nowMs?: number) => number })
+          .getRenderPoseAlpha === 'function'
+          ? (
+              physics as unknown as { getRenderPoseAlpha: (nowMs?: number) => number }
+            ).getRenderPoseAlpha(typeof performance !== 'undefined' ? performance.now() : 0)
+          : 1.0;
+      const poseAlpha = Math.max(0.0, Math.min(1.0, poseAlphaRaw));
+      const doSubframeInterp = poseAlpha < 0.999;
+
       for (let k = 0; k < intactCount; k++) {
         const b = physics.blocks[this.blockSortOrder[k]];
         const base = k * BLOCK_FLOATS;
-        mat4FromRotationTranslationScale(this.tmpMatA, b.rotation, b.position, [1, 1, 1]);
-        mat4FromRigidInverse(this.tmpMatB, b.rotation, b.position);
+        let renderPos: Vec3 = b.position;
+        let renderQuat: Quat = b.rotation;
+        if (doSubframeInterp && b.prePos && b.preQuat) {
+          const dxp = b.position[0] - b.prePos[0];
+          const dyp = b.position[1] - b.prePos[1];
+          const dzp = b.position[2] - b.prePos[2];
+          if (dxp * dxp + dyp * dyp + dzp * dzp <= 0.64) {
+            this.tmpPosInterp[0] = b.prePos[0] + dxp * poseAlpha;
+            this.tmpPosInterp[1] = b.prePos[1] + dyp * poseAlpha;
+            this.tmpPosInterp[2] = b.prePos[2] + dzp * poseAlpha;
+            slerpQuatInto(this.tmpQuatInterp, b.preQuat, b.rotation, poseAlpha);
+            renderPos = this.tmpPosInterp;
+            renderQuat = this.tmpQuatInterp;
+          }
+        }
+        mat4FromRotationTranslationScale(this.tmpMatA, renderQuat, renderPos, [1, 1, 1]);
+        mat4FromRigidInverse(this.tmpMatB, renderQuat, renderPos);
 
         this.blockStorageData.set(this.tmpMatA, base + 0);
         this.blockStorageData.set(this.tmpMatB, base + 16);
@@ -1102,9 +1165,9 @@ export class WebGPURenderer {
           Math.abs(this.tmpMatA[10]) * 0.125 +
           0.025;
 
-        const bx = b.position[0];
-        const by = b.position[1];
-        const bz = b.position[2];
+        const bx = renderPos[0];
+        const by = renderPos[1];
+        const bz = renderPos[2];
         if (worldHalfY > maxBlockHalfY) maxBlockHalfY = worldHalfY;
         if (bx - worldHalfX < blkMinX) blkMinX = bx - worldHalfX;
         if (by - worldHalfY - 0.025 < blkMinY) blkMinY = by - worldHalfY - 0.025;
@@ -1212,10 +1275,40 @@ export class WebGPURenderer {
       this.shardSortOrder[j + 1] = keyIdx;
     }
 
+    const shardPoseAlpha =
+      typeof (physics as unknown as { getRenderPoseAlpha?: (nowMs?: number) => number })
+        .getRenderPoseAlpha === 'function'
+        ? Math.max(
+            0.0,
+            Math.min(
+              1.0,
+              (
+                physics as unknown as { getRenderPoseAlpha: (nowMs?: number) => number }
+              ).getRenderPoseAlpha(typeof performance !== 'undefined' ? performance.now() : 0)
+            )
+          )
+        : 1.0;
+    const interpShards = shardPoseAlpha < 0.999;
+
     for (let k = 0; k < shardCount; k++) {
       const s = physics.shards[this.shardSortOrder[k]];
       const base = k * SHARD_FLOATS;
-      mat4FromRotationTranslationScale(this.tmpMatA, s.rotation, s.position, [1, 1, 1]);
+      let sPos: Vec3 = s.position;
+      let sRot: Quat = s.rotation;
+      if (interpShards && s.prePos && s.preQuat) {
+        const dxp = s.position[0] - s.prePos[0];
+        const dyp = s.position[1] - s.prePos[1];
+        const dzp = s.position[2] - s.prePos[2];
+        if (dxp * dxp + dyp * dyp + dzp * dzp <= 0.64) {
+          this.tmpPosInterp[0] = s.prePos[0] + dxp * shardPoseAlpha;
+          this.tmpPosInterp[1] = s.prePos[1] + dyp * shardPoseAlpha;
+          this.tmpPosInterp[2] = s.prePos[2] + dzp * shardPoseAlpha;
+          slerpQuatInto(this.tmpQuatInterp, s.preQuat, s.rotation, shardPoseAlpha);
+          sPos = this.tmpPosInterp;
+          sRot = this.tmpQuatInterp;
+        }
+      }
+      mat4FromRotationTranslationScale(this.tmpMatA, sRot, sPos, [1, 1, 1]);
       this.shardStorageData.set(this.tmpMatA, base + 0);
 
       const swatch = STAINED_GLASS_PALETTE[s.swatchId];

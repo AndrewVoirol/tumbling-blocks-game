@@ -3080,7 +3080,7 @@ export class GameEngine {
         const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
         const underClampedTopPen =
           (blk.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
-          (blk.assignedLayer >= 18 ? -0.55 : 0) -
+          (blk.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
           countCrossHingesBelow(blk.assignedLayer) * 0.48;
         const jammedOrUnsafe =
           c.collapseTriggered ||
@@ -3135,7 +3135,7 @@ export class GameEngine {
           : maxSafeGlobalEccDm * 2.4 - (postEccDm - maxSafeGlobalEccDm) * 5.5;
       const underClampedTopPen =
         (blk.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
-        (blk.assignedLayer >= 18 ? -0.55 : 0) -
+        (blk.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
         countCrossHingesBelow(blk.assignedLayer) * 0.48;
 
       const cemTwoPlyBonus =
@@ -3271,7 +3271,7 @@ export class GameEngine {
       const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
       const underClampedTopPen =
         (b.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
-        (b.assignedLayer >= 18 ? -0.55 : 0) -
+        (b.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
         crossHinges * 0.48;
       const rankScore =
         underClampedTopPen +
@@ -3321,7 +3321,7 @@ export class GameEngine {
 
     const difficulty = this.getActiveTurnAiDifficulty();
     const labelPrefix = difficulty === 'master' ? 'Master Glazier' : 'Apprentice AI';
-    const scoutDelay = this.aiFastCadence ? 0.02 : 0.72;
+    const scoutDelay = this.aiFastCadence ? 0.22 : 0.72;
     const probeDelay = this.aiFastCadence ? 0.02 : 0.88;
     const postTapDelay = this.aiFastCadence ? 0.02 : 0.82;
 
@@ -3444,7 +3444,14 @@ export class GameEngine {
           pulledBlk.position[2] - this.aiPullBlockInitXZ[1]
         );
         const liveLeanDeg = this.physics.getTelemetry().leanAngleDeg;
-        if (movedDm < 0.08 && (this.physics.grabResistance01 > 0.72 || liveLeanDeg > 0.90)) {
+        const jammedEarly =
+          movedDm < 0.08 && (this.physics.grabResistance01 > 0.72 || liveLeanDeg > 0.90);
+        const jammedMidChannel =
+          this.aiTimerSec >= 0.30 &&
+          movedDm < 0.32 &&
+          this.physics.grabResistance01 > 0.72 &&
+          liveLeanDeg > 0.85;
+        if (jammedEarly || jammedMidChannel) {
           this.aiAbortedBlockIds.add(pulledBlk.id);
           this.physics.endGrab(false);
           this.resetAiController();
@@ -3531,6 +3538,8 @@ export class GameEngine {
     this.benchPaused = false;
     this.benchCameraLocked = false;
     this.resetAiController();
+    this.aiAbortedBlockIds.clear();
+    this.aiLastBlocksStacked = 0;
     if (mode !== undefined && mode !== 'party') {
       this.aiOpponentEnabled = false;
       this.aiVsAiEnabled = false;

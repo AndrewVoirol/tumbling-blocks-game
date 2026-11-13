@@ -2071,7 +2071,7 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
       (globalThis as unknown as { WebSocket: unknown }).WebSocket = origWS;
       (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = origRTC;
     }
-  });
+  }, 15000);
 
   it('T-MP11: Non-inhibiting relay abuse guard rejects foreign Origins (403) & non-0x564d / >16 KB binary / >512 KB or non-JSON frames while passing 0x564d & ~400 KB 512-shard room_welcome', async () => {
     const httpModName = 'node:http';

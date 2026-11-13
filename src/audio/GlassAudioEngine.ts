@@ -13,6 +13,17 @@ import {
 
 export * from './physicalModalModels';
 
+export interface AudioImpactTelemetryEntry {
+  timeMs: number;
+  kind: 'glass' | 'woodThud' | 'wobble' | 'tapTest';
+  surface: 'glass' | 'wood';
+  fundamentalHz: number;
+  gain: number;
+  pitchScale: number;
+  impactSpeedMps: number;
+  wasMuted: boolean;
+}
+
 export interface GlassImpactOptions {
   /** Normal impact closing speed in SI m/s (governs Hertzian cutoff f_c = 1 / (2 * tau_c)) */
   impactSpeedMps?: number;
@@ -163,6 +174,30 @@ export class GlassAudioEngine {
     singGain: number;
     raspGain: number;
   } | null = null;
+
+  private recentImpactLog: AudioImpactTelemetryEntry[] = [];
+
+  private pushAudioTelemetry(entry: AudioImpactTelemetryEntry): void {
+    this.recentImpactLog.push(entry);
+    if (this.recentImpactLog.length > 48) {
+      this.recentImpactLog.splice(0, this.recentImpactLog.length - 48);
+    }
+  }
+
+  public consumeRecentImpactLog(): AudioImpactTelemetryEntry[] {
+    if (this.recentImpactLog.length === 0) return [];
+    const out = this.recentImpactLog;
+    this.recentImpactLog = [];
+    return out;
+  }
+
+  public getRecentImpactLog(): ReadonlyArray<AudioImpactTelemetryEntry> {
+    return this.recentImpactLog;
+  }
+
+  public clearRecentImpactLog(): void {
+    this.recentImpactLog = [];
+  }
 
   public constructor(injectedContext?: AudioContext) {
     if (injectedContext) {
@@ -660,6 +695,18 @@ export class GlassAudioEngine {
       fundamentalHz,
     };
 
+    const tapNowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.pushAudioTelemetry({
+      timeMs: tapNowMs,
+      kind: 'tapTest',
+      surface: 'glass',
+      fundamentalHz,
+      gain: 0.23 * (1.0 - 0.34 * p),
+      pitchScale: 1.0,
+      impactSpeedMps: 0.35,
+      wasMuted: this.muted,
+    });
+
     if (!this.ctx || !this.masterGain || this.muted) return;
     const now = this.ctx.currentTime;
     const sr = this.ctx.sampleRate || 48000;
@@ -806,11 +853,13 @@ export class GlassAudioEngine {
     camRight?: [number, number, number],
     damage: number = 0
   ): void {
-    if (!this.ctx || !this.masterGain || this.muted) return;
-    const now = this.ctx.currentTime;
     const vn = clampFinite(impactSpeedMps, 0.015, 6.0, 0.25);
-    if (now - this.lastThudTime < 0.012 && vn < 0.35) return;
-    this.lastThudTime = now;
+    const clockNow = this.ctx
+      ? this.ctx.currentTime
+      : (typeof performance !== 'undefined' ? performance.now() : Date.now()) * 0.001;
+    if (this.ctx && clockNow - this.lastThudTime < 0.018) return;
+    if (!this.ctx && clockNow - this.lastThudTime < 0.012 && vn < 0.35) return;
+    this.lastThudTime = clockNow;
 
     let resolvedCamPos: [number, number, number] | undefined;
     let resolvedCamRight: [number, number, number] | undefined = camRight;
@@ -839,7 +888,39 @@ export class GlassAudioEngine {
       0.25
     );
     const woodAmp = clampFinite(0.045 + 0.28 * energyNorm, 0.02, 0.34, 0.14);
+    const plateModes = computeOakPlateModes({ radialNorm });
+    this.pushAudioTelemetry({
+      timeMs: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+      kind: 'woodThud',
+      surface: 'wood',
+      fundamentalHz: plateModes[0]?.freqHz ?? 112,
+      gain: woodAmp,
+      pitchScale: 1.0,
+      impactSpeedMps: vn,
+      wasMuted: this.muted,
+    });
 
+    if (!this.ctx || !this.masterGain || this.muted) {
+      // Also log coupled glass component cleanly in headless / muted telemetry without invoking public playGlassImpact (preserves multiplayer hostAudioTap parity)
+      const allModes = computeGlassBarModes({
+        damage: resolvedDamage,
+        massKg: resolvedMassKg,
+      });
+      const primaryMode =
+        allModes.find((m) => m.kind === 'flexural-y' && m.order === 1) ?? allModes[0];
+      const coupledIntensity = clampFinite(energyNorm * 0.68, 0.0, 1.0, 0.0);
+      this.pushAudioTelemetry({
+        timeMs: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+        kind: 'glass',
+        surface: 'wood',
+        fundamentalHz: primaryMode?.freqHz ?? 2865,
+        gain: clampFinite(0.018 + coupledIntensity * 0.33, 0.015, 0.36, 0.12),
+        pitchScale: 1.0,
+        impactSpeedMps: vn,
+        wasMuted: this.muted,
+      });
+      return;
+    }
     // 1. Axisymmetric & asymmetric Kirchhoff white-oak circular plate modes + woody knock
     this.triggerOakPlateModes(
       vn,
@@ -853,7 +934,7 @@ export class GlassAudioEngine {
     // 2. Coupled muted leaded-glass prism modes filtered by the softer glass-on-oak Hertzian cutoff
     this.playGlassImpact(
       energyNorm * 0.68,
-      0.98,
+      1.0,
       worldPos,
       resolvedCamPos,
       resolvedCamRight,
@@ -896,15 +977,6 @@ export class GlassAudioEngine {
     }
     this.lastClinkTime = clockNow;
 
-    if (!this.ctx || !this.masterGain || this.muted) {
-      // Passed physical threshold + 12 ms cooldown (headless test or locally muted Host)
-      this.lastImpactPassedGate = !this.muted && !this.ctx;
-      return false;
-    }
-
-    const now = this.ctx.currentTime;
-    const sr = this.ctx.sampleRate || 48000;
-
     const pScale = clampFinite(pitchScale, 0.5, 2.5, 1.0);
     // Legacy MujocoPhysicsEngine passes pitchScale = 0.92 when bestHitTable === true
     const inferredWoodFromPitch = !options?.surface && pScale <= 0.94;
@@ -923,6 +995,29 @@ export class GlassAudioEngine {
       LEADED_CAME_PRISM_DEFAULTS.massKg
     );
 
+    const allModes = computeGlassBarModes({ damage, massKg });
+    const primaryMode = allModes.find((m) => m.kind === 'flexural-y' && m.order === 1) ?? allModes[0];
+    const effScale = inferredWoodFromPitch ? 1.0 : pScale;
+    this.pushAudioTelemetry({
+      timeMs: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+      kind: 'glass',
+      surface,
+      fundamentalHz: (primaryMode?.freqHz ?? 2865) * effScale,
+      gain: clampFinite(0.018 + intensity * 0.33, 0.015, 0.36, 0.12),
+      pitchScale: effScale,
+      impactSpeedMps: vnMps,
+      wasMuted: this.muted,
+    });
+
+    if (!this.ctx || !this.masterGain || this.muted) {
+      // Passed physical threshold + 12 ms cooldown (headless test or locally muted Host)
+      this.lastImpactPassedGate = !this.muted && !this.ctx;
+      return false;
+    }
+
+    const now = this.ctx.currentTime;
+    const sr = this.ctx.sampleRate || 48000;
+
     const hertz = computeHertzianContact({
       impactSpeedMps: vnMps,
       surface,
@@ -931,7 +1026,6 @@ export class GlassAudioEngine {
     });
 
     // Select 4 distinct physical modes: flexural-y n=1, torsional n=1, flexural-y n=2, flexural-y n=3
-    const allModes = computeGlassBarModes({ damage, massKg });
     const selectedModes = [
       allModes.find((m) => m.kind === 'flexural-y' && m.order === 1) ?? allModes[0],
       allModes.find((m) => m.kind === 'torsional' && m.order === 1) ?? allModes[1],
@@ -1079,6 +1173,20 @@ export class GlassAudioEngine {
       }
       this.wobbleBlockLastTimeSec.set(options.blockId, clockNow);
     }
+
+    const damageWob = clampFinite(options?.damage ?? 0.0, 0.0, 1.0, 0.0);
+    const modesWob = computeGlassBarModes({ damage: damageWob, clampingLoadN });
+    const fPrimaryWob = modesWob[0]?.freqHz ?? 2865;
+    this.pushAudioTelemetry({
+      timeMs: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+      kind: 'wobble',
+      surface,
+      fundamentalHz: fPrimaryWob * (schedule[0]?.pitchScale ?? 1.0),
+      gain: schedule[0]?.intensity01 ?? 0.1,
+      pitchScale: schedule[0]?.pitchScale ?? 1.0,
+      impactSpeedMps: Math.max(0.03, angularSpeedRadPerSec * 0.03),
+      wasMuted: this.muted,
+    });
 
     if (!this.ctx || !this.masterGain || this.muted) {
       this.lastWobblePassedGate = !this.muted && !this.ctx;

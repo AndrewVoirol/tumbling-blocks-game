@@ -1,6 +1,17 @@
+import { existsSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { attachVitrailRoomRelay } from './workers/vitrail-rooms/nodeRelay.mjs';
+
+const fsAllowRoots = [process.cwd()];
+const nodeModulesPath = resolve(process.cwd(), 'node_modules');
+if (existsSync(nodeModulesPath)) {
+  const realNodeModules = realpathSync(nodeModulesPath);
+  if (!fsAllowRoots.includes(realNodeModules)) {
+    fsAllowRoots.push(realNodeModules);
+  }
+}
 
 const crossOriginIsolationHeaders = {
   'Cross-Origin-Opener-Policy': 'same-origin',
@@ -39,6 +50,9 @@ export default defineConfig({
     port: 5173,
     strictPort: false,
     headers: crossOriginIsolationHeaders,
+    fs: {
+      allow: fsAllowRoots,
+    },
   },
   preview: {
     port: 4173,

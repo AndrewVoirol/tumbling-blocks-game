@@ -227,6 +227,7 @@ export async function createFuzzSuite(deps) {
     const mjData = rw && typeof rw.getData === 'function' ? rw.getData() : null;
     const bodyTreeId = mjModel ? mjModel.body_treeid : null;
     const geomContype = mjModel ? mjModel.geom_contype : null;
+    const geomConaffinity = mjModel ? mjModel.geom_conaffinity : null;
     const treeAsleep = mjData ? mjData.tree_asleep : null;
 
     const isBodySleepingFast = (bodyId) => {
@@ -338,8 +339,9 @@ export async function createFuzzSuite(deps) {
       if (checkSettledOffRim && !b.extracted && b.id !== phys.activeBlockId) {
         const r = Math.hypot(b.position[0], b.position[2]);
         const vy = b.linVel[1];
+        const speed3d = Math.hypot(b.linVel[0], b.linVel[1], b.linVel[2]);
         // A block whose CoM is well past the rim + half-length (`4.30 + 0.42 = 4.72 dm`) cannot rest on the table
-        if (r > TABLE_RADIUS + 0.44 && b.position[1] > -1.5 && Math.abs(vy) < 0.06) {
+        if (r > TABLE_RADIUS + 0.44 && b.position[1] > -1.5 && speed3d < 0.12) {
           let bridgedByOnTableBlock = false;
           for (let j = 0; j < phys.blocks.length; j++) {
             const sb = phys.blocks[j];
@@ -355,7 +357,7 @@ export async function createFuzzSuite(deps) {
           if (!bridgedByOnTableBlock) {
             throw new FuzzInvariantError(
               'OFF_RIM_BLOCK_FLOATER',
-              `Off-rim block #${b.id} stranded above y=-1.5 dm at r=${r.toFixed(3)}, y=${b.position[1].toFixed(3)}, vy=${vy.toFixed(4)}`,
+              `Off-rim block #${b.id} stranded above y=-1.5 dm at r=${r.toFixed(3)}, y=${b.position[1].toFixed(3)}, vy=${vy.toFixed(4)}, speed3d=${speed3d.toFixed(4)}`,
               ctx
             );
           }
@@ -400,8 +402,10 @@ export async function createFuzzSuite(deps) {
         const asleep = sy > 0.26 ? isBodySleepingFast(s.bodyHandle) : false;
         if (asleep && sy > 0.26) {
           const isHero = geomContype ? geomContype[s.colliderHandle] === 4 : true;
+          const collidesWithBlocks =
+            isHero || (geomConaffinity ? (geomConaffinity[s.colliderHandle] & 2) !== 0 : false);
           let supported = false;
-          if (isHero) {
+          if (collidesWithBlocks) {
             for (let j = 0; j < phys.blocks.length; j++) {
               const sb = phys.blocks[j];
               if (sb.shattered || sb.extracted) continue;
@@ -416,7 +420,7 @@ export async function createFuzzSuite(deps) {
                 break;
               }
             }
-            if (!supported) {
+            if (!supported && isHero) {
               for (let j = 0; j < phys.shards.length; j++) {
                 const os = phys.shards[j];
                 if (os.id === s.id) continue;
@@ -446,10 +450,12 @@ export async function createFuzzSuite(deps) {
 
       if (checkSettledOffRim) {
         const r = Math.hypot(s.position[0], s.position[2]);
-        const vy = rw
-          ? (rw.getRigidBody(s.bodyHandle)?.linvel().y ?? s.preLinVel[1])
-          : s.preLinVel[1];
-        if (r > TABLE_RADIUS + 0.14 && s.position[1] > -1.5 && Math.abs(vy) < 0.06) {
+        const lv = rw ? rw.getRigidBody(s.bodyHandle)?.linvel() : null;
+        const vy = lv ? lv.y : s.preLinVel[1];
+        const speed3d = lv
+          ? Math.hypot(lv.x, lv.y, lv.z)
+          : Math.hypot(s.preLinVel[0], s.preLinVel[1], s.preLinVel[2]);
+        if (r > TABLE_RADIUS + 0.14 && s.position[1] > -1.5 && speed3d < 0.12) {
           let supportedByOverhangingBlock = false;
           for (let j = 0; j < phys.blocks.length; j++) {
             const sb = phys.blocks[j];
@@ -469,7 +475,7 @@ export async function createFuzzSuite(deps) {
           if (!supportedByOverhangingBlock) {
             throw new FuzzInvariantError(
               'OFF_RIM_SHARD_FLOATER',
-              `Off-rim shard #${s.id} stranded above y=-1.5 dm at r=${r.toFixed(3)}, y=${s.position[1].toFixed(3)}, vy=${vy.toFixed(4)}`,
+              `Off-rim shard #${s.id} stranded above y=-1.5 dm at r=${r.toFixed(3)}, y=${s.position[1].toFixed(3)}, vy=${vy.toFixed(4)}, speed3d=${speed3d.toFixed(4)}`,
               ctx
             );
           }

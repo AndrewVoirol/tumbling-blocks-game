@@ -519,7 +519,10 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
       const isAsleep = rw.getRigidBody(s.bodyHandle)?.isSleeping() ?? false;
       if (sy <= 0.26 || (!isAsleep && speed > 0.12)) continue;
       let supported = false;
-      if (mjModel.geom_contype[s.colliderHandle] === 4) {
+      const collidesWithBlocks =
+        mjModel.geom_contype[s.colliderHandle] === 4 ||
+        (mjModel.geom_conaffinity[s.colliderHandle] & 2) !== 0;
+      if (collidesWithBlocks) {
         for (const b of world.blocks) {
           if (b.shattered || b.extracted) continue;
           const dy = sy - b.position[1];
@@ -533,7 +536,7 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
             break;
           }
         }
-        if (!supported) {
+        if (!supported && mjModel.geom_contype[s.colliderHandle] === 4) {
           for (const os of world.shards) {
             if (os.id === s.id || mjModel.geom_contype[os.colliderHandle] !== 4) continue;
             const dy = sy - os.position[1];

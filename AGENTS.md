@@ -4,7 +4,8 @@
 
 1. **Mandatory Turn-0 Skill Read**: Read `/Users/andrewvoirol/.gemini/config/skills/webgpu-interactive-simulation/SKILL.md` before designing, editing, or delegating any WGSL shader, optical pass, fracture geometry, or MuJoCo physics solver changes.
 2. **Core Commands**:
-   - **Complete Vitest Suite (`58/58` across `7` suites: `T1–T9` Physics/Fracture, `C1–C8` Colosseum, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos)**: `npx vitest run` (or `npm run test:blast -- <file-or-symbol>`)
+   - **Complete Vitest Suite (`64/64` across `8` suites: `T1–T9` Physics/Fracture, `C1–C8` Colosseum, `6` Faithful-Glass Fidelity Checks, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos)**: `npx vitest run` (or `npm run test:blast -- <file-or-symbol>`)
+   - **5-Domain Pre-Ship Evaluation Suite (`17/17` across Gravity/Overhang, `12L–30L` Stacks & `10 mm` Drop, AI Games & `60`-Seed Fuzzer, Sandbox `512`-Pool & `734`-Event Acoustic Audit)**: `npm run eval:preship` (`node scripts/eval-preship-suite.mjs`)
    - **100-Match Adversarial Network Chaos Simulator (`8%` drop + `65%` burst, `120 ± 45 ms` jitter/reordering, mid-drag WebRTC->WS failover, `30 Hz` occluded Host, `< 2.0 mm` Guest convergence)**: `npm run chaos:mp` (`node scripts/chaos-multiplayer-sim.mjs`)
    - **Live Two-Browser 8-Stage Hardware-WebGPU Multiplayer E2E (`0.peerjs.com` WebRTC + Live Cloudflare DO Relay)**: `npm run verify:mp:live` (`node scripts/verify-live-multiplayer-browsers.mjs`)
    - **Stateful Multi-Action Trajectory Fuzzer (`mj_energyPos`/`mj_energyVel` Passivity + Invariant Shrinking)**: `node scripts/fuzz-stateful-trajectories.mjs --seeds 500 --actions 80`

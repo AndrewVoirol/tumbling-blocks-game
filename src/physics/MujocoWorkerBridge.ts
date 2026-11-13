@@ -46,6 +46,11 @@ import {
   TurnPhase,
   WobbleRockEvent,
 } from './PhysicsWorld';
+import {
+  cloneFidelityConfig,
+  FAITHFUL_GLASS_FIDELITY_CONFIG,
+  type PhysicsFidelityConfig,
+} from './physicsFidelityProfile';
 
 export interface WorkerEndpointLike {
   onmessage: ((ev: MessageEvent<WorkerOutboundMessage>) => void) | null;
@@ -162,6 +167,17 @@ export class MujocoWorkerBridge {
   private oracleCallbacks = new Map<number, (res: BlockCriticalityCandidate[]) => void>();
   private placementCallbacks = new Map<number, (res: AdversarialPlacementPlan[]) => void>();
   private raycastCallbacks = new Map<number, (res: SceneRaycastHit | null) => void>();
+  private fidelity: PhysicsFidelityConfig = cloneFidelityConfig(FAITHFUL_GLASS_FIDELITY_CONFIG);
+  private prevSnapArrivalMs: number = 0;
+  private lastSnapArrivalMs: number = 0;
+  private ewmaSnapIntervalMs: number = 16.67;
+  private lastSolverDiagnostics = {
+    timestepHz: 600,
+    solverIterations: 26,
+    lsIterations: 6,
+    lastCullShardStats: { total: 0, hero: 0, cullet: 0 },
+    phantomAirClinkCount: 0,
+  };
   private disposed: boolean = false;
 
   private constructor(worker: WorkerEndpointLike, audio: GlassAudioEngine) {
@@ -237,6 +253,56 @@ export class MujocoWorkerBridge {
 
   public computeMechanicalEnergyJ(): number {
     return this.mechanicalEnergyJ;
+  }
+
+  public setFidelityConfig(partial: Partial<PhysicsFidelityConfig>): void {
+    this.fidelity = {
+      ...this.fidelity,
+      ...partial,
+    };
+    this.post({
+      type: 'setFidelityConfig',
+      epoch: this.epoch,
+      seq: ++this.commandSeq,
+      config: { ...partial },
+    });
+  }
+
+  public getFidelityConfig(): PhysicsFidelityConfig {
+    return { ...this.fidelity };
+  }
+
+  public getSolverDiagnostics() {
+    return {
+      timestepHz: this.lastSolverDiagnostics.timestepHz,
+      solverIterations: this.lastSolverDiagnostics.solverIterations,
+      lsIterations: this.lastSolverDiagnostics.lsIterations,
+      lastCullShardStats: { ...this.lastSolverDiagnostics.lastCullShardStats },
+      phantomAirClinkCount: this.lastSolverDiagnostics.phantomAirClinkCount,
+    };
+  }
+
+  public trackBlockDrop(_blockId: number, _restYDm: number): void {
+    // Worker bridge mirror stub for direct ComparisonLab parity
+  }
+
+  public getTrackedDropState(): {
+    maxReboundMm: number;
+    sawDescent: boolean;
+    traceMm: number[];
+  } {
+    return { maxReboundMm: 0, sawDescent: false, traceMm: [] };
+  }
+
+  public getRenderPoseAlpha(nowMs?: number): number {
+    if (!this.fidelity.subframeRenderInterpolation) return 1.0;
+    if (this.lastSnapArrivalMs <= 0 || this.prevSnapArrivalMs <= 0) return 1.0;
+    const t = nowMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const elapsed = t - this.lastSnapArrivalMs;
+    if (elapsed < 0) return 0.0;
+    if (elapsed > 90) return 1.0;
+    const denom = Math.max(6.5, this.ewmaSnapIntervalMs * 1.12);
+    return Math.min(1.0, Math.max(0.0, elapsed / denom));
   }
 
   private bumpEpoch(): number {
@@ -330,6 +396,30 @@ export class MujocoWorkerBridge {
     this.initialLayers = snap.initialLayers;
     this.solverWarningCount = snap.solverWarningCount ?? 0;
     this.mechanicalEnergyJ = snap.mechanicalEnergyJ ?? 0;
+    if (snap.solverDiagnostics) {
+      this.lastSolverDiagnostics = {
+        timestepHz: snap.solverDiagnostics.timestepHz,
+        solverIterations: snap.solverDiagnostics.solverIterations,
+        lsIterations: snap.solverDiagnostics.lsIterations,
+        lastCullShardStats: { ...snap.solverDiagnostics.lastCullShardStats },
+        phantomAirClinkCount: snap.solverDiagnostics.phantomAirClinkCount,
+      };
+    }
+
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (snap.isFullRebuild) {
+      this.prevSnapArrivalMs = 0;
+      this.lastSnapArrivalMs = 0;
+    } else {
+      if (this.lastSnapArrivalMs > 0) {
+        const dtSnap = nowMs - this.lastSnapArrivalMs;
+        if (dtSnap >= 2 && dtSnap <= 60) {
+          this.ewmaSnapIntervalMs = this.ewmaSnapIntervalMs * 0.72 + dtSnap * 0.28;
+        }
+      }
+      this.prevSnapArrivalMs = this.lastSnapArrivalMs;
+      this.lastSnapArrivalMs = nowMs;
+    }
 
     if (snap.isFullRebuild && snap.initialBlocks) {
       this.blocks = snap.initialBlocks.map((b) => ({
@@ -432,6 +522,13 @@ export class MujocoWorkerBridge {
       }
     }
 
+    const prevShardById = new Map<number, GlassShardState>();
+    if (!snap.isFullRebuild && this.shards.length > 0) {
+      for (let i = 0; i < this.shards.length; i++) {
+        prevShardById.set(this.shards[i].id, this.shards[i]);
+      }
+    }
+
     const st = snap.shardTransforms;
     const shardCount = Math.floor(st.length / 14);
     const nextShards: GlassShardState[] = [];
@@ -442,6 +539,13 @@ export class MujocoWorkerBridge {
       if (!meta) continue;
       const pos: Vec3 = [st[base + 1], st[base + 2], st[base + 3]];
       const rot: Quat = [st[base + 4], st[base + 5], st[base + 6], st[base + 7]];
+      const prevShard = prevShardById.get(id);
+      const prePos: Vec3 = prevShard
+        ? [prevShard.position[0], prevShard.position[1], prevShard.position[2]]
+        : [pos[0], pos[1], pos[2]];
+      const preQuat: Quat = prevShard
+        ? [prevShard.rotation[0], prevShard.rotation[1], prevShard.rotation[2], prevShard.rotation[3]]
+        : [rot[0], rot[1], rot[2], rot[3]];
       const preLinVel: Vec3 = [st[base + 8], st[base + 9], st[base + 10]];
       const preAngVel: Vec3 = [st[base + 11], st[base + 12], st[base + 13]];
       nextShards.push({
@@ -454,8 +558,8 @@ export class MujocoWorkerBridge {
         rippleSeed: meta.rippleSeed,
         position: pos,
         rotation: rot,
-        prePos: pos,
-        preQuat: rot,
+        prePos,
+        preQuat,
         preLinVel,
         preAngVel,
         volume: meta.volume,
@@ -576,6 +680,15 @@ export class MujocoWorkerBridge {
             this.listenerCamPos,
             this.listenerCamRight,
             ev.options
+          );
+          break;
+        case 'blockThud':
+          this.audio.playBlockThud(
+            ev.impactSpeedMps,
+            ev.worldPos,
+            this.listenerCamPos,
+            this.listenerCamRight,
+            ev.damage ?? 0
           );
           break;
         case 'glassCrack':
