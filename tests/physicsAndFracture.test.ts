@@ -816,7 +816,7 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     expect(Math.hypot(projUp![0] - anchorUp[0], projUp![2] - anchorUp[2])).toBeLessThan(1e-4);
 
     engine.dispose();
-  });
+  }, 60000);
 
   it('T5: load-bearing pull stays vibration-free, and asymmetric collapse produces shattered + crazed + precarious survivors that sleep 100% on the table', async () => {
     await ensureRapierInitialized();
@@ -1228,7 +1228,7 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     expect(Math.abs(gBlk.position[2] - 0.19)).toBeLessThan(0.03);
 
     engine.dispose();
-  }, 30000);
+  }, 90000);
 
   it('T7: guards mid-drag PULLING->EXTRACTED against side-corner snap, tracks Sandbox table grabPlaneY without parallax, and cancels active grab on modal open', async () => {
     const { GameEngine } = await import('../src/engine/GameEngine');

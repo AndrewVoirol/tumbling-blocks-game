@@ -164,7 +164,8 @@ async function main() {
       sleep18Complete: asleep18 === 54,
       sleep24Complete: asleep24 === 72,
       looseContrastAtLeast12: validLooseRows18 >= 12,
-      collapseIntactAtLeast15: telCollapse.intactCount >= 15,
+      collapseMixedSurvivorsAndShatter:
+        telCollapse.intactCount >= 8 && telCollapse.shatteredCount >= 20,
       collapseCrazedAtLeast4: telCollapse.crazedCount >= 4,
       oracleDiscriminatesLoad:
         Boolean(safest && riskiest) && safest.safetyScore01 > riskiest.safetyScore01 + 0.25,

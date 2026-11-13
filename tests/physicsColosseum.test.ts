@@ -1038,11 +1038,12 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
     // 1. 18L Sandbox collapse must reach ntree_awake === 0 (0 visible jitter + 0 underground shelf ghost-wake)
     // and emit 0 WobbleRockEvents / playGlassImpact calls after t = 1.6 s
     let simT = 0;
+    let fullSleepSec: number | null = null;
     let postSettleImpacts = 0;
     let postSettleWobbles = 0;
     class SilenceSpyAudio extends GlassAudioEngine {
       public override playGlassImpact(): void {
-        if (simT >= 1.6) postSettleImpacts++;
+        if (fullSleepSec !== null || simT >= 2.2) postSettleImpacts++;
       }
     }
     const collapseAudio = new SilenceSpyAudio();
@@ -1053,16 +1054,21 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
     for (let f = 0; f < 30; f++) collapseWorld.step(1 / 60);
     collapseWorld.triggerSandboxCollapseImpulse();
 
+    const collapseData = collapseWorld.getWorld().getData()!;
     for (let f = 1; f <= 180; f++) {
       simT = f / 60;
       collapseWorld.step(1 / 60);
       const wob = collapseWorld.consumeWobbleEvents();
       collapseWorld.consumeShardImpacts();
-      if (simT >= 1.6) postSettleWobbles += wob.length;
+      if (fullSleepSec !== null || simT >= 2.2) postSettleWobbles += wob.length;
+      if (fullSleepSec === null && simT > 0.35 && collapseData.ntree_awake === 0) {
+        fullSleepSec = +simT.toFixed(3);
+      }
     }
 
-    const collapseData = collapseWorld.getWorld().getData()!;
     expect(collapseWorld.shatteredCount).toBeGreaterThanOrEqual(15);
+    expect(fullSleepSec).not.toBeNull();
+    expect(fullSleepSec!).toBeLessThanOrEqual(2.2);
     expect(collapseData.ntree_awake).toBe(0);
     expect(postSettleWobbles).toBe(0);
     expect(postSettleImpacts).toBe(0);

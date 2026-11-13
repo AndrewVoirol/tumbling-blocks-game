@@ -7473,9 +7473,9 @@ export class MujocoPhysicsEngine {
 
       const wasDemoted = prevContypeById.get(id) === MJ_CONTYPE_CULLET_SHARD;
       const isAbyss = py < -0.45;
-      let isHero = volume >= 0.0022 && !wasDemoted && !isAbyss && restoredHeroCount < 56;
-      if (isHero) {
-        const rShardDm = Math.hypot(hxDm, hyDm, hzDm);
+      const rShardDm = Math.hypot(hxDm, hyDm, hzDm);
+      let overlapsIntactBlock = false;
+      if (!isAbyss) {
         for (let bi = 0; bi < count; bi++) {
           const blk = this.blocks[bi];
           if (blk.shattered || blk.extracted) continue;
@@ -7485,22 +7485,28 @@ export class MujocoPhysicsEngine {
           if (Math.abs(dx) > 0.85 || Math.abs(dy) > 0.85 || Math.abs(dz) > 0.85) continue;
           const localPt = quatInverseRotateVec3(blk.rotation, [dx, dy, dz]);
           if (
-            Math.abs(localPt[0]) < BLOCK_HALF_X + hxDm - 0.001 &&
-            Math.abs(localPt[1]) < BLOCK_HALF_Y + hyDm - 0.001 &&
-            Math.abs(localPt[2]) < BLOCK_HALF_Z + hzDm - 0.001
+            Math.abs(localPt[0]) < BLOCK_HALF_X + rShardDm &&
+            Math.abs(localPt[1]) < BLOCK_HALF_Y + rShardDm &&
+            Math.abs(localPt[2]) < BLOCK_HALF_Z + rShardDm
           ) {
-            isHero = false;
+            overlapsIntactBlock = true;
             break;
           }
         }
-        if (isHero) {
-          for (let hi = 0; hi < restoredHeroSpheres.length; hi++) {
-            const hs = restoredHeroSpheres[hi];
-            const distDm = Math.hypot(px - hs[0], py - hs[1], pz - hs[2]);
-            if (distDm < (rShardDm + hs[3]) * 0.82) {
-              isHero = false;
-              break;
-            }
+      }
+      let isHero =
+        volume >= 0.0022 &&
+        !wasDemoted &&
+        !isAbyss &&
+        !overlapsIntactBlock &&
+        restoredHeroCount < 56;
+      if (isHero) {
+        for (let hi = 0; hi < restoredHeroSpheres.length; hi++) {
+          const hs = restoredHeroSpheres[hi];
+          const distDm = Math.hypot(px - hs[0], py - hs[1], pz - hs[2]);
+          if (distDm < (rShardDm + hs[3]) * 0.82) {
+            isHero = false;
+            break;
           }
         }
         if (isHero) {
@@ -7513,7 +7519,9 @@ export class MujocoPhysicsEngine {
       const ctype = isHero ? MJ_CONTYPE_HERO_SHARD : MJ_CONTYPE_CULLET_SHARD;
       const caff = isHero
         ? (offRim ? MJ_CONAFFINITY_HERO_SHARD_OFF_RIM : MJ_CONAFFINITY_HERO_SHARD_ON_TABLE)
-        : this.getCulletConaffinity(offRim);
+        : overlapsIntactBlock
+          ? (offRim ? MJ_CONAFFINITY_CULLET_OFF_RIM : MJ_CONAFFINITY_CULLET_ON_TABLE)
+          : this.getCulletConaffinity(offRim);
 
       m.geom_type[geomId] = 6;
       m.geom_dataid[geomId] = -1;
@@ -7632,6 +7640,7 @@ export class MujocoPhysicsEngine {
       }
     }
 
+    d.qacc_warmstart.fill(0);
     this.mj.mj_forward(m, d);
     this.syncTransformsAndRules();
 

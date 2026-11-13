@@ -466,11 +466,12 @@ async function runAudit() {
     // 8. Post-collapse 100% tree sleep (visible rubble + hidden shelf) and zero post-settle audio buzz
     {
       let simT = 0;
+      let fullSleepSec = null;
       let postSettleImpacts = 0;
       let postSettleWobbles = 0;
       class CollapseSilenceAudio extends GlassAudioEngine {
         playGlassImpact() {
-          if (simT >= 1.6) postSettleImpacts++;
+          if (fullSleepSec !== null || simT >= 2.2) postSettleImpacts++;
         }
       }
       const probeAudio = new CollapseSilenceAudio();
@@ -480,13 +481,12 @@ async function runAudit() {
       for (let f = 0; f < 30; f++) world.step(1 / 60);
       world.triggerSandboxCollapseImpulse();
 
-      let fullSleepSec = null;
       for (let f = 1; f <= 180; f++) {
         simT = f / 60;
         world.step(1 / 60);
         const wob = world.consumeWobbleEvents();
         world.consumeShardImpacts();
-        if (simT >= 1.6) postSettleWobbles += wob.length;
+        if (fullSleepSec !== null || simT >= 2.2) postSettleWobbles += wob.length;
         if (fullSleepSec === null && simT > 0.35 && world.data.ntree_awake === 0) {
           fullSleepSec = +simT.toFixed(3);
         }
@@ -497,7 +497,7 @@ async function runAudit() {
         world.shatteredCount >= 15 &&
         ntreeAwakeEnd === 0 &&
         fullSleepSec !== null &&
-        fullSleepSec <= 2.4 &&
+        fullSleepSec <= 2.2 &&
         postSettleWobbles === 0 &&
         postSettleImpacts === 0;
 

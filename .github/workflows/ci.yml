@@ -9,6 +9,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   fast-gates:
     name: Build, MuJoCo Calibration & 9-Probe Dynamics
@@ -28,10 +31,22 @@ jobs:
       - name: 9-Probe Continuous Dynamics Audit (9/9)
         run: npm run audit:dynamics
 
-  full-suites:
-    name: Vitest (64/64) & 5-Domain Pre-Ship Eval (17/17)
+  vitest:
+    name: Vitest (${{ matrix.label }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Physics, Colosseum & Fidelity
+            files: tests/physicsAndFracture.test.ts tests/physicsColosseum.test.ts tests/physicsComparisonFidelity.test.ts
+          - label: Acoustics, Multiplayer & Touch/HUD
+            files: tests/acoustics.test.ts tests/multiplayer.test.ts tests/touchAndHud.test.ts
+          - label: 520-Seed Stateful Fuzzer
+            files: tests/statefulFuzz.test.ts
+          - label: 100-Match Network Chaos
+            files: tests/multiplayerChaos.test.ts
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,7 +54,19 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
-      - name: Complete Vitest Suite (8 Suites, 64 Checks)
-        run: npx vitest run --maxWorkers=2
-      - name: 5-Domain Pre-Ship Evaluation Suite (17/17)
+      - name: Run Vitest Shard (${{ matrix.label }})
+        run: npx vitest run ${{ matrix.files }} --maxWorkers=1 --testTimeout=120000 --hookTimeout=60000
+
+  eval-preship:
+    name: 5-Domain Pre-Ship Evaluation Suite (17/17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run 5-Domain Pre-Ship Eval (17/17)
         run: npm run eval:preship

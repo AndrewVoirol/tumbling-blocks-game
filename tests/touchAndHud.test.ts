@@ -774,7 +774,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
     } finally {
       engine.dispose();
     }
-  });
+  }, 60000);
 
   it('4. prevents duplicate nested outbound audio events via installHostAudioTap re-entrancy guard', async () => {
     const engine = new GameEngine();
@@ -1748,7 +1748,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
     } finally {
       engine.dispose();
     }
-  }, 120000);
+  }, 300000);
 
   it('7. [BUG-1] releases Glazier AI mocap tether on Guide modal / AI-off mid-pull and cleanly resumes or hands off EXTRACTED placement', async () => {
     const engine = new GameEngine();

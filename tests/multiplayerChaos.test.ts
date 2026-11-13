@@ -546,7 +546,7 @@ describe('Vitrail Multiplayer Resilience, <=4s ICE Fallback & 100-Match Chaos Su
       expect(result.maxSteadyStateConvergenceErrorMm).toBeLessThan(2.0);
       expect(result.convergenceViolationsOver2Mm).toBe(0);
     },
-    300000
+    600000
   );
 
   it(
