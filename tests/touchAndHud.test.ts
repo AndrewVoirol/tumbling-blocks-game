@@ -13,6 +13,7 @@ interface MinimalChildProcess {
     on(event: 'data', cb: (chunk: Uint8Array) => void): void;
   } | null;
   once(event: 'exit', cb: (code: number | null) => void): void;
+  once(event: 'error', cb: (err: unknown) => void): void;
   kill(signal?: string): boolean;
 }
 
@@ -20,7 +21,7 @@ interface MinimalChildProcessModule {
   spawn(
     cmd: string,
     args: string[],
-    opts: { stdio: Array<'ignore' | 'pipe'> }
+    opts: { stdio: Array<'ignore' | 'pipe'>; env?: Record<string, string | undefined> }
   ): MinimalChildProcess;
 }
 
@@ -937,9 +938,12 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
       const vitePort = typeof addr === 'object' && addr ? addr.port : 0;
       expect(vitePort).toBeGreaterThan(0);
 
-      const envChrome = (
-        globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }
-      ).process?.env?.CHROME_PATH;
+      const procObj = (
+        globalThis as unknown as {
+          process?: { env?: Record<string, string | undefined>; platform?: string };
+        }
+      ).process;
+      const envChrome = procObj?.env?.CHROME_PATH;
       const chromeCandidates = [
         ...(envChrome ? [envChrome] : []),
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -954,6 +958,10 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
         chromeCandidates.find((candidate) => fsMod.existsSync(candidate)) ??
         '/usr/bin/google-chrome';
 
+      const chromeEnv =
+        procObj?.platform === 'linux'
+          ? { ...(procObj.env ?? {}), DBUS_SESSION_BUS_ADDRESS: '/dev/null' }
+          : procObj?.env;
       chromeProc = cpMod.spawn(
         chromeBin,
         [
@@ -964,31 +972,70 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
           '--no-first-run',
           '--no-default-browser-check',
           '--no-proxy-server',
+          '--remote-debugging-address=127.0.0.1',
+          '--password-store=basic',
+          '--use-mock-keychain',
+          '--disable-dbus',
+          '--disable-background-networking',
+          '--disable-extensions',
+          '--disable-sync',
+          '--disable-component-update',
+          '--disable-breakpad',
           `--user-data-dir=${userDataDir}`,
           '--remote-debugging-port=0',
           'about:blank',
         ],
-        { stdio: ['ignore', 'ignore', 'pipe'] }
+        { stdio: ['ignore', 'ignore', 'pipe'], env: chromeEnv }
       );
 
       const decoder = new TextDecoder('utf-8');
+      const activePortFile = pathMod.join(userDataDir, 'DevToolsActivePort');
       const cdpPort = await new Promise<number>((resolve, reject) => {
-        const timeout = setTimeout(
-          () => reject(new Error('Timed out waiting for Chrome DevTools port')),
-          10000
-        );
+        let settled = false;
         let stderrBuf = '';
+        let pollTimer: ReturnType<typeof setInterval> | null = null;
+        const finish = (cb: () => void) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          if (pollTimer !== null) clearInterval(pollTimer);
+          cb();
+        };
+        const timeout = setTimeout(
+          () =>
+            finish(() =>
+              reject(
+                new Error(
+                  `Timed out waiting for Chrome DevTools port (bin=${chromeBin}): ${stderrBuf}`
+                )
+              )
+            ),
+          30000
+        );
+        pollTimer = setInterval(() => {
+          try {
+            if (!fsMod.existsSync(activePortFile)) return;
+            const raw = fsMod.readFileSync(activePortFile, 'utf8');
+            const firstLine = Number.parseInt(raw.split(/\r?\n/)[0]?.trim() ?? '', 10);
+            if (Number.isInteger(firstLine) && firstLine > 0) {
+              finish(() => resolve(firstLine));
+            }
+          } catch {
+            // DevToolsActivePort still being written
+          }
+        }, 200);
         chromeProc!.stderr!.on('data', (chunk: Uint8Array) => {
           stderrBuf += decoder.decode(chunk, { stream: true });
-          const match = stderrBuf.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);
+          const match = stderrBuf.match(/DevTools listening on ws:\/\/[^/:]+:(\d+)\//);
           if (match) {
-            clearTimeout(timeout);
-            resolve(Number(match[1]));
+            finish(() => resolve(Number(match[1])));
           }
         });
+        chromeProc!.once('error', (err: unknown) => {
+          finish(() => reject(new Error(`Failed to spawn Chrome (${chromeBin}): ${String(err)}`)));
+        });
         chromeProc!.once('exit', (code: number | null) => {
-          clearTimeout(timeout);
-          reject(new Error(`Chrome exited prematurely with code ${code}: ${stderrBuf}`));
+          finish(() => reject(new Error(`Chrome exited prematurely with code ${code}: ${stderrBuf}`)));
         });
       });
 
@@ -1019,7 +1066,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
 
       // Wait for App + __VITRAIL_ENGINE__ to mount with zero gpuError
       await cdp.evaluate(`new Promise((resolve, reject) => {
-        const deadline = Date.now() + 12000;
+        const deadline = Date.now() + 25000;
         const poll = () => {
           const eng = window.__VITRAIL_ENGINE__;
           const errModal = document.querySelector('[role="alertdialog"]');
@@ -1649,7 +1696,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
         // Ignore residual temp cleanup race from Chromium sub-processes
       }
     }
-  }, 35000);
+  }, 90000);
 
   it('6. optimizes continuous extraction azimuth & adversarial eccentric placement and survives a 30-turn headless AI-vs-AI match', async () => {
     const engine = new GameEngine();

@@ -43,6 +43,7 @@ jobs:
             files: tests/physicsAndFracture.test.ts tests/physicsColosseum.test.ts tests/physicsComparisonFidelity.test.ts
           - label: Acoustics, Multiplayer & Touch/HUD
             files: tests/acoustics.test.ts tests/multiplayer.test.ts tests/touchAndHud.test.ts
+            setup_chrome: true
           - label: 520-Seed Stateful Fuzzer
             files: tests/statefulFuzz.test.ts
           - label: 100-Match Network Chaos
@@ -54,7 +55,17 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
+      - name: Setup Chrome for Headless CDP HUD Audit
+        if: matrix.setup_chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-dependencies: true
       - name: Run Vitest Shard (${{ matrix.label }})
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          DBUS_SESSION_BUS_ADDRESS: /dev/null
         run: npx vitest run ${{ matrix.files }} --maxWorkers=1 --testTimeout=120000 --hookTimeout=60000
 
   eval-preship:

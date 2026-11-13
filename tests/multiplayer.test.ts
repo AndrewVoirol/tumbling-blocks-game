@@ -1223,15 +1223,14 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
         enableWebRtcUpgrade: false,
       });
 
-      await waitUntil(() => {
-        host.stepHeadless(1 / 60);
-        guestReloaded.stepHeadless(1 / 60);
-        return (
+      await waitUntil(
+        () =>
           zombieCtrlClosed &&
           Boolean(guestReloaded.getTelemetrySnapshot().mpPeerConnected) &&
-          guestReloaded.mpRoomSeed === seed
-        );
-      }, 2500);
+          guestReloaded.mpRoomSeed === seed,
+        2500
+      );
+      await pumpPair(guestReloaded, 8);
 
       expect(zombieCtrlClosed).toBe(true);
       expect(zombieSentBlackholed).toBe(0);
