@@ -12,10 +12,13 @@
     "test:blast": "node \"$HOME/.gemini/config/skills/gpu-project-modernizer/scripts/test-blast.mjs\"",
     "test": "vitest run",
     "calibrate:physics": "node scripts/calibrate-mujoco-physics.mjs",
+    "audit:dynamics": "node .agents/skills/vitrail-simulation-audit/scripts/audit-dynamics.mjs",
     "eval:preship": "node scripts/eval-preship-suite.mjs",
     "chaos:mp": "node scripts/chaos-multiplayer-sim.mjs",
     "verify:mp:live": "node scripts/verify-live-multiplayer-browsers.mjs",
-    "bench:optical": "node scripts/optical-bench.mjs"
+    "bench:optical": "node scripts/optical-bench.mjs",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "@mujoco/mujoco": "^4.0.0",

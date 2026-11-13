@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Tracked pre-push regression gate for Vitrail (tumbling-blocks-game).
+# Install once via: npm run hooks:install (or automatically via npm install `prepare`).
+
+set -euo pipefail
+
+# Skip pure remote ref deletions (`git push origin --delete <branch>`), while still
+# executing all gates when run directly from a terminal or subshell.
+if [ ! -t 0 ]; then
+  READ_ANY=0
+  HAS_NON_DELETE_REF=0
+  ZERO_OID="0000000000000000000000000000000000000000"
+  while read -r _local_ref local_oid _remote_ref _remote_oid; do
+    [ -z "${local_oid:-}" ] && continue
+    READ_ANY=1
+    if [ "$local_oid" != "$ZERO_OID" ]; then
+      HAS_NON_DELETE_REF=1
+    fi
+  done
+  if [ "$READ_ANY" -eq 1 ] && [ "$HAS_NON_DELETE_REF" -eq 0 ]; then
+    exit 0
+  fi
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[vitrail pre-push] Running Tier-1 regression gates..."
+
+WGSL_LINTER="$HOME/.gemini/config/skills/gpu-project-modernizer/scripts/lint-wgsl-and-layout.mjs"
+if [ -f "$WGSL_LINTER" ]; then
+  echo "[vitrail pre-push] 1/4 Static WGSL AST & layout lint..."
+  npm run lint:wgsl
+else
+  echo "[vitrail pre-push] 1/4 Skipping host-local WGSL AST script (not installed in \$HOME/.gemini)..."
+fi
+
+echo "[vitrail pre-push] 2/4 TypeScript + Vite production build..."
+npm run build
+
+echo "[vitrail pre-push] 3/4 Offline MuJoCo 4.0 calibration & sag scorecard..."
+npm run calibrate:physics
+
+echo "[vitrail pre-push] 4/4 9-probe continuous & multi-stage dynamics audit..."
+npm run audit:dynamics
+
+echo "[vitrail pre-push] All Tier-1 gates passed."

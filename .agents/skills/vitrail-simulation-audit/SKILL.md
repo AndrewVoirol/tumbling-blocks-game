@@ -41,9 +41,10 @@ Use this playbook and its executable 9-probe dynamical harness (`scripts/audit-d
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `58/58` Vitest Suite (`7` suites: `T1–T9`, `C1–C8`, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos) + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
+5. **Complete `64/64` Vitest Suite (`8` suites: `T1–T9`, `C1–C8`, `6` Faithful-Glass Fidelity Checks, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
    ```bash
    npx vitest run
+   npm run eval:preship
    npm run verify:mp:live
    node scripts/fuzz-stateful-trajectories.mjs --seeds 500 --actions 80
    ```
@@ -74,3 +75,11 @@ When running a native `swarm` (`workspace: "share"` for concurrent authors, `wor
    - Verify both `uCausticTex.a` Voronoi shard caustic ribbons on the oak table when `intactCount === 0` AND smoked neutral-density crystal refraction (`~30%` passband background visibility on unloaded prisms/shards + `0.11` dark-field trough extinction inside stressed courses)—never pass Polariscope dark-field by crushing transmission into `< 1%` matte-black silhouettes, and never pass negative bases to WGSL `pow()`.
 3. **Outlier-Trimmed `Plumb`, Sandbox `Toppled` Parity & Multiplayer Seed Sync (`App.tsx`, `src/multiplayer/*`)**:
    - Keep internal `solverLeanAngleDeg` separate from HUD `leanAngleDeg` (`standingTilts[tiltLen - 5]` column consensus when stationary, `maxDynamicTipTiltRad` when tipping), assert `isToppled` (`— Toppled`) on collapsed Sandbox heaps (`currentLayers === 0 && shatteredCount > 0`), and preserve sequential `mulberry32` `54/54` Host/Worker/Guest block palette parity.
+
+---
+
+## 4. Eye-and-Ear Realism & Two-Sided Physics/Audio Invariants (`M1–M6` + `eval:preship`)
+
+1. **Unloaded Rebound vs. Spawn Silence (`M1`)**: Assert `>= 1.15–1.7 mm` crisp rebound on `10–12 mm` unloaded oak drops paired `1:1` with `hasOnsetContact` impulses (`0` timer buzz), while gating only `< 0.30 s` initial stack spawn audio (`inInitialTowerSpawnSettle`, `settleClinks = 0`) without damping physics across `12L–30L` towers.
+2. **Free Extraction Tribology, Cullet Masks & Substrate Audio (`M2–M4`)**: Reject artificial slot-rail/pitch locks (`78%` / `0.94`), kinetic drop below `μk = 0.215`, phantom air clinks, `0x20` ghosting cullet (require `0x22` on-table / `0x02` off-rim), and `-8%` oak modal detuning (`2865 Hz` glass prism modes stay substrate-invariant + coupled `95–135 Hz` white-oak plate thud).
+3. **Worker Interpolation, Multi-Domain Fuzzer & Two-Sided `multiccd` (`M5–M6`)**: Verify `getRenderPoseAlpha` slerp (`120 Hz` parity), `>= 500 Hz / >= 14` iters collapse stability on MT, static `0.275` breakaway friction inside `mj_copyState` rollouts, Glazier AI `currentLayers - 5` top-course guard + `>= 0.30 s && movedDm < 0.32` bind abort, 3D `speed3d < 0.12` off-rim checks, and two-sided `mjDSBL_MULTICCD` bracketing (`!(solverLeanAngleDeg < 8.5° && shards.length < 64)` onset AND `visibleAwakeShards <= 48` rubble settle).

@@ -382,7 +382,7 @@ async function main() {
     // DOMAIN 4: Sandbox Smashing (18L, 24L, 30L), Solo Collapse & 512 Pool Wrap
     // =========================================================================
     const cpuCount = globalThis.navigator?.hardwareConcurrency ?? os.cpus().length;
-    const budget18Ms = cpuCount <= 2 ? 48.0 : 16.0;
+    const budget18Ms = cpuCount <= 2 || Boolean(process.env.CI) ? 48.0 : 16.0;
     let maxShardImpactBurst = 0;
     let maxWobbleBurst = 0;
 

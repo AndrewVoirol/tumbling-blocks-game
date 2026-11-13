@@ -1,0 +1,45 @@
+name: Vitrail Physics & Build CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  fast-gates:
+    name: Build, MuJoCo Calibration & 9-Probe Dynamics
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Typecheck & Production Bundle
+        run: npm run build
+      - name: MuJoCo 4.0 Calibration Scorecard (8/8)
+        run: npm run calibrate:physics
+      - name: 9-Probe Continuous Dynamics Audit (9/9)
+        run: npm run audit:dynamics
+
+  full-suites:
+    name: Vitest (64/64) & 5-Domain Pre-Ship Eval (17/17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Complete Vitest Suite (8 Suites, 64 Checks)
+        run: npx vitest run --maxWorkers=2
+      - name: 5-Domain Pre-Ship Evaluation Suite (17/17)
+        run: npm run eval:preship

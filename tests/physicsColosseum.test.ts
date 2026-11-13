@@ -377,7 +377,8 @@ describe('Colosseum Phase 2 Adversarial Physics, Tribology, Fracture & Snapshot 
 
     const p95 = percentile(stepMs, 0.95);
     const cpuCount = globalThis.navigator?.hardwareConcurrency ?? 2;
-    const p95BudgetMs = cpuCount <= 2 ? 48.0 : 16.0;
+    const isCiSharedVm = Boolean((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CI);
+    const p95BudgetMs = cpuCount <= 2 || isCiSharedVm ? 48.0 : 16.0;
     expect(world.shatteredCount).toBeGreaterThanOrEqual(18);
     expect(floatingOffRimShards).toBe(0);
     expect(floatingOffRimBlocks).toBe(0);
