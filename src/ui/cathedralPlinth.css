@@ -39,8 +39,14 @@
   display: block;
 }
 
+.mobile-hud-root .plinth-opal-plaque .vitrail-wordmark {
+  color: var(--silica-bright);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+}
+
 .mobile-hud-root .plinth-opal-plaque .vitrail-spec {
   display: block;
+  color: rgba(214, 224, 240, 0.74);
 }
 
 .mobile-hud-root .polariscope-lens-btn .quarry-etch-content {
@@ -69,6 +75,17 @@
 .mobile-hud-root button,
 .mobile-hud-root input {
   border-radius: 0;
+}
+
+.mobile-hud-root .quarry-glass-pane {
+  height: auto;
+  flex: 1 1 auto;
+  align-self: stretch;
+}
+
+.mobile-hud-root .quarry-etch-content {
+  height: auto;
+  align-self: stretch;
 }
 
 /* ============================================================================
@@ -352,6 +369,7 @@
 
 .mobile-hud-root .plinth-half-icon-btn {
   flex: 0 0 44px;
+  height: 44px;
 }
 
 .mobile-hud-root .plinth-half-online-bar {
@@ -654,6 +672,7 @@
 .mobile-hud-root .plinth-full-hdr-btn {
   min-width: 44px;
   min-height: 44px;
+  height: 44px;
 }
 
 .mobile-hud-root .atelier-sheet-scroll {

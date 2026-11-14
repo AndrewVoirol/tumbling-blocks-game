@@ -1413,20 +1413,44 @@ describe('Cathedral Plinth Mobile HUD & E1–E8 Contracts', () => {
     it('6. [Post-Audit Regressions] checks 4 distinct lighting gem colors, Glazier AI <-> Pass & Play <-> Online Room transitions, Rebuild AI retention, and crystal close/input normalization', async () => {
       await resetClosedMobileState();
 
-      // A. Detent 1 & Detent 2: 4 distinct lighting gem colors + quarry-tone-crystal close buttons
+      // A. Detent 1 & Detent 2: 4 distinct lighting gem colors, quarry-tone-crystal close buttons, 100% pane fill, & light silica cartouche text
       const lightingAndClose = await cdp!.evaluate<{
         halfGemColors: string[];
         fullGemColors: string[];
         halfCloseHasCrystalTone: boolean;
         fullCloseHasCrystalTone: boolean;
         hasInvalidBtnClass: boolean;
+        underfilledButtons: Array<{ ctx: string; label: string; diff: number }>;
+        headingAvgRgb: number;
+        specAvgRgb: number;
       }>(`new Promise((resolve) => {
+        const parseRgbAvg = (colorStr) => {
+          const m = (colorStr || '').match(/[0-9]+/g);
+          if (!m || m.length < 3) return 0;
+          return (Number(m[0]) + Number(m[1]) + Number(m[2])) / 3;
+        };
+        const collectUnderfilled = (ctx) => Array.from(document.querySelectorAll('.mobile-hud-root button'))
+          .map((btn) => {
+            const br = btn.getBoundingClientRect();
+            const pane = btn.querySelector('.quarry-glass-pane');
+            const diff = pane ? Math.abs(btn.clientHeight - pane.clientHeight) : 0;
+            return {
+              ctx,
+              label: (btn.getAttribute('aria-label') || btn.textContent || '').trim().slice(0, 28),
+              bh: br.height > 0 ? btn.clientHeight : 0,
+              diff: +diff.toFixed(1),
+            };
+          })
+          .filter((x) => x.bh > 0 && x.diff > 1.5)
+          .map(({ ctx, label, diff }) => ({ ctx, label, diff }));
+
         document.querySelector('button.plinth-sill-mode')?.click();
         requestAnimationFrame(() => requestAnimationFrame(() => {
           const halfGemColors = Array.from(document.querySelectorAll('.half-light-grid .half-light-btn .inlaid-gem'))
             .map((el) => getComputedStyle(el).backgroundColor);
           const halfClose = document.querySelector('button[aria-label="Collapse studio tray"]');
           const halfCloseHasCrystalTone = Boolean(halfClose?.classList.contains('quarry-tone-crystal'));
+          const halfUnderfilled = collectUnderfilled('half');
           document.querySelector('button[aria-label="Expand full studio sheet"]')?.click();
           requestAnimationFrame(() => requestAnimationFrame(() => {
             const fullGemColors = Array.from(document.querySelectorAll('.atelier-btn-grid .inlaid-gem'))
@@ -1434,12 +1458,18 @@ describe('Cathedral Plinth Mobile HUD & E1–E8 Contracts', () => {
             const fullClose = document.querySelector('button[aria-label="Close studio sheet"]');
             const fullCloseHasCrystalTone = Boolean(fullClose?.classList.contains('quarry-tone-crystal'));
             const hasInvalidBtnClass = document.querySelectorAll('.quarry-btn-crystal').length > 0;
+            const fullUnderfilled = collectUnderfilled('full');
+            const headingEl = document.querySelector('#plinth-full-heading');
+            const specEl = document.querySelector('.plinth-opal-plaque .vitrail-spec');
             resolve({
               halfGemColors,
               fullGemColors,
               halfCloseHasCrystalTone,
               fullCloseHasCrystalTone,
               hasInvalidBtnClass,
+              underfilledButtons: [...halfUnderfilled, ...fullUnderfilled],
+              headingAvgRgb: headingEl ? parseRgbAvg(getComputedStyle(headingEl).color) : 0,
+              specAvgRgb: specEl ? parseRgbAvg(getComputedStyle(specEl).color) : 0,
             });
           }));
         }));
@@ -1451,6 +1481,9 @@ describe('Cathedral Plinth Mobile HUD & E1–E8 Contracts', () => {
       expect(lightingAndClose.halfCloseHasCrystalTone).toBe(true);
       expect(lightingAndClose.fullCloseHasCrystalTone).toBe(true);
       expect(lightingAndClose.hasInvalidBtnClass).toBe(false);
+      expect(lightingAndClose.underfilledButtons).toEqual([]);
+      expect(lightingAndClose.headingAvgRgb).toBeGreaterThanOrEqual(180);
+      expect(lightingAndClose.specAvgRgb).toBeGreaterThanOrEqual(150);
 
       // B. Glazier AI idempotency, Rebuild retention, Glazier AI -> Pass & Play, and Glazier AI -> Online Room -> Pass & Play
       const modeTransitions = await cdp!.evaluate<{
