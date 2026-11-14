@@ -2346,6 +2346,7 @@ export class GameEngine {
   }
 
   public setAiOpponentEnabled(enabled: boolean, difficulty?: AiDifficulty): void {
+    const wasEnabled = this.aiOpponentEnabled;
     if (difficulty) {
       this.aiDifficulty = difficulty;
       this.aiPlayerDifficulties[1] = difficulty;
@@ -2356,11 +2357,22 @@ export class GameEngine {
     if (!enabled) {
       this.aiVsAiEnabled = false;
       this.aiFastCadence = false;
+    } else {
+      this.onlineLobbyOpen = false;
     }
     this.aiOpponentEnabled = enabled;
-    this.resetAiController();
+    const alreadyActiveIn2PParty =
+      enabled &&
+      wasEnabled &&
+      !this.mpRole &&
+      Boolean(this.physics) &&
+      this.physics.gameMode === 'party' &&
+      this.physics.playerCount === 2;
+    if (!alreadyActiveIn2PParty || this.aiStage === 'scouting' || this.aiStage === 'idle') {
+      this.resetAiController();
+    }
     if (enabled && this.physics && (this.physics.gameMode !== 'party' || this.physics.playerCount !== 2)) {
-      this.resetGame('party', 2);
+      this.resetGame('party', 2, { preserveAi: true });
       return;
     }
     this.emitTelemetry(true);
@@ -3603,7 +3615,11 @@ export class GameEngine {
     }
   }
 
-  public resetGame(mode?: GameMode, players?: number): void {
+  public resetGame(
+    mode?: GameMode,
+    players?: number,
+    options?: { preserveAi?: boolean }
+  ): void {
     if (!this.physics) return;
 
     // In active Online mode, clicking Rebuild triggers a synchronized deterministic rematch
@@ -3624,12 +3640,10 @@ export class GameEngine {
     this.resetAiController();
     this.aiAbortedBlockIds.clear();
     this.aiLastBlocksStacked = 0;
-    if (mode !== undefined && mode !== 'party') {
-      this.aiOpponentEnabled = false;
-      this.aiVsAiEnabled = false;
-      this.aiFastCadence = false;
-    }
-    if (players !== undefined && players !== 2) {
+    const shouldClearAi =
+      !options?.preserveAi &&
+      (mode !== undefined || (players !== undefined && players !== 2));
+    if (shouldClearAi) {
       this.aiOpponentEnabled = false;
       this.aiVsAiEnabled = false;
       this.aiFastCadence = false;
