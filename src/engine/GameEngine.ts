@@ -15,6 +15,7 @@ import {
   PhysicsWorld,
   ShardMeshAppendEvent,
   TowerTelemetry,
+  TurnPhase,
 } from '../physics/PhysicsWorld';
 import { MujocoWorkerBridge } from '../physics/MujocoWorkerBridge';
 import { WebGPURenderer } from '../renderer/WebGPURenderer';
@@ -67,9 +68,19 @@ export interface AdversarialPlacementPlan {
   predictedMinCourseMarginDm: number;
 }
 
+export interface TouchBlockInspectInfo {
+  seq: number;
+  blockId: number;
+  swatchId: number;
+  assignedLayer: number;
+  damage: number;
+  status: 'loose' | 'snug' | 'pinned' | 'locked_top' | 'locked_support' | 'sandbox';
+}
+
 export interface VitrailHudTelemetry extends TowerTelemetry {
   aiDifficulty?: AiDifficulty;
   aiVsAiEnabled?: boolean;
+  touchInspect?: TouchBlockInspectInfo | null;
   mpActive?: boolean;
   mpRole?: MultiplayerRole | null;
   mpRoomCode?: string | null;
@@ -186,6 +197,10 @@ export class GameEngine {
     | 'pinch_pan' = 'none';
   private pendingTapHit: { blockId: number; hit: RayOBBHit } | null = null;
   private grabAnchorOrigin: Vec3 = [0, 0, 0];
+  private touchInspect: TouchBlockInspectInfo | null = null;
+  private touchInspectSeq: number = 0;
+  private pendingLockedTouchBlockId: number | null = null;
+  private lastObservedTurnPhase: TurnPhase = 'SELECT_BLOCK';
 
   public modalOpen: boolean = false;
   public onlineLobbyOpen: boolean = false;
@@ -308,6 +323,7 @@ export class GameEngine {
     this.physics = new PhysicsWorld(this.audio);
     this.authoritativePhysics = this.physics;
     this.authoritativeWorkerActive = false;
+    this.lastObservedTurnPhase = this.physics.turnPhase;
     this.camera.update(0.016, 16 / 9);
     this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
   }
@@ -424,6 +440,7 @@ export class GameEngine {
 
     this.authoritativePhysics = this.physics;
     this.authoritativeWorkerActive = this.physicsWorkerActive;
+    this.lastObservedTurnPhase = this.physics.turnPhase;
 
     if (benchScene && params) {
       const presetId = params.get('preset') ?? undefined;
@@ -498,6 +515,9 @@ export class GameEngine {
 
   private stepPhysicsAndSecondaryAcoustics(dt: number): void {
     this.physics.step(dt);
+    if (this.syncPhaseTouchInspectClear()) {
+      this.emitTelemetry(true);
+    }
 
     if ((this.physics as unknown as { isRemoteGuestMirror?: boolean }).isRemoteGuestMirror) {
       return;
@@ -624,9 +644,65 @@ export class GameEngine {
     this.rafId = requestAnimationFrame(this.tick);
   };
 
+  public setViewportBottomInset(fraction01: number): void {
+    this.camera.setViewportBottomInset(fraction01);
+  }
+
+  private syncPhaseTouchInspectClear(): boolean {
+    if (!this.physics) return false;
+    const curPhase = this.physics.turnPhase;
+    const prevPhase = this.lastObservedTurnPhase;
+    this.lastObservedTurnPhase = curPhase;
+    if (
+      this.physics.gameMode !== 'sandbox' &&
+      curPhase !== 'SELECT_BLOCK' &&
+      (prevPhase === 'SELECT_BLOCK' ||
+        this.touchInspect !== null ||
+        this.pendingLockedTouchBlockId !== null)
+    ) {
+      const changed = this.touchInspect !== null || this.pendingLockedTouchBlockId !== null;
+      this.touchInspect = null;
+      this.pendingLockedTouchBlockId = null;
+      return changed;
+    }
+    return false;
+  }
+
+  private classifyLegalTouchStatus(blockId: number): TouchBlockInspectInfo['status'] {
+    const blk = this.physics.blocks[blockId];
+    if (this.physics.gameMode === 'sandbox') {
+      return 'sandbox';
+    }
+    const w = this.physics.blockPhotoelasticWrench;
+    const wBase = blockId * 4;
+    const mean =
+      w && wBase + 2 < w.length ? (w[wBase] + w[wBase + 1] + w[wBase + 2]) / 3 : 0;
+    if (mean < 0.16 || (blk?.isLooseSlot && mean < 0.25)) {
+      return 'loose';
+    }
+    if (mean < 0.52) {
+      return 'snug';
+    }
+    return 'pinned';
+  }
+
+  private recordTouchBlockInspect(blockId: number, status: TouchBlockInspectInfo['status']): void {
+    const blk = this.physics?.blocks[blockId];
+    if (!blk) return;
+    this.touchInspect = {
+      seq: ++this.touchInspectSeq,
+      blockId: blk.id,
+      swatchId: blk.swatchId,
+      assignedLayer: blk.assignedLayer,
+      damage: blk.damage,
+      status,
+    };
+  }
+
   private emitTelemetry(force: boolean): void {
     if (!this.listener || !this.physics) return;
     void force;
+    this.syncPhaseTouchInspectClear();
     const base = this.physics.getTelemetry();
     this.listener({
       ...base,
@@ -637,6 +713,7 @@ export class GameEngine {
       aiActionLabel: this.aiActionLabel,
       polariscopeMode: this.polariscopeMode,
       physicsWorkerActive: this.physicsWorkerActive,
+      touchInspect: this.touchInspect,
       mpActive: this.mpStatus.active,
       mpRole: this.mpRole,
       mpRoomCode: this.mpRoomCode,
@@ -649,6 +726,7 @@ export class GameEngine {
   }
 
   public getTelemetrySnapshot(): VitrailHudTelemetry {
+    this.syncPhaseTouchInspectClear();
     const base = this.physics.getTelemetry();
     return {
       ...base,
@@ -659,6 +737,7 @@ export class GameEngine {
       aiActionLabel: this.aiActionLabel,
       polariscopeMode: this.polariscopeMode,
       physicsWorkerActive: this.physicsWorkerActive,
+      touchInspect: this.touchInspect,
       mpActive: this.mpStatus.active,
       mpRole: this.mpRole,
       mpRoomCode: this.mpRoomCode,
@@ -2175,10 +2254,15 @@ export class GameEngine {
 
     if (prevSeed !== this.guestWorld.roomSeed) {
       this.clearGuestLocalBlockInteraction();
+      this.touchInspect = null;
+      this.pendingLockedTouchBlockId = null;
+      this.lastObservedTurnPhase = this.guestWorld.turnPhase;
       this.updateCursorStyle();
       this.emitTelemetry(true);
       return;
     }
+
+    this.syncPhaseTouchInspectClear();
 
     if (
       prevPhase !== this.guestWorld.turnPhase ||
@@ -3566,8 +3650,11 @@ export class GameEngine {
     this.lastPinchDist = 0;
     this.lastPinchMidpoint = [0, 0];
     this.pendingTapHit = null;
+    this.touchInspect = null;
+    this.pendingLockedTouchBlockId = null;
     this.audio.updateSlideFriction(0, 0);
     this.physics.rebuildTower(mode, players);
+    this.lastObservedTurnPhase = this.physics.turnPhase;
     this.camera.resetView(27.0);
     this.updateCursorStyle();
     this.emitTelemetry(true);
@@ -3612,6 +3699,9 @@ export class GameEngine {
   ): void {
     if (!this.physics || !this.renderer) return;
 
+    this.camera.setViewportBottomInset(0);
+    this.touchInspect = null;
+    this.pendingLockedTouchBlockId = null;
     this.audio.setMuted(true);
     const preset =
       LIGHTING_PRESETS.find((p) => p.id === presetId) ?? LIGHTING_PRESETS[0];
@@ -4039,6 +4129,7 @@ export class GameEngine {
     this.camera.isUserOrbiting = false;
     this.activePointerId = null;
     this.pendingTapHit = null;
+    this.pendingLockedTouchBlockId = null;
   }
 
   public handlePointerDown(
@@ -4093,6 +4184,8 @@ export class GameEngine {
     this.pointerDownPos = [clientX, clientY];
     this.lastPointerPos = [clientX, clientY];
     this.pointerMovedDist = 0;
+    this.pendingLockedTouchBlockId = null;
+    this.syncPhaseTouchInspectClear();
 
     const rect = this.getViewportRect(overrideRect);
     const { origin, dir } = this.camera.screenToRay(clientX, clientY, rect);
@@ -4160,9 +4253,19 @@ export class GameEngine {
           this.pendingTapHit = pick;
           this.grabAnchorOrigin = [...pick.hit.worldPoint];
           this.interactionMode = 'block_pending';
+          this.pendingLockedTouchBlockId = null;
           this.updateCursorStyle();
           return;
         }
+      } else if (
+        blk &&
+        !blk.shattered &&
+        !blk.isLegalTarget &&
+        this.physics.gameMode !== 'sandbox' &&
+        this.physics.turnPhase === 'SELECT_BLOCK' &&
+        pointerType === 'touch'
+      ) {
+        this.pendingLockedTouchBlockId = pick.blockId;
       }
     }
 
@@ -4470,21 +4573,30 @@ export class GameEngine {
     } else if (this.interactionMode === 'block_pending') {
       // Pointer moved < 5.0 px: acoustic & tactile tap-test without leaving SELECT_BLOCK!
       if (this.pendingTapHit && this.canLocalPlayerManipulateBlocks()) {
+        let tapTriggered = false;
         if (this.mpRole === 'guest') {
+          const blk = this.physics.blocks[this.pendingTapHit.blockId];
           this.sendGuestRemoteCommand({
             kind: 'tap_block',
             blockId: this.pendingTapHit.blockId,
             localNormal: this.pendingTapHit.hit.localNormal,
             localPoint: this.pendingTapHit.hit.localPoint,
           });
+          tapTriggered =
+            this.physics.turnPhase === 'SELECT_BLOCK' &&
+            Boolean(blk && !blk.shattered && !blk.extracted && blk.isLegalTarget);
         } else {
           this.physics.setListenerPose(this.camera.position, this.camera.getRightVector());
-          this.physics.tapNudgeBlock(
+          tapTriggered = this.physics.tapNudgeBlock(
             this.pendingTapHit.blockId,
             this.pendingTapHit.hit.localNormal,
             this.pendingTapHit.hit.localPoint
           );
           this.mpForceImmediateSnapshot = true;
+        }
+        if (tapTriggered && pointerType === 'touch') {
+          const status = this.classifyLegalTouchStatus(this.pendingTapHit.blockId);
+          this.recordTouchBlockInspect(this.pendingTapHit.blockId, status);
         }
       }
     } else if (this.interactionMode === 'block') {
@@ -4552,12 +4664,37 @@ export class GameEngine {
           );
         }
       }
+    } else if (
+      pointerType === 'touch' &&
+      this.interactionMode === 'orbit' &&
+      this.pendingLockedTouchBlockId !== null &&
+      this.pointerMovedDist <= 8.0
+    ) {
+      const blk = this.physics.blocks[this.pendingLockedTouchBlockId];
+      const tel = this.physics.getTelemetry();
+      if (
+        blk &&
+        !blk.shattered &&
+        !blk.isLegalTarget &&
+        this.physics.gameMode !== 'sandbox' &&
+        this.physics.turnPhase === 'SELECT_BLOCK'
+      ) {
+        const rowNum = blk.assignedLayer + 1;
+        const status: TouchBlockInspectInfo['status'] =
+          tel.lockedMinRow !== null &&
+          tel.lockedMinRow < tel.currentLayers &&
+          rowNum === tel.lockedMinRow
+            ? 'locked_support'
+            : 'locked_top';
+        this.recordTouchBlockInspect(blk.id, status);
+      }
     }
 
     this.camera.isUserOrbiting = false;
     this.activePointerId = null;
     this.interactionMode = 'none';
     this.pendingTapHit = null;
+    this.pendingLockedTouchBlockId = null;
     this.updateCursorStyle();
     this.emitTelemetry(true);
   }
@@ -4566,6 +4703,7 @@ export class GameEngine {
     pointerId?: number,
     pointerType: 'mouse' | 'touch' | 'pen' = 'mouse'
   ): void {
+    const hadTouchInspect = this.touchInspect !== null;
     if (pointerId === undefined) {
       this.safeReleasePointerCapture(this.activePointerId);
       for (const touchId of this.activeTouches.keys()) {
@@ -4574,9 +4712,14 @@ export class GameEngine {
       this.activeTouches.clear();
       this.primaryTouchDownMs = -Infinity;
       this.lastPinchDist = 0;
+      this.touchInspect = null;
+      this.pendingLockedTouchBlockId = null;
       if (this.interactionMode === 'pinch_pan') {
         this.interactionMode = 'none';
         this.updateCursorStyle();
+        if (hadTouchInspect) {
+          this.emitTelemetry(true);
+        }
         return;
       }
     } else {
@@ -4590,7 +4733,12 @@ export class GameEngine {
           if (this.activeTouches.size === 0) {
             this.interactionMode = 'none';
             this.primaryTouchDownMs = -Infinity;
+            this.touchInspect = null;
+            this.pendingLockedTouchBlockId = null;
             this.updateCursorStyle();
+            if (hadTouchInspect) {
+              this.emitTelemetry(true);
+            }
           }
           return;
         }
@@ -4600,7 +4748,12 @@ export class GameEngine {
       }
     }
 
-    if (this.activePointerId === null) return;
+    if (this.activePointerId === null) {
+      if (pointerId === undefined && hadTouchInspect) {
+        this.emitTelemetry(true);
+      }
+      return;
+    }
     if (pointerId !== undefined && pointerId !== this.activePointerId) return;
     this.safeReleasePointerCapture(this.activePointerId);
 
@@ -4620,6 +4773,8 @@ export class GameEngine {
     this.activePointerId = null;
     this.interactionMode = 'none';
     this.pendingTapHit = null;
+    this.touchInspect = null;
+    this.pendingLockedTouchBlockId = null;
     this.updateCursorStyle();
     this.emitTelemetry(true);
   }
@@ -4864,6 +5019,7 @@ export class GameEngine {
   public dispose(): void {
     this.disposed = true;
     this.running = false;
+    this.camera?.setViewportBottomInset(0);
     if (typeof cancelAnimationFrame === 'function') {
       cancelAnimationFrame(this.rafId);
     }

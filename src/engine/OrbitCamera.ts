@@ -36,6 +36,17 @@ export class OrbitCamera {
   public invViewProjMatrix: Float32Array = mat4Create();
 
   public isUserOrbiting: boolean = false;
+  private targetBottomInsetFraction: number = 0;
+  private currentBottomInsetFraction: number = 0;
+
+  public setViewportBottomInset(fraction01: number): void {
+    const safe = Number.isFinite(fraction01) ? fraction01 : 0;
+    this.targetBottomInsetFraction = Math.max(0, Math.min(0.40, safe));
+  }
+
+  public getViewportBottomInset(): number {
+    return this.currentBottomInsetFraction;
+  }
 
   public resetView(towerHeightCm: number = 27.0): void {
     this.targetAzimuth = 0.64;
@@ -103,7 +114,15 @@ export class OrbitCamera {
   public update(dt: number, aspect: number): void {
     this.aspect = Math.max(0.2, aspect);
     this.effectiveFovYRad = this.computePortraitSafeFovY(this.aspect);
-    const smooth = 1.0 - Math.exp(-Math.min(1.0, dt * 14.0));
+    const clampedDt = Number.isFinite(dt) ? Math.min(1.0, Math.max(0, dt)) : 0;
+    const smooth = 1.0 - Math.exp(-Math.min(1.0, clampedDt * 14.0));
+
+    this.currentBottomInsetFraction +=
+      (this.targetBottomInsetFraction - this.currentBottomInsetFraction) *
+      (1.0 - Math.exp(-clampedDt * 12.0));
+    if (Math.abs(this.targetBottomInsetFraction - this.currentBottomInsetFraction) < 1e-4) {
+      this.currentBottomInsetFraction = this.targetBottomInsetFraction;
+    }
 
     this.azimuth += (this.targetAzimuth - this.azimuth) * smooth;
     this.elevation += (this.targetElevation - this.elevation) * smooth;
@@ -128,6 +147,7 @@ export class OrbitCamera {
 
     mat4LookAt(this.viewMatrix, this.position, this.target, [0, 1, 0]);
     mat4PerspectiveZO(this.projMatrix, this.effectiveFovYRad, this.aspect, this.near, this.far);
+    this.projMatrix[9] = -this.currentBottomInsetFraction;
     mat4Multiply(this.viewProjMatrix, this.projMatrix, this.viewMatrix);
     mat4Invert(this.invViewProjMatrix, this.viewProjMatrix);
   }
@@ -139,6 +159,8 @@ export class OrbitCamera {
     target?: Vec3,
     aspect: number = this.aspect
   ): void {
+    this.targetBottomInsetFraction = 0;
+    this.currentBottomInsetFraction = 0;
     this.azimuth = azimuth;
     this.targetAzimuth = azimuth;
     this.elevation = elevation;
