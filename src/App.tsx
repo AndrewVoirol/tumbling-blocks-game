@@ -472,7 +472,7 @@ export const App: React.FC = () => {
       engineRef.current?.leaveOnlineRoom(mode, telemetry.playerCount);
       return;
     }
-    if (wasOnlineDrawerOnly && mode === telemetry.gameMode) {
+    if (wasOnlineDrawerOnly && mode === telemetry.gameMode && !telemetry.aiOpponentEnabled) {
       return;
     }
     engineRef.current?.resetGame(mode, telemetry.playerCount);
@@ -557,6 +557,35 @@ export const App: React.FC = () => {
     setOnlineDrawerOpen(false);
     const next = !telemetry.aiOpponentEnabled;
     engineRef.current?.setAiOpponentEnabled(next, telemetry.aiDifficulty ?? 'master');
+  };
+
+  const handleSelectLocalParty = () => {
+    setOnlineDrawerOpen(false);
+    engineRef.current?.setOnlineLobbyOpen(false);
+    if (telemetry.aiOpponentEnabled) {
+      engineRef.current?.setAiOpponentEnabled(false);
+    }
+    if (telemetry.mpRole) {
+      engineRef.current?.leaveOnlineRoom('party', Math.max(2, telemetry.playerCount));
+      return;
+    }
+    if (telemetry.gameMode === 'party' && !telemetry.aiOpponentEnabled) {
+      return;
+    }
+    engineRef.current?.resetGame('party', Math.max(2, telemetry.playerCount));
+  };
+
+  const handleSelectGlazierAi = () => {
+    setOnlineDrawerOpen(false);
+    engineRef.current?.setOnlineLobbyOpen(false);
+    if (
+      !telemetry.aiOpponentEnabled ||
+      telemetry.mpRole ||
+      telemetry.gameMode !== 'party' ||
+      telemetry.playerCount !== 2
+    ) {
+      engineRef.current?.setAiOpponentEnabled(true, telemetry.aiDifficulty ?? 'master');
+    }
   };
 
   const handleSelectAiDifficulty = (difficulty: AiDifficulty) => {
@@ -801,9 +830,9 @@ export const App: React.FC = () => {
           onToggleMute={handleToggleMute}
           onSelectLightPreset={handleSelectLighting}
           onTogglePolariscope={handleTogglePolariscope}
-          onSelectMode={handleModeChange}
+          onSelectMode={(mode) => (mode === 'party' ? handleSelectLocalParty() : handleModeChange(mode))}
           onSetPlayerCount={handleSetPlayerCount}
-          onToggleVsAi={handleToggleVsAi}
+          onToggleVsAi={handleSelectGlazierAi}
           onSelectAiDifficulty={handleSelectAiDifficulty}
           onToggleOnlineDrawer={() => {
             if (onlineDrawerOpen && !isOnlineSession) {
