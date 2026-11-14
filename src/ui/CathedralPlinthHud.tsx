@@ -87,14 +87,14 @@ const SUPPRESSED_INSPECT_PHASES = new Set([
 
 function getLightPresetGemHex(presetId: string): string {
   switch (presetId) {
-    case 'noon-clerestory':
-      return '#7ec8ff';
-    case 'vesper-rose':
-      return '#ff8866';
-    case 'candleglow-vesper':
-      return '#ffbe58';
-    case 'moonlight-lancet':
-      return '#98b4ff';
+    case 'lancet-morning':
+      return '#60a5fa';
+    case 'daylight-atelier':
+      return '#f6e3a1';
+    case 'high-clerestory':
+      return '#2dd4bf';
+    case 'golden-vespers':
+      return '#f97316';
     default:
       return '#a8c8ff';
   }
@@ -632,7 +632,13 @@ export const StudioControlsContent: React.FC<{
                     autoCapitalize="characters"
                     autoCorrect="off"
                     spellCheck={false}
-                    onChange={(e) => p.onJoinCodeDraftChange(e.target.value.toUpperCase())}
+                    onChange={(e) => p.onJoinCodeDraftChange(normalizeRoomCode(e.target.value))}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && canJoin) {
+                        e.preventDefault();
+                        p.onJoinOnline();
+                      }
+                    }}
                     onFocus={(e) => {
                       e.currentTarget.scrollIntoView({ block: 'center', behavior: 'smooth' });
                     }}
@@ -1363,22 +1369,18 @@ export const CathedralPlinthHud: React.FC<CathedralPlinthHudProps> = (p) => {
               aria-label="Studio Tray"
             >
               <div className="plinth-half-header">
-                <button
+                <QuarryButton
                   ref={halfCloseBtnRef}
-                  type="button"
-                  className="quarry-btn quarry-btn-crystal plinth-half-icon-btn"
+                  tone="crystal"
+                  soundTone="default"
+                  onAudioDown={p.playUiDown}
+                  onAudioUp={p.playUiUp}
+                  className="plinth-half-icon-btn"
                   aria-label="Collapse studio tray"
-                  onClick={() => {
-                    p.playUiUp('default');
-                    setDetent('closed');
-                  }}
+                  onClick={() => setDetent('closed')}
                 >
-                  <span className="quarry-glass-pane">
-                    <span className="quarry-etch-content">
-                      <EtchedCloseSvg />
-                    </span>
-                  </span>
-                </button>
+                  <EtchedCloseSvg />
+                </QuarryButton>
 
                 <div className="plinth-half-tabs">
                   <QuarryButton
@@ -1621,22 +1623,18 @@ export const CathedralPlinthHud: React.FC<CathedralPlinthHudProps> = (p) => {
                 >
                   <span>Tray</span>
                 </QuarryButton>
-                <button
+                <QuarryButton
                   ref={fullCloseBtnRef}
-                  type="button"
-                  className="quarry-btn quarry-btn-crystal plinth-full-hdr-btn"
+                  tone="crystal"
+                  soundTone="default"
+                  onAudioDown={p.playUiDown}
+                  onAudioUp={p.playUiUp}
+                  className="plinth-full-hdr-btn"
                   aria-label="Close studio sheet"
-                  onClick={() => {
-                    p.playUiUp('default');
-                    setDetent('closed');
-                  }}
+                  onClick={() => setDetent('closed')}
                 >
-                  <span className="quarry-glass-pane">
-                    <span className="quarry-etch-content">
-                      <EtchedCloseSvg />
-                    </span>
-                  </span>
-                </button>
+                  <EtchedCloseSvg />
+                </QuarryButton>
               </div>
             </div>
 
