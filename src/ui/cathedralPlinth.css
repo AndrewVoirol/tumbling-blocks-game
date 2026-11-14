@@ -1,0 +1,995 @@
+/* ============================================================================
+ * VITRAIL — CATHEDRAL PLINTH MOBILE & COMPACT-LANDSCAPE HUD
+ * Rectangular leaded-glass quarry chrome with zero rounded pill shapes.
+ * ============================================================================ */
+
+.mobile-hud-root {
+  position: fixed;
+  inset: 0;
+  z-index: 24;
+  pointer-events: none;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mobile-hud-root[aria-hidden='true'] {
+  pointer-events: none;
+}
+
+.mobile-hud-root[data-detent='full'] .plinth-transom,
+.mobile-hud-root[data-detent='full'] .plinth-sill-assembly {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Override mobile hide rules in src/styles/index.css cleanly */
+.mobile-hud-root .mode-course-meta {
+  display: inline;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: rgba(212, 224, 240, 0.72);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mobile-hud-root .plinth-full-cartouche .margin-inlay-cell {
+  display: block;
+}
+
+.mobile-hud-root .plinth-opal-plaque .vitrail-spec {
+  display: block;
+}
+
+.mobile-hud-root .polariscope-lens-btn .quarry-etch-content {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+}
+
+.mobile-hud-root .keystone-cta {
+  height: 46px;
+  min-width: min(100%, 220px);
+}
+
+.mobile-hud-root .plinth-place-submit {
+  min-width: 84px;
+}
+
+.mobile-hud-root .quarry-btn,
+.mobile-hud-root .quarry-glass-pane,
+.mobile-hud-root .quarry-etch-content,
+.mobile-hud-root button,
+.mobile-hud-root input {
+  border-radius: 0;
+}
+
+/* ============================================================================
+ * TOP TRANSOM CREST (Non-interactive spire telemetry plaque)
+ * ============================================================================ */
+.mobile-hud-root .plinth-transom {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  z-index: 25;
+  pointer-events: none;
+}
+
+.mobile-hud-root .plinth-transom-frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.24);
+  background: linear-gradient(180deg, rgba(16, 15, 22, 0.88), rgba(10, 10, 15, 0.94));
+  box-shadow:
+    0 6px 20px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.mobile-hud-root .plinth-transom-brand {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: rgba(238, 243, 252, 0.92);
+  white-space: nowrap;
+}
+
+.mobile-hud-root .plinth-transom-sep {
+  width: 1px;
+  height: 11px;
+  background: rgba(196, 204, 218, 0.22);
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .plinth-transom-stat {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: rgba(214, 224, 240, 0.88);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mobile-hud-root .plinth-transom-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(210, 228, 248, 0.92);
+  white-space: nowrap;
+}
+
+.mobile-hud-root .plinth-transom-gem {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  transform: rotate(45deg);
+}
+
+/* ============================================================================
+ * BOTTOM PLINTH ASSEMBLY (Detents 0 & 1)
+ * ============================================================================ */
+.mobile-hud-root .plinth-sill-assembly {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 26;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 0 8px calc(8px + env(safe-area-inset-bottom, 0px));
+  pointer-events: none;
+}
+
+.mobile-hud-root .plinth-mp-banner,
+.mobile-hud-root .plinth-inspect-strip {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.26);
+  background: linear-gradient(180deg, rgba(18, 17, 24, 0.94), rgba(11, 11, 16, 0.97));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.52);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.mobile-hud-root .plinth-mp-banner {
+  border-color: rgba(239, 98, 116, 0.48);
+  background: linear-gradient(180deg, rgba(38, 14, 20, 0.95), rgba(20, 9, 13, 0.98));
+}
+
+.mobile-hud-root .plinth-mp-banner-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.3;
+  color: rgba(255, 224, 228, 0.95);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-hud-root .plinth-mp-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .plinth-banner-btn {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 10px;
+  border-radius: 0;
+  border: 1px solid rgba(255, 208, 214, 0.34);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 236, 238, 0.96);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.mobile-hud-root .plinth-banner-btn:active {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.mobile-hud-root .plinth-inspect-strip {
+  min-height: 38px;
+  padding: 6px 10px;
+  justify-content: space-between;
+}
+
+.mobile-hud-root .plinth-inspect-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mobile-hud-root .plinth-inspect-swatch {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  border-radius: 0;
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+.mobile-hud-root .plinth-inspect-course {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(235, 241, 250, 0.95);
+  white-space: nowrap;
+}
+
+.mobile-hud-root .plinth-inspect-status {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: rgba(196, 218, 244, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mobile-hud-root .plinth-inspect-crazed {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #f6b368;
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .plinth-frame {
+  position: relative;
+  pointer-events: auto;
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.26);
+  background: linear-gradient(180deg, rgba(16, 15, 22, 0.94), rgba(9, 9, 14, 0.98));
+  box-shadow:
+    0 -12px 34px rgba(0, 0, 0, 0.62),
+    inset 0 1px 0 rgba(255, 255, 255, 0.11);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  touch-action: pan-x;
+}
+
+.mobile-hud-root .plinth-frame-bg {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0.24;
+}
+
+.mobile-hud-root .plinth-swipe-cap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 16px;
+  border-bottom: 1px solid rgba(196, 204, 218, 0.12);
+  touch-action: none;
+  cursor: grab;
+}
+
+.mobile-hud-root .plinth-detent-bar {
+  width: 34px;
+  height: 3px;
+  border-radius: 0;
+  background: rgba(206, 214, 228, 0.42);
+}
+
+.mobile-hud-root .plinth-arch-apex {
+  position: absolute;
+  top: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+/* ============================================================================
+ * DETENT 1: LIVE CLERESTORY HALF-TRAY
+ * ============================================================================ */
+.mobile-hud-root .plinth-half-tray {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid rgba(196, 204, 218, 0.18);
+  background: linear-gradient(180deg, rgba(20, 19, 28, 0.95), rgba(13, 12, 19, 0.96));
+}
+
+.mobile-hud-root .plinth-half-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 6px 4px;
+  border-bottom: 1px solid rgba(196, 204, 218, 0.12);
+}
+
+.mobile-hud-root .plinth-half-tabs {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 4px;
+}
+
+.mobile-hud-root .plinth-half-tab-btn,
+.mobile-hud-root .plinth-half-icon-btn {
+  min-width: 44px;
+  min-height: 44px;
+  flex: 1 1 0;
+}
+
+.mobile-hud-root .plinth-half-icon-btn {
+  flex: 0 0 44px;
+}
+
+.mobile-hud-root .plinth-half-online-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border-bottom: 1px solid rgba(196, 204, 218, 0.14);
+  background: rgba(16, 26, 42, 0.56);
+}
+
+.mobile-hud-root .plinth-half-online-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(214, 232, 255, 0.92);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mobile-hud-root .plinth-half-online-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .plinth-half-online-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.mobile-hud-root .sheet-half-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 8px 10px;
+  max-height: min(36dvh, 290px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.mobile-hud-root .half-section-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(188, 200, 220, 0.62);
+}
+
+.mobile-hud-root .half-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(44px, 1fr));
+  gap: 4px;
+}
+
+.mobile-hud-root .half-mode-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.mobile-hud-root .half-mode-btn .quarry-etch-content {
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  padding: 0 4px;
+  justify-content: center;
+}
+
+.mobile-hud-root .half-light-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(44px, 1fr));
+  gap: 4px;
+}
+
+.mobile-hud-root .half-light-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.mobile-hud-root .half-utility-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.mobile-hud-root .half-utility-row > * {
+  flex: 1 1 0;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+/* ============================================================================
+ * DETENT 0: CLOSED SILL ROW & CONTEXTUAL GAMEPLAY BAR
+ * ============================================================================ */
+.mobile-hud-root .plinth-sill-body {
+  position: relative;
+  padding: 6px;
+}
+
+.mobile-hud-root .plinth-sill-row {
+  display: flex;
+  align-items: stretch;
+  gap: 5px;
+}
+
+.mobile-hud-root .plinth-sill-mode {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 48px;
+}
+
+.mobile-hud-root .plinth-sill-mode .quarry-glass-pane,
+.mobile-hud-root .plinth-sill-mode .quarry-etch-content {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.mobile-hud-root .plinth-sill-mode .quarry-etch-content {
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 8px;
+}
+
+.mobile-hud-root .plinth-mode-text-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.mobile-hud-root .plinth-mode-name {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: rgba(242, 246, 254, 0.96);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.mobile-hud-root .plinth-sill-action {
+  flex: 0 0 auto;
+  min-width: 48px;
+  min-height: 48px;
+}
+
+.mobile-hud-root .plinth-keystone-anchor {
+  display: contents;
+}
+
+.mobile-hud-root .plinth-sill-keystone {
+  flex: 0 0 auto;
+  min-width: 48px;
+  min-height: 48px;
+}
+
+.mobile-hud-root .plinth-status-quarry {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.24);
+  background: linear-gradient(180deg, rgba(24, 25, 36, 0.86), rgba(14, 15, 22, 0.94));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.mobile-hud-root .plinth-status-quarry-text {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: rgba(226, 236, 252, 0.92);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* EXTRACTED 5-button placement bar */
+.mobile-hud-root .plinth-place-keys {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  width: 100%;
+}
+
+.mobile-hud-root .plinth-place-btn {
+  flex: 1 1 46px;
+  min-width: 44px;
+  min-height: 48px;
+}
+
+.mobile-hud-root .plinth-place-turn90 {
+  flex: 1.15 1 56px;
+  min-width: 44px;
+  min-height: 48px;
+}
+
+.mobile-hud-root .plinth-place-submit {
+  flex: 1.55 1 88px;
+  min-width: 44px;
+  min-height: 48px;
+}
+
+.mobile-hud-root .plinth-place-label-compact {
+  display: none;
+}
+
+.mobile-hud-root .place-glyph-svg {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .place-glyph-svg svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* ============================================================================
+ * DETENT 2: FULL STUDIO MODAL DIALOG
+ * ============================================================================ */
+.mobile-hud-root .plinth-full-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding:
+    calc(env(safe-area-inset-top, 0px) + 10px)
+    8px
+    calc(env(safe-area-inset-bottom, 0px) + 8px);
+  background: rgba(6, 5, 10, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.mobile-hud-root .plinth-full-modal {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-height: min(92dvh, calc(100% - 4px));
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.28);
+  background: linear-gradient(180deg, rgba(16, 15, 22, 0.97), rgba(9, 9, 14, 0.99));
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.8),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.mobile-hud-root .plinth-full-cartouche {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid rgba(196, 204, 218, 0.16);
+  background: linear-gradient(180deg, rgba(24, 23, 33, 0.94), rgba(15, 14, 21, 0.94));
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .plinth-full-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mobile-hud-root .plinth-opal-plaque {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mobile-hud-root .plinth-full-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .plinth-full-hdr-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.mobile-hud-root .atelier-sheet-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mobile-hud-root .atelier-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(196, 204, 218, 0.12);
+}
+
+.mobile-hud-root .atelier-section:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.mobile-hud-root .atelier-section-title {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(214, 224, 240, 0.78);
+}
+
+.mobile-hud-root .atelier-btn-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(44px, 1fr));
+  gap: 6px;
+}
+
+.mobile-hud-root .atelier-btn-grid > *,
+.mobile-hud-root .atelier-row-actions > * {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.mobile-hud-root .atelier-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mobile-hud-root .atelier-row-actions > .quarry-btn {
+  flex: 1 1 110px;
+}
+
+.mobile-hud-root .online-room-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 0;
+  border: 1px solid rgba(112, 166, 255, 0.24);
+  background: rgba(14, 20, 32, 0.65);
+}
+
+.mobile-hud-root .online-join-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.mobile-hud-root #online-room-code-input {
+  flex: 1 1 110px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 10px;
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.3);
+  background: rgba(8, 9, 14, 0.92);
+  color: #f0f5ff;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+.mobile-hud-root #online-room-code-input::placeholder {
+  letter-spacing: 0.08em;
+  color: rgba(188, 200, 220, 0.45);
+}
+
+.mobile-hud-root .online-code-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(120, 178, 255, 0.24);
+  background: rgba(10, 14, 24, 0.72);
+}
+
+.mobile-hud-root .online-code-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: #e4f0ff;
+}
+
+.mobile-hud-root .online-status-copy {
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgba(210, 224, 244, 0.88);
+}
+
+.mobile-hud-root .crystal-telemetry-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mobile-hud-root .etched-plumb-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px solid rgba(196, 204, 218, 0.16);
+  background: rgba(18, 18, 26, 0.68);
+}
+
+.mobile-hud-root .etched-plumb-dial {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+}
+
+.mobile-hud-root .inlaid-plumb-jewel {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
+  margin-top: -4px;
+  border-radius: 0;
+  transform: rotate(45deg);
+  box-shadow: 0 0 8px currentColor;
+}
+
+.mobile-hud-root .etched-plumb-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-hud-root .etched-plumb-title {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(196, 204, 218, 0.65);
+}
+
+.mobile-hud-root .etched-plumb-deg {
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.mobile-hud-root .etched-plumb-status {
+  font-size: 11.5px;
+  color: rgba(214, 224, 240, 0.84);
+}
+
+.mobile-hud-root .etched-metrics-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mobile-hud-root .etched-metric-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(196, 204, 218, 0.12);
+  background: rgba(16, 16, 24, 0.52);
+}
+
+.mobile-hud-root .etched-metric-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mobile-hud-root .etched-m-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(232, 238, 250, 0.92);
+}
+
+.mobile-hud-root .etched-m-sub {
+  font-size: 10px;
+  color: rgba(188, 200, 220, 0.68);
+}
+
+.mobile-hud-root .etched-m-val {
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: rgba(240, 246, 255, 0.96);
+}
+
+/* ============================================================================
+ * E7: ULTRA-NARROW VIEWPORTS (<= 359px, e.g. 320x568 iPhone SE)
+ * ============================================================================ */
+@media (max-width: 359px) {
+  .mobile-hud-root .plinth-sill-assembly {
+    padding: 0 4px calc(6px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .mobile-hud-root .plinth-sill-body {
+    padding: 4px 2px;
+  }
+
+  .mobile-hud-root .plinth-place-keys {
+    gap: 1.5px;
+  }
+
+  .mobile-hud-root .plinth-place-btn {
+    flex: 1 1 44px;
+    min-width: 44px;
+  }
+
+  .mobile-hud-root .plinth-place-turn90 {
+    flex: 1.15 1 52px;
+    min-width: 44px;
+  }
+
+  .mobile-hud-root .plinth-place-submit {
+    flex: 1.35 1 64px;
+    min-width: 44px;
+  }
+
+  .mobile-hud-root .plinth-place-label-full {
+    display: none;
+  }
+
+  .mobile-hud-root .plinth-place-label-compact {
+    display: inline;
+  }
+
+  .mobile-hud-root .place-glyph-svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .mobile-hud-root .quarry-etch-content {
+    gap: 2.5px;
+    padding: 0 3px;
+    font-size: 10.5px;
+  }
+
+  .mobile-hud-root .half-mode-grid {
+    gap: 2px;
+  }
+
+  .mobile-hud-root .half-mode-btn .quarry-etch-content {
+    font-size: 9.5px;
+    letter-spacing: 0;
+    padding: 0 2px;
+  }
+}
+
+/* ============================================================================
+ * E7: MOBILE LANDSCAPE CENTERING & COMPACTNESS
+ * ============================================================================ */
+@media (min-width: 560px) {
+  .mobile-hud-root .plinth-sill-assembly,
+  .mobile-hud-root .plinth-inspect-strip,
+  .mobile-hud-root .plinth-mp-banner,
+  .mobile-hud-root .plinth-half-tray,
+  .mobile-hud-root .plinth-full-modal {
+    width: 100%;
+    max-width: min(100%, 560px);
+    margin-inline: auto;
+  }
+}
+
+@media (max-height: 500px) {
+  .mobile-hud-root .plinth-transom {
+    top: calc(env(safe-area-inset-top, 0px) + 4px);
+  }
+
+  .mobile-hud-root .plinth-transom-frame {
+    padding: 3px 8px;
+  }
+
+  .mobile-hud-root .plinth-sill-assembly {
+    padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .mobile-hud-root .plinth-frame {
+    padding-bottom: 0;
+  }
+
+  .mobile-hud-root .plinth-half-header {
+    padding: 4px 6px 3px;
+  }
+
+  .mobile-hud-root .sheet-half-body {
+    max-height: calc(52dvh - 54px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    gap: 5px;
+    padding: 6px 6px 8px;
+  }
+
+  .mobile-hud-root .plinth-full-modal {
+    max-height: min(92dvh, calc(100% - env(safe-area-inset-top, 0px) - 10px));
+  }
+}
+
+/* ============================================================================
+ * E9: REDUCED MOTION
+ * ============================================================================ */
+@media (prefers-reduced-motion: reduce) {
+  .mobile-hud-root,
+  .mobile-hud-root *,
+  .mobile-hud-root *::before,
+  .mobile-hud-root *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
