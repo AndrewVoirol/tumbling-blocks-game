@@ -27,6 +27,49 @@ import {
   SmashVoronoiSvg,
   VitrailSvgDefs,
 } from './ui/VitrailGlassArt';
+import { CathedralPlinthHud } from './ui/CathedralPlinthHud';
+
+const MOBILE_PLINTH_MEDIA_QUERY =
+  '(max-width: 767px), ((max-width: 960px) and (max-height: 540px))';
+
+function getInitialMobilePlinthActive(): boolean {
+  if (typeof window === 'undefined') return false;
+  const chromeParam = new URLSearchParams(window.location.search).get('chrome');
+  if (chromeParam === 'plinth') return true;
+  if (chromeParam === 'classic') return false;
+  return typeof window.matchMedia === 'function'
+    ? window.matchMedia(MOBILE_PLINTH_MEDIA_QUERY).matches
+    : false;
+}
+
+function useMobilePlinthActive(): boolean {
+  const [active, setActive] = useState<boolean>(getInitialMobilePlinthActive);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const chromeParam = new URLSearchParams(window.location.search).get('chrome');
+    if (chromeParam === 'plinth') {
+      setActive(true);
+      return;
+    }
+    if (chromeParam === 'classic') {
+      setActive(false);
+      return;
+    }
+    if (typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia(MOBILE_PLINTH_MEDIA_QUERY);
+    const update = () => setActive(mql.matches);
+    update();
+    if (typeof mql.addEventListener === 'function') {
+      mql.addEventListener('change', update);
+      return () => mql.removeEventListener('change', update);
+    }
+    mql.addListener(update);
+    return () => mql.removeListener(update);
+  }, []);
+
+  return active;
+}
 
 const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#f59e0b', '#10b981'];
 
@@ -283,14 +326,17 @@ export const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<GameEngine | null>(null);
   const guideBtnRef = useRef<HTMLButtonElement | null>(null);
+  const mobileKeystoneBtnRef = useRef<HTMLButtonElement | null>(null);
   const codexWindowRef = useRef<HTMLDivElement | null>(null);
   const codexCloseBtnRef = useRef<HTMLButtonElement | null>(null);
   const wasHelpOpenRef = useRef<boolean>(false);
+  const isMobilePlinth = useMobilePlinthActive();
 
   const [telemetry, setTelemetry] = useState<VitrailHudTelemetry>(INITIAL_TELEMETRY);
   const [muted, setMuted] = useState<boolean>(false);
   const [lightPreset, setLightPreset] = useState<string>(LIGHTING_PRESETS[0].id);
   const [showHelp, setShowHelp] = useState<boolean>(false);
+  const [mobileOverlayOpen, setMobileOverlayOpen] = useState<boolean>(false);
   const [gpuError, setGpuError] = useState<string | null>(null);
   const [onlineDrawerOpen, setOnlineDrawerOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('room')
@@ -342,12 +388,28 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  const handleBottomInsetChange = useCallback((fraction: number) => {
+    (
+      engineRef.current as unknown as { setViewportBottomInset?: (f: number) => void } | null
+    )?.setViewportBottomInset?.(fraction);
+  }, []);
+
   useEffect(() => {
-    engineRef.current?.setModalOpen(showHelp);
+    if (!isMobilePlinth) {
+      setMobileOverlayOpen(false);
+      handleBottomInsetChange(0);
+    }
+  }, [isMobilePlinth, handleBottomInsetChange]);
+
+  useEffect(() => {
+    engineRef.current?.setModalOpen(showHelp || Boolean(gpuError) || mobileOverlayOpen);
+  }, [showHelp, gpuError, mobileOverlayOpen]);
+
+  useEffect(() => {
     if (!showHelp) {
       if (wasHelpOpenRef.current) {
         wasHelpOpenRef.current = false;
-        guideBtnRef.current?.focus();
+        (guideBtnRef.current ?? mobileKeystoneBtnRef.current)?.focus();
       }
       return;
     }
@@ -446,8 +508,32 @@ export const App: React.FC = () => {
   const handleCopyInviteLink = () => {
     const url = engineRef.current?.getOnlineInviteUrl() ?? telemetry.mpRoomCode ?? '';
     if (!url) return;
+    const copyWithFallback = () => {
+      if (typeof document === 'undefined' || !document.body) return;
+      const textarea = document.createElement('textarea');
+      textarea.value = url;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '-9999px';
+      textarea.style.left = '-9999px';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      try {
+        document.execCommand('copy');
+      } catch {
+        // Ignore clipboard fallback errors in restricted environments.
+      } finally {
+        document.body.removeChild(textarea);
+      }
+    };
     if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      void navigator.clipboard.writeText(url);
+      void navigator.clipboard.writeText(url).catch(() => {
+        copyWithFallback();
+      });
+    } else {
+      copyWithFallback();
     }
     setCopiedRoomLink(true);
     if (copyFeedbackTimerRef.current !== null) {
@@ -670,7 +756,7 @@ export const App: React.FC = () => {
 
   const isBench =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('bench');
-  const isModalOverlayOpen = showHelp || Boolean(gpuError);
+  const isModalOverlayOpen = showHelp || Boolean(gpuError) || mobileOverlayOpen;
 
   return (
     <div className="app-shell" data-lighting={lightPreset}>
@@ -703,11 +789,55 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      <div
-        className="hud-layer"
-        aria-hidden={isModalOverlayOpen ? true : undefined}
-        style={{ display: isBench ? 'none' : undefined }}
-      >
+      {!isBench && isMobilePlinth ? (
+        <CathedralPlinthHud
+          telemetry={telemetry}
+          muted={muted}
+          lightPreset={lightPreset}
+          showHelp={showHelp}
+          onlineDrawerOpen={onlineDrawerOpen}
+          joinCodeDraft={joinCodeDraft}
+          copiedRoomLink={copiedRoomLink}
+          onToggleMute={handleToggleMute}
+          onSelectLightPreset={handleSelectLighting}
+          onTogglePolariscope={handleTogglePolariscope}
+          onSelectMode={handleModeChange}
+          onSetPlayerCount={handleSetPlayerCount}
+          onToggleVsAi={handleToggleVsAi}
+          onSelectAiDifficulty={handleSelectAiDifficulty}
+          onToggleOnlineDrawer={() => {
+            if (onlineDrawerOpen && !isOnlineSession) {
+              setOnlineDrawerOpen(false);
+            } else {
+              handleSelectOnlineTab();
+            }
+          }}
+          onJoinCodeDraftChange={setJoinCodeDraft}
+          onHostOnline={handleHostOnlineRoom}
+          onJoinOnline={handleJoinOnlineRoom}
+          onLeaveOnline={handleLeaveOnlineRoom}
+          onCopyInviteLink={handleCopyInviteLink}
+          onRequestOnlineRematch={() => engineRef.current?.requestOnlineRematch()}
+          onRebuild={handleRebuild}
+          onTriggerSmash={() => engineRef.current?.triggerCollapseDemo()}
+          onOpenHelp={() => setShowHelp(true)}
+          onRotateCarried={(deltaYawRad) => engineRef.current?.handleRotateCarried(deltaYawRad)}
+          onResetCarriedRotation={() => engineRef.current?.handleResetCarriedRotation()}
+          onReleaseOntoTop={() => engineRef.current?.handleReleaseOntoTop()}
+          onOverlayOpenChange={setMobileOverlayOpen}
+          onBottomInsetChange={handleBottomInsetChange}
+          isExternalModalOpen={showHelp || Boolean(gpuError)}
+          keystoneButtonRef={mobileKeystoneBtnRef}
+          playUiDown={playUiDown}
+          playUiUp={playUiUp}
+          QuarryButton={QuarryButton}
+        />
+      ) : (
+        <div
+          className="hud-layer"
+          aria-hidden={isModalOverlayOpen ? true : undefined}
+          style={{ display: isBench ? 'none' : undefined }}
+        >
         {/* Subtle oblique clerestory sunbeam cast from the left stained-glass lancet into the room */}
         <div className="lancet-sunbeam-veil" aria-hidden="true" />
 
@@ -1575,7 +1705,8 @@ export const App: React.FC = () => {
             </div>
           )}
         </div>
-      </div>
+        </div>
+      )}
 
       {/* ====================================================================
        * VITRAIL GUIDE MODAL (Inlaid Glass Medallions + Etched Crystal Sheet)
