@@ -1409,5 +1409,158 @@ describe('Cathedral Plinth Mobile HUD & E1–E8 Contracts', () => {
       expect(bannerCheck.text.length).toBeGreaterThan(0);
       expect(bannerCheck.dismissed).toBe(true);
     });
+
+    it('6. [Post-Audit Regressions] checks 4 distinct lighting gem colors, Glazier AI <-> Pass & Play <-> Online Room transitions, Rebuild AI retention, and crystal close/input normalization', async () => {
+      await resetClosedMobileState();
+
+      // A. Detent 1 & Detent 2: 4 distinct lighting gem colors + quarry-tone-crystal close buttons
+      const lightingAndClose = await cdp!.evaluate<{
+        halfGemColors: string[];
+        fullGemColors: string[];
+        halfCloseHasCrystalTone: boolean;
+        fullCloseHasCrystalTone: boolean;
+        hasInvalidBtnClass: boolean;
+      }>(`new Promise((resolve) => {
+        document.querySelector('button.plinth-sill-mode')?.click();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const halfGemColors = Array.from(document.querySelectorAll('.half-light-grid .half-light-btn .inlaid-gem'))
+            .map((el) => getComputedStyle(el).backgroundColor);
+          const halfClose = document.querySelector('button[aria-label="Collapse studio tray"]');
+          const halfCloseHasCrystalTone = Boolean(halfClose?.classList.contains('quarry-tone-crystal'));
+          document.querySelector('button[aria-label="Expand full studio sheet"]')?.click();
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            const fullGemColors = Array.from(document.querySelectorAll('.atelier-btn-grid .inlaid-gem'))
+              .map((el) => getComputedStyle(el).backgroundColor);
+            const fullClose = document.querySelector('button[aria-label="Close studio sheet"]');
+            const fullCloseHasCrystalTone = Boolean(fullClose?.classList.contains('quarry-tone-crystal'));
+            const hasInvalidBtnClass = document.querySelectorAll('.quarry-btn-crystal').length > 0;
+            resolve({
+              halfGemColors,
+              fullGemColors,
+              halfCloseHasCrystalTone,
+              fullCloseHasCrystalTone,
+              hasInvalidBtnClass,
+            });
+          }));
+        }));
+      })`);
+      expect(lightingAndClose.halfGemColors).toHaveLength(4);
+      expect(new Set(lightingAndClose.halfGemColors).size).toBe(4);
+      expect(lightingAndClose.fullGemColors).toHaveLength(4);
+      expect(new Set(lightingAndClose.fullGemColors).size).toBe(4);
+      expect(lightingAndClose.halfCloseHasCrystalTone).toBe(true);
+      expect(lightingAndClose.fullCloseHasCrystalTone).toBe(true);
+      expect(lightingAndClose.hasInvalidBtnClass).toBe(false);
+
+      // B. Glazier AI idempotency, Rebuild retention, Glazier AI -> Pass & Play, and Glazier AI -> Online Room -> Pass & Play
+      const modeTransitions = await cdp!.evaluate<{
+        aiAfterFirstClick: boolean;
+        aiAfterSecondClick: boolean;
+        aiAfterRebuild: boolean;
+        aiAfterPassPlay: boolean;
+        modeAfterPassPlay: string;
+        sillAfterPassPlay: string;
+        normalizedRoomInput: string;
+        aiAfterOnlineToPassPlay: boolean;
+        modeAfterOnlineToPassPlay: string;
+        onlineOpenAfterOnlineToPassPlay: boolean;
+        sillAfterOnlineToPassPlay: string;
+      }>(`new Promise((resolve) => {
+        const eng = window.__VITRAIL_ENGINE__;
+        const clickModeBtn = (label) => {
+          const btn = Array.from(document.querySelectorAll('.plinth-full-modal button.mode-course-btn'))
+            .find((b) => b.textContent?.includes(label));
+          btn?.click();
+        };
+
+        // Ensure Detent 2 is open
+        if (!document.querySelector('.plinth-full-modal')) {
+          document.querySelector('button.plinth-sill-keystone')?.click();
+        }
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          clickModeBtn('Glazier AI');
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            const aiAfterFirstClick = Boolean(eng.aiOpponentEnabled);
+
+            // Second click on Glazier AI must remain idempotently in AI (no toggle off)
+            clickModeBtn('Glazier AI');
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+              const aiAfterSecondClick = Boolean(eng.aiOpponentEnabled);
+
+              // Rebuild in Detent 2 preserves Glazier AI
+              document.querySelector('.plinth-full-modal button[aria-label="Rebuild 54-Prism Stained-Glass Tower"]')?.click();
+              requestAnimationFrame(() => requestAnimationFrame(() => {
+                const aiAfterRebuild = Boolean(eng.aiOpponentEnabled);
+
+                // Glazier AI -> Pass & Play clears AI and switches to 2P Pass & Play
+                clickModeBtn('Pass & Play');
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                  const aiAfterPassPlay = Boolean(eng.aiOpponentEnabled);
+                  const modeAfterPassPlay = eng.physics.gameMode;
+                  const sillAfterPassPlay = document.querySelector('button.plinth-sill-mode')?.textContent?.trim() ?? '';
+
+                  // Glazier AI -> Online Room -> verify input normalization -> Pass & Play
+                  clickModeBtn('Glazier AI');
+                  requestAnimationFrame(() => requestAnimationFrame(() => {
+                    clickModeBtn('Online Room');
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
+                      const inp = document.querySelector('#online-room-code-input');
+                      let normalizedRoomInput = '';
+                      if (inp) {
+                        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                        setter.call(inp, 'ab-c 12!');
+                        inp.dispatchEvent(new Event('input', { bubbles: true }));
+                      }
+                      requestAnimationFrame(() => {
+                        normalizedRoomInput = document.querySelector('#online-room-code-input')?.value ?? '';
+                        clickModeBtn('Pass & Play');
+                        requestAnimationFrame(() => requestAnimationFrame(() => {
+                          const aiAfterOnlineToPassPlay = Boolean(eng.aiOpponentEnabled);
+                          const modeAfterOnlineToPassPlay = eng.physics.gameMode;
+                          const onlineOpenAfterOnlineToPassPlay = Boolean(eng.onlineLobbyOpen);
+                          const sillAfterOnlineToPassPlay = document.querySelector('button.plinth-sill-mode')?.textContent?.trim() ?? '';
+
+                          // Restore Solo & close sheet
+                          clickModeBtn('Solo');
+                          requestAnimationFrame(() => {
+                            document.querySelector('button[aria-label="Close studio sheet"]')?.click();
+                            requestAnimationFrame(() => requestAnimationFrame(() => {
+                              resolve({
+                                aiAfterFirstClick,
+                                aiAfterSecondClick,
+                                aiAfterRebuild,
+                                aiAfterPassPlay,
+                                modeAfterPassPlay,
+                                sillAfterPassPlay,
+                                normalizedRoomInput,
+                                aiAfterOnlineToPassPlay,
+                                modeAfterOnlineToPassPlay,
+                                onlineOpenAfterOnlineToPassPlay,
+                                sillAfterOnlineToPassPlay,
+                              });
+                            }));
+                          });
+                        }));
+                      });
+                    }));
+                  }));
+                }));
+              }));
+            }));
+          }));
+        }));
+      })`);
+      expect(modeTransitions.aiAfterFirstClick).toBe(true);
+      expect(modeTransitions.aiAfterSecondClick).toBe(true);
+      expect(modeTransitions.aiAfterRebuild).toBe(true);
+      expect(modeTransitions.aiAfterPassPlay).toBe(false);
+      expect(modeTransitions.modeAfterPassPlay).toBe('party');
+      expect(modeTransitions.sillAfterPassPlay).toContain('2P Pass & Play');
+      expect(modeTransitions.normalizedRoomInput).toBe('ABC12');
+      expect(modeTransitions.aiAfterOnlineToPassPlay).toBe(false);
+      expect(modeTransitions.modeAfterOnlineToPassPlay).toBe('party');
+      expect(modeTransitions.onlineOpenAfterOnlineToPassPlay).toBe(false);
+      expect(modeTransitions.sillAfterOnlineToPassPlay).toContain('2P Pass & Play');
+    });
   });
 });
