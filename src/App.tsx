@@ -624,7 +624,7 @@ export const App: React.FC = () => {
       engineRef.current?.requestOnlineRematch();
       return;
     }
-    engineRef.current?.resetGame(telemetry.gameMode, telemetry.playerCount);
+    engineRef.current?.resetGame();
   };
 
   // Plumb compass jewel coordinates
