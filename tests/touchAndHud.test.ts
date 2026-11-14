@@ -1111,6 +1111,8 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
         );
 
         const report = await cdp!.evaluate<{
+          isMobilePlinth: boolean;
+          hasDesktopHud: boolean;
           undersized: Array<{ label: string; width: number; height: number }>;
           offscreen: Array<{ label: string; left: number; top: number; right: number; bottom: number }>;
           zoneOverlaps: Array<{ pair: string; area: number }>;
@@ -1122,6 +1124,9 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
             const r = el.getBoundingClientRect();
             return r.width > 0 && r.height > 0;
           };
+
+          const isMobilePlinth = Boolean(document.querySelector('.mobile-hud-root'));
+          const hasDesktopHud = Boolean(document.querySelector('.hud-layer'));
 
           const controls = Array.from(document.querySelectorAll('button, input, [role="button"], [role="radio"], [role="tab"]'))
             .filter(isVisible);
@@ -1145,11 +1150,18 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
             }
           }
 
-          const zones = [
-            ['lancet', document.querySelector('.vitrail-lancet-window')],
-            ['plate', document.querySelector('.crystal-optical-plate')],
-            ['prism', document.querySelector('.cut-glass-prism-bar')],
-          ].filter(([, el]) => el && isVisible(el));
+          const zones = (
+            isMobilePlinth
+              ? [
+                  ['transom', document.querySelector('.plinth-transom')],
+                  ['sill', document.querySelector('.plinth-sill-assembly')],
+                ]
+              : [
+                  ['lancet', document.querySelector('.vitrail-lancet-window')],
+                  ['plate', document.querySelector('.crystal-optical-plate')],
+                  ['prism', document.querySelector('.cut-glass-prism-bar')],
+                ]
+          ).filter(([, el]) => el && isVisible(el));
 
           const zoneOverlaps = [];
           for (let i = 0; i < zones.length; i++) {
@@ -1165,9 +1177,19 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
             }
           }
 
-          return { undersized, offscreen, zoneOverlaps, controlCount: controls.length };
+          return {
+            isMobilePlinth,
+            hasDesktopHud,
+            undersized,
+            offscreen,
+            zoneOverlaps,
+            controlCount: controls.length,
+          };
         })()`);
 
+        const expectMobile = vpWidth <= 767 || (vpWidth <= 960 && vpHeight <= 540);
+        expect(report.isMobilePlinth).toBe(expectMobile);
+        expect(report.hasDesktopHud).toBe(!expectMobile);
         expect(
           report.undersized,
           `${stateLabel} @ ${vpWidth}x${vpHeight} undersized controls`
@@ -1180,7 +1202,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
           report.zoneOverlaps,
           `${stateLabel} @ ${vpWidth}x${vpHeight} HUD zone overlaps`
         ).toEqual([]);
-        expect(report.controlCount).toBeGreaterThanOrEqual(10);
+        expect(report.controlCount).toBeGreaterThanOrEqual(expectMobile ? 3 : 10);
       };
 
       // State 1: Pass & Play -> AI active (Apprentice vs Master Glazier radiogroup visible!)
@@ -1259,6 +1281,18 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
 
       for (const vp of VIEWPORTS) {
         await auditViewportLayout(vp.width, vp.height, 'EXTRACTED Controls (Q / 90 R / E / 0° / Place Prism)');
+        if (vp.width === 390 && vp.height === 844) {
+          const mobileExtractedLabels = await cdp.evaluate<string[]>(`(() => {
+            return Array.from(document.querySelectorAll('.plinth-place-keys button'))
+              .map((b) => b.getAttribute('aria-label') || '');
+          })()`);
+          expect(mobileExtractedLabels.length).toBe(5);
+          expect(mobileExtractedLabels.some((s) => s.includes('counter-clockwise'))).toBe(true);
+          expect(mobileExtractedLabels.some((s) => s.includes('90 degrees'))).toBe(true);
+          expect(mobileExtractedLabels.some((s) => s.includes('Place Prism onto top course'))).toBe(true);
+          expect(mobileExtractedLabels.some((s) => s.includes('clockwise') && !s.includes('counter-clockwise'))).toBe(true);
+          expect(mobileExtractedLabels.some((s) => s.includes('Align prism to course axis'))).toBe(true);
+        }
       }
 
       // State 3: Online Room Code controls (Host, CODE input, Join) + input autofill/a11y attributes
@@ -1290,7 +1324,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
         await auditViewportLayout(vp.width, vp.height, 'Online Room Code Controls');
       }
 
-      // State 4: Polariscope pill & crystal-optical-plate strict child containment across 390x844, 844x390, 1024x1366, 1366x1024, and 1440x900 in BOTH Natural (false) & Isochromatic (true)
+      // State 4: Polariscope toggle & optical container strict child containment across 390x844, 844x390 (Cathedral Plinth Detent 1 Crystal tab), 1024x1366, 1366x1024, and 1440x900 (Desktop crystal-optical-plate) in BOTH Natural (false) & Isochromatic (true)
       await cdp.evaluate(`new Promise((resolve) => {
         const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
         const soloTab = tabs.find((el) => el.textContent?.includes('Solo'));
@@ -1298,11 +1332,11 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
         requestAnimationFrame(() => requestAnimationFrame(resolve));
       })`);
       const polariscopeViewports = [
-        { width: 390, height: 844, dpr: 3, mobile: true, expectSingleLine: false, fullOffscreenAudit: true },
-        { width: 844, height: 390, dpr: 3, mobile: true, expectSingleLine: true, fullOffscreenAudit: false },
-        { width: 1024, height: 1366, dpr: 2, mobile: true, expectSingleLine: true, fullOffscreenAudit: true },
-        { width: 1366, height: 1024, dpr: 2, mobile: true, expectSingleLine: true, fullOffscreenAudit: true },
-        { width: 1440, height: 900, dpr: 2, mobile: false, expectSingleLine: true, fullOffscreenAudit: true },
+        { width: 390, height: 844, dpr: 3, mobile: true, isMobilePlinth: true, expectSingleLine: false, fullOffscreenAudit: true },
+        { width: 844, height: 390, dpr: 3, mobile: true, isMobilePlinth: true, expectSingleLine: true, fullOffscreenAudit: false },
+        { width: 1024, height: 1366, dpr: 2, mobile: true, isMobilePlinth: false, expectSingleLine: true, fullOffscreenAudit: true },
+        { width: 1366, height: 1024, dpr: 2, mobile: true, isMobilePlinth: false, expectSingleLine: true, fullOffscreenAudit: true },
+        { width: 1440, height: 900, dpr: 2, mobile: false, isMobilePlinth: false, expectSingleLine: true, fullOffscreenAudit: true },
       ];
       for (const pvp of polariscopeViewports) {
         await cdp.send('Emulation.setDeviceMetricsOverride', {
@@ -1311,6 +1345,26 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
           deviceScaleFactor: pvp.dpr,
           mobile: pvp.mobile,
         });
+        await cdp.evaluate(`new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))`);
+
+        if (pvp.isMobilePlinth) {
+          // Closed sill audit first, then open Detent 1 ('half') -> Crystal tab for Polariscope
+          await auditViewportLayout(pvp.width, pvp.height, 'Cathedral Plinth Closed Sill');
+          const mobileTrayReady = await cdp.evaluate<boolean>(`new Promise((resolve) => {
+            const modeBtn = document.querySelector('button.plinth-sill-mode');
+            modeBtn?.click();
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+              const crystalTab = Array.from(document.querySelectorAll('button.plinth-half-tab-btn'))
+                .find((el) => el.textContent?.includes('Crystal'));
+              crystalTab?.click();
+              requestAnimationFrame(() => requestAnimationFrame(() => {
+                resolve(Boolean(document.querySelector('.plinth-half-tray') && document.querySelector('button.polariscope-lens-btn')));
+              }));
+            }));
+          })`);
+          expect(mobileTrayReady).toBe(true);
+        }
+
         for (const wantPolariscope of [false, true]) {
           const containment = await cdp.evaluate<{
             tagText: string;
@@ -1325,48 +1379,59 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
             const cur = btn?.getAttribute('aria-pressed') === 'true';
             if (cur !== ${wantPolariscope}) btn?.click();
             requestAnimationFrame(() => requestAnimationFrame(() => {
-              const plate = document.querySelector('aside.crystal-optical-plate');
               const polBtn = document.querySelector('button.polariscope-lens-btn');
-              const pane = polBtn?.querySelector('.quarry-glass-pane');
-              const content = polBtn?.querySelector('.quarry-etch-content');
-              const labelEl = content?.children?.[1];
-              const tag = polBtn?.querySelector('.polariscope-state-tag');
-              const pr = plate.getBoundingClientRect();
-              const br = polBtn.getBoundingClientRect();
-              const pnr = pane.getBoundingClientRect();
-              const lr = labelEl.getBoundingClientRect();
-              const tr = tag.getBoundingClientRect();
-              const eps = 0.5;
-              const labelCy = (lr.top + lr.bottom) * 0.5;
-              const tagCy = (tr.top + tr.bottom) * 0.5;
-              resolve({
-                tagText: (tag.textContent || '').trim(),
-                tagVisible: tr.width > 1 && tr.height > 1,
-                tagInsideBtn:
-                  tr.top >= br.top - eps &&
-                  tr.left >= br.left - eps &&
-                  tr.bottom <= br.bottom + eps &&
-                  tr.right <= br.right + eps,
-                btnInsidePlate:
-                  br.top >= pr.top - eps &&
-                  br.left >= pr.left - eps &&
-                  br.bottom <= pr.bottom + eps &&
-                  br.right <= pr.right + eps,
-                paneFillsBtn:
-                  Math.abs(pnr.height - br.height) <= 2.5 &&
-                  Math.abs(pnr.bottom - br.bottom) <= 2.0,
-                singleLineAligned: Math.abs(labelCy - tagCy) <= 4.0,
-                metrics: {
-                  plateBottom: +pr.bottom.toFixed(2),
-                  btnBottom: +br.bottom.toFixed(2),
-                  btnRight: +br.right.toFixed(2),
-                  paneHeight: +pnr.height.toFixed(2),
-                  btnHeight: +br.height.toFixed(2),
-                  tagBottom: +tr.bottom.toFixed(2),
-                  tagRight: +tr.right.toFixed(2),
-                  tagWidth: +tr.width.toFixed(2),
-                  tagHeight: +tr.height.toFixed(2),
-                },
+              polBtn?.scrollIntoView({ block: 'nearest' });
+              requestAnimationFrame(() => {
+                const container = ${pvp.isMobilePlinth
+                  ? `document.querySelector('.plinth-half-tray')`
+                  : `document.querySelector('aside.crystal-optical-plate')`};
+                const subPanel = ${pvp.isMobilePlinth
+                  ? `document.querySelector('.crystal-telemetry-panel')`
+                  : `container`};
+                const pane = polBtn?.querySelector('.quarry-glass-pane');
+                const content = polBtn?.querySelector('.quarry-etch-content');
+                const labelEl = content?.children?.[1];
+                const tag = polBtn?.querySelector('.polariscope-state-tag');
+                const pr = container.getBoundingClientRect();
+                const sr = subPanel.getBoundingClientRect();
+                const br = polBtn.getBoundingClientRect();
+                const pnr = pane.getBoundingClientRect();
+                const lr = labelEl.getBoundingClientRect();
+                const tr = tag.getBoundingClientRect();
+                const eps = 0.5;
+                const labelCy = (lr.top + lr.bottom) * 0.5;
+                const tagCy = (tr.top + tr.bottom) * 0.5;
+                resolve({
+                  tagText: (tag.textContent || '').trim(),
+                  tagVisible: tr.width > 1 && tr.height > 1,
+                  tagInsideBtn:
+                    tr.top >= br.top - eps &&
+                    tr.left >= br.left - eps &&
+                    tr.bottom <= br.bottom + eps &&
+                    tr.right <= br.right + eps,
+                  btnInsidePlate:
+                    br.top >= pr.top - eps &&
+                    br.left >= pr.left - eps &&
+                    br.bottom <= pr.bottom + eps &&
+                    br.right <= pr.right + eps &&
+                    br.left >= sr.left - eps &&
+                    br.right <= sr.right + eps,
+                  paneFillsBtn:
+                    Math.abs(pnr.height - br.height) <= 2.5 &&
+                    Math.abs(pnr.bottom - br.bottom) <= 2.0,
+                  singleLineAligned: Math.abs(labelCy - tagCy) <= 4.0,
+                  metrics: {
+                    plateBottom: +pr.bottom.toFixed(2),
+                    btnBottom: +br.bottom.toFixed(2),
+                    btnRight: +br.right.toFixed(2),
+                    paneHeight: +pnr.height.toFixed(2),
+                    btnHeight: +br.height.toFixed(2),
+                    tagBottom: +tr.bottom.toFixed(2),
+                    tagRight: +tr.right.toFixed(2),
+                    tagWidth: +tr.width.toFixed(2),
+                    tagHeight: +tr.height.toFixed(2),
+                  },
+                });
               });
             }));
           })`);
@@ -1382,7 +1447,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
           ).toBe(true);
           expect(
             containment.btnInsidePlate,
-            `polariscope btn inside plate @ ${pvp.width}x${pvp.height} (${containment.tagText}): ${JSON.stringify(containment.metrics)}`
+            `polariscope btn inside plate/tray @ ${pvp.width}x${pvp.height} (${containment.tagText}): ${JSON.stringify(containment.metrics)}`
           ).toBe(true);
           expect(
             containment.paneFillsBtn,
@@ -1401,17 +1466,16 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
               `Polariscope ${containment.tagText}`
             );
           } else {
-            // Short landscape (`844x390`, `max-height: 580px`) uses scrollable `.vitrail-lancet-window`; still enforce `0 px` top-level HUD card overlap & on-screen `crystal-optical-plate`
+            // Short landscape (`844x390`) uses scrollable `.sheet-half-body`; enforce `0 px` Plinth zone overlap & on-screen `.plinth-half-tray`
             const landscapeOverlap = await cdp.evaluate<{
-              plateInViewport: boolean;
+              trayInViewport: boolean;
               zoneOverlaps: Array<{ pair: string; area: number }>;
             }>(`(() => {
-              const plate = document.querySelector('.crystal-optical-plate');
-              const pr = plate.getBoundingClientRect();
+              const tray = document.querySelector('.plinth-half-tray') || document.querySelector('.crystal-optical-plate');
+              const pr = tray.getBoundingClientRect();
               const zones = [
-                ['lancet', document.querySelector('.vitrail-lancet-window')],
-                ['plate', plate],
-                ['prism', document.querySelector('.cut-glass-prism-bar')],
+                ['transom', document.querySelector('.plinth-transom')],
+                ['sill', document.querySelector('.plinth-sill-assembly')],
               ].filter(([, el]) => el);
               const zoneOverlaps = [];
               for (let i = 0; i < zones.length; i++) {
@@ -1425,13 +1489,23 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
                 }
               }
               return {
-                plateInViewport: pr.top >= -0.5 && pr.right <= window.innerWidth + 0.5 && pr.bottom <= window.innerHeight + 0.5,
+                trayInViewport: pr.top >= -0.5 && pr.right <= window.innerWidth + 0.5 && pr.bottom <= window.innerHeight + 0.5,
                 zoneOverlaps,
               };
             })()`);
-            expect(landscapeOverlap.plateInViewport).toBe(true);
+            expect(landscapeOverlap.trayInViewport).toBe(true);
             expect(landscapeOverlap.zoneOverlaps).toEqual([]);
           }
+        }
+
+        if (pvp.isMobilePlinth) {
+          await cdp.evaluate(`new Promise((resolve) => {
+            const btn = document.querySelector('button.polariscope-lens-btn');
+            if (btn?.getAttribute('aria-pressed') === 'true') btn.click();
+            const closeBtn = document.querySelector('button[aria-label="Collapse studio tray"]');
+            closeBtn?.click();
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+          })`);
         }
       }
       // Reset Polariscope back to Natural (`false`) before keyboard test below
