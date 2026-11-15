@@ -221,8 +221,8 @@ export class MujocoWorldCompat {
         const xM = qpos[info.qposAdr + 0];
         const yM = qpos[info.qposAdr + 1];
         const zM = qpos[info.qposAdr + 2];
-        // Wake any active sleeping shard perched above the tabletop (> 1.8 cm) or inside the column footprint (< 14 cm)
-        if (yM > -0.05 && (yM > 0.018 || xM * xM + zM * zM < 0.0196)) {
+        // Wake any active sleeping shard perched above the tabletop (> 1.35 cm, covering 1.50 cm flat bricks) or inside the column footprint (< 14 cm)
+        if (yM > -0.05 && (yM > 0.0135 || xM * xM + zM * zM < 0.0196)) {
           info.settledAsleep = false;
           info.quietTicks = 0;
           const treeId = bodyTreeId[sid];

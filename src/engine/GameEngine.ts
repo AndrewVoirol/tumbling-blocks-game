@@ -196,6 +196,7 @@ export class GameEngine {
     | 'place_top'
     | 'pinch_pan' = 'none';
   private pendingTapHit: { blockId: number; hit: RayOBBHit } | null = null;
+  private pointerDownExplicitTs: number | undefined = undefined;
   private grabAnchorOrigin: Vec3 = [0, 0, 0];
   private touchInspect: TouchBlockInspectInfo | null = null;
   private touchInspectSeq: number = 0;
@@ -3983,7 +3984,8 @@ export class GameEngine {
       return;
     }
     if (
-      (this.physics.turnPhase === 'PULLING' && this.physics.isPointerDraggingBlock) ||
+      (this.physics.isPointerDraggingBlock &&
+        (this.physics.turnPhase === 'PULLING' || this.physics.gameMode === 'sandbox')) ||
       (this.mpRole === 'guest' && this.interactionMode === 'block')
     ) {
       this.canvas.style.cursor = 'grabbing';
@@ -4198,6 +4200,7 @@ export class GameEngine {
     this.pointerDownPos = [clientX, clientY];
     this.lastPointerPos = [clientX, clientY];
     this.pointerMovedDist = 0;
+    this.pointerDownExplicitTs = timestampMs;
     this.pendingLockedTouchBlockId = null;
     this.syncPhaseTouchInspectClear();
 
@@ -4473,7 +4476,8 @@ export class GameEngine {
         const started = this.physics.startGrabBlock(
           this.pendingTapHit.blockId,
           this.pendingTapHit.hit.localPoint,
-          this.pendingTapHit.hit.worldPoint
+          this.pendingTapHit.hit.worldPoint,
+          this.pointerDownExplicitTs ?? timestampMs
         );
         if (started) {
           this.interactionMode = 'block';
@@ -4520,7 +4524,7 @@ export class GameEngine {
               this.mpPendingPullTarget = planePt;
             }
           } else {
-            this.physics.updateGrabTarget(planePt);
+            this.physics.updateGrabTarget(planePt, timestampMs);
           }
         }
       }
@@ -4639,10 +4643,10 @@ export class GameEngine {
         if (overTop && resolvedTop) {
           this.physics.updateCarriedHover(resolvedTop.synthOrigin, resolvedTop.synthDir);
         }
-        this.physics.endGrab(overTop);
+        this.physics.endGrab(overTop, timestampMs);
         this.mpForceImmediateSnapshot = true;
       } else {
-        this.physics.endGrab(false);
+        this.physics.endGrab(false, timestampMs);
         this.mpForceImmediateSnapshot = true;
       }
     } else if (

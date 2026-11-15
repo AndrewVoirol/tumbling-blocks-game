@@ -1310,7 +1310,12 @@ export class MujocoWorkerBridge {
     return true;
   }
 
-  public startGrabBlock(blockId: number, localPoint: Vec3, worldPoint: Vec3): boolean {
+  public startGrabBlock(
+    blockId: number,
+    localPoint: Vec3,
+    worldPoint: Vec3,
+    timestampMs?: number
+  ): boolean {
     const blk = this.blocks[blockId];
     if (!blk || blk.shattered) return false;
     if (this.gameMode !== 'sandbox' && (!blk.isLegalTarget || this.turnPhase !== 'SELECT_BLOCK')) {
@@ -1345,17 +1350,19 @@ export class MujocoWorkerBridge {
       blockId,
       localPoint: [...localPoint],
       worldPoint: [...worldPoint],
+      timestampMs,
     });
     return true;
   }
 
-  public updateGrabTarget(worldTargetOnPlane: Vec3): void {
+  public updateGrabTarget(worldTargetOnPlane: Vec3, timestampMs?: number): void {
     this.grabWorldAnchor = [...worldTargetOnPlane];
     this.post({
       type: 'updateGrabTarget',
       epoch: this.epoch,
       seq: ++this.commandSeq,
       worldTargetOnPlane: [...worldTargetOnPlane],
+      timestampMs,
     });
   }
 
@@ -1388,7 +1395,7 @@ export class MujocoWorkerBridge {
     });
   }
 
-  public endGrab(dropIfPoisedOverTower: boolean = false): void {
+  public endGrab(dropIfPoisedOverTower: boolean = false, timestampMs?: number): void {
     this.isPointerDraggingBlock = false;
     this.grabResistance01 = 0;
     this.grabLockUntilSeq = 0;
@@ -1411,6 +1418,7 @@ export class MujocoWorkerBridge {
       epoch: this.epoch,
       seq: ++this.commandSeq,
       dropIfPoisedOverTower,
+      timestampMs,
     });
   }
 
@@ -1639,7 +1647,9 @@ export class MujocoWorkerBridge {
           const nx = planes[p * 4 + 0];
           const ny = planes[p * 4 + 1];
           const nz = planes[p * 4 + 2];
-          const pw = planes[p * 4 + 3];
+          // `voronoiFracture.ts` encodes outer leaded block faces via negative sign (`-distFromCentroid`);
+          // take `Math.abs(...)` just like `glassShard.wgsl.ts` / `causticPass.wgsl.ts`.
+          const pw = Math.abs(planes[p * 4 + 3]);
           const num = pw - (nx * lOrig[0] + ny * lOrig[1] + nz * lOrig[2]);
           const den = nx * lDir[0] + ny * lDir[1] + nz * lDir[2];
           if (Math.abs(den) < 1e-9) {

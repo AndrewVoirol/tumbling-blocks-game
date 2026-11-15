@@ -199,12 +199,25 @@ export type WorkerInboundMessage =
       blockId: number;
       localPoint: Vec3;
       worldPoint: Vec3;
+      timestampMs?: number;
     }
-  | { type: 'updateGrabTarget'; epoch: number; seq?: number; worldTargetOnPlane: Vec3 }
+  | {
+      type: 'updateGrabTarget';
+      epoch: number;
+      seq?: number;
+      worldTargetOnPlane: Vec3;
+      timestampMs?: number;
+    }
   | { type: 'updateCarriedHover'; epoch: number; seq?: number; rayOrigin: Vec3; rayDir: Vec3 }
   | { type: 'rotateCarriedBlock'; epoch: number; seq?: number; deltaYawRad: number }
   | { type: 'resetCarriedBlockRotation'; epoch: number; seq?: number }
-  | { type: 'endGrab'; epoch: number; seq?: number; dropIfPoisedOverTower: boolean }
+  | {
+      type: 'endGrab';
+      epoch: number;
+      seq?: number;
+      dropIfPoisedOverTower: boolean;
+      timestampMs?: number;
+    }
   | { type: 'releaseExtractedBlockOntoTop'; epoch: number; seq?: number }
   | { type: 'triggerSandboxCollapseImpulse'; epoch: number; seq?: number }
   | {
@@ -728,7 +741,12 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         break;
       }
       case 'startGrabBlock': {
-        const started = engine.startGrabBlock(msg.blockId, msg.localPoint, msg.worldPoint);
+        const started = engine.startGrabBlock(
+          msg.blockId,
+          msg.localPoint,
+          msg.worldPoint,
+          msg.timestampMs
+        );
         scope.postMessage({
           type: 'grabStarted',
           epoch: workerEpoch,
@@ -740,7 +758,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         break;
       }
       case 'updateGrabTarget': {
-        engine.updateGrabTarget(msg.worldTargetOnPlane);
+        engine.updateGrabTarget(msg.worldTargetOnPlane, msg.timestampMs);
         break;
       }
       case 'updateCarriedHover': {
@@ -758,7 +776,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         break;
       }
       case 'endGrab': {
-        engine.endGrab(msg.dropIfPoisedOverTower);
+        engine.endGrab(msg.dropIfPoisedOverTower, msg.timestampMs);
         postSnapshot(false);
         break;
       }

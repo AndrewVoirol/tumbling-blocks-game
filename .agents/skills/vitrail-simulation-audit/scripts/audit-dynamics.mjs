@@ -25,8 +25,8 @@ async function runAudit() {
   try {
     const [
       { GlassAudioEngine },
-      { quatFromAxisAngle },
-      { BLOCK_HALF_Y, BLOCK_HEIGHT, BLOCK_WIDTH, TABLE_RADIUS },
+      { quatFromAxisAngle, quatInverseRotateVec3 },
+      { BLOCK_HALF_X, BLOCK_HALF_Y, BLOCK_HALF_Z, BLOCK_HEIGHT, BLOCK_WIDTH, TABLE_RADIUS },
       { ensureMujocoInitialized },
       { PhysicsWorld },
     ] = await Promise.all([
@@ -608,11 +608,246 @@ async function runAudit() {
       }
     }
 
+    // 10. Sandbox post-collapse solid cullet persistence, block-vs-shard drag plow + bevel tilt + acoustics, flick & tablecloth support-loss
+    {
+      const world = new PhysicsWorld(audio, 18, { seed: 42 });
+      world.rebuildTower('sandbox', 2, 18, 42);
+      for (let f = 0; f < 30; f++) world.step(1 / 60);
+      world.triggerSandboxCollapseImpulse();
+      for (let f = 0; f < 180; f++) world.step(1 / 60);
+
+      const onTableShards = world.shards.filter(
+        (s) => Math.hypot(s.position[0], s.position[2]) <= TABLE_RADIUS - 0.04
+      );
+      const postCollapseGhost = onTableShards.filter(
+        (s) => (world.model.geom_conaffinity[s.colliderHandle] & 0x02) === 0
+      ).length;
+
+      // Default `nudgeShard(..., 0.035)` on settled post-collapse `0x22` shards must not wipe velocity on substep 1
+      let nudgeShardKilled = 0;
+      let nudgeShardTested = 0;
+      for (const shd of onTableShards.slice(0, 12)) {
+        for (let f = 0; f < 15; f++) world.step(1 / 60);
+        nudgeShardTested++;
+        const dof = world.getWorld().getMapping(shd.bodyHandle).dofAdr;
+        world.nudgeShard(shd.id, shd.position, [1, -0.3, 0], 0.035);
+        const vBefore = Math.hypot(
+          world.data.qvel[dof],
+          world.data.qvel[dof + 1],
+          world.data.qvel[dof + 2]
+        );
+        world.step(1 / 60);
+        const vAfter = Math.hypot(
+          world.data.qvel[dof],
+          world.data.qvel[dof + 1],
+          world.data.qvel[dof + 2]
+        );
+        if (vBefore > 0.52 && vAfter < 0.01) nudgeShardKilled++;
+      }
+      for (let f = 0; f < 60; f++) world.step(1 / 60);
+
+      const rw = world.getWorld();
+      const intact = world.blocks.filter((b) => !b.shattered);
+      const pusher = intact[0];
+      for (let i = 1; i < intact.length; i++) {
+        const ang = (i / intact.length) * Math.PI * 2;
+        rw.getRigidBody(intact[i].bodyHandle).setTranslation(
+          { x: Math.cos(ang) * 3.6, y: BLOCK_HALF_Y, z: Math.sin(ang) * 3.6 },
+          true
+        );
+        rw.getRigidBody(intact[i].bodyHandle).setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      }
+      const qBroadside = quatFromAxisAngle([0, 1, 0], Math.PI * 0.5);
+      const startPos = [-1.2, BLOCK_HALF_Y, 0.0];
+      const endPos = [2.0, BLOCK_HALF_Y, 0.0];
+      rw.getRigidBody(pusher.bodyHandle).setTranslation(
+        { x: startPos[0], y: startPos[1], z: startPos[2] },
+        true
+      );
+      rw.getRigidBody(pusher.bodyHandle).setRotation(
+        { x: qBroadside[0], y: qBroadside[1], z: qBroadside[2], w: qBroadside[3] },
+        true
+      );
+      for (let f = 0; f < 45; f++) world.step(1 / 60);
+      world.consumeShardImpacts();
+
+      const corridorInit = new Map();
+      for (const s of world.shards) {
+        if (
+          s.position[0] > startPos[0] + 0.25 &&
+          s.position[0] < endPos[0] - 0.35 &&
+          Math.abs(s.position[2]) < BLOCK_HALF_X - 0.10 &&
+          s.position[1] < 0.15
+        ) {
+          corridorInit.set(s.id, [...s.position]);
+        }
+      }
+
+      world.startGrabBlock(
+        pusher.id,
+        [0, BLOCK_HALF_Y, 0],
+        [startPos[0], BLOCK_HALF_Y * 2, startPos[2]]
+      );
+      let interiorPassThroughs = 0;
+      let maxTiltDeg = 0;
+      let dragShardImpacts = 0;
+      for (let f = 1; f <= 95; f++) {
+        const u = Math.min(1, f / 75);
+        const gx = startPos[0] * (1 - u) + endPos[0] * u;
+        world.updateGrabTarget([gx, BLOCK_HALF_Y * 2, startPos[2]]);
+        world.step(1 / 60);
+        dragShardImpacts += world.consumeShardImpacts().length;
+        const r = pusher.rotation;
+        const upY = 1 - 2 * (r[0] * r[0] + r[2] * r[2]);
+        const tilt = (Math.acos(Math.max(-1, Math.min(1, Math.abs(upY)))) * 180) / Math.PI;
+        if (tilt > maxTiltDeg) maxTiltDeg = tilt;
+        for (const s of world.shards) {
+          const rel = [
+            s.position[0] - pusher.position[0],
+            s.position[1] - pusher.position[1],
+            s.position[2] - pusher.position[2],
+          ];
+          const loc = quatInverseRotateVec3(pusher.rotation, rel);
+          if (
+            Math.abs(loc[0]) < BLOCK_HALF_X - 0.04 &&
+            Math.abs(loc[1]) < BLOCK_HALF_Y - 0.025 &&
+            Math.abs(loc[2]) < BLOCK_HALF_Z - 0.03
+          ) {
+            interiorPassThroughs++;
+          }
+        }
+      }
+      world.endGrab(false);
+      for (let f = 0; f < 150; f++) world.step(1 / 60);
+
+      let movedCorridor = 0;
+      for (const [id, p0] of corridorInit) {
+        const cur = world.shards.find((s) => s.id === id);
+        if (!cur || Math.hypot(cur.position[0] - p0[0], cur.position[2] - p0[2]) > 0.05) {
+          movedCorridor++;
+        }
+      }
+      const postDragGhost = world.shards.filter(
+        (s) =>
+          Math.hypot(s.position[0], s.position[2]) <= TABLE_RADIUS - 0.04 &&
+          (world.model.geom_conaffinity[s.colliderHandle] & 0x02) === 0
+      ).length;
+      const postDragAwake = world.data.ntree_awake;
+      world.dispose();
+
+      // Perched 15 mm flat-block tablecloth snap
+      const tcWorld = new PhysicsWorld(audio, 2, { seed: 19 });
+      tcWorld.rebuildTower('sandbox', 2, 2, 19);
+      for (let f = 0; f < 25; f++) tcWorld.step(1 / 60);
+      const tcRw = tcWorld.getWorld();
+      const baseBlk = tcWorld.blocks[0];
+      for (let i = 1; i < tcWorld.blocks.length - 1; i++) {
+        tcRw
+          .getRigidBody(tcWorld.blocks[i].bodyHandle)
+          .setTranslation({ x: -2.8, y: BLOCK_HALF_Y, z: (i - 2) * 0.4 }, true);
+      }
+      tcRw.getRigidBody(baseBlk.bodyHandle).setTranslation({ x: 0, y: BLOCK_HALF_Y, z: 0 }, true);
+      tcRw.getRigidBody(baseBlk.bodyHandle).setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      const shatterBlk = tcWorld.blocks[tcWorld.blocks.length - 1];
+      tcRw
+        .getRigidBody(shatterBlk.bodyHandle)
+        .setTranslation({ x: 0, y: BLOCK_HALF_Y * 3 + 0.05, z: 0 }, true);
+      tcRw.syncKinematics();
+      tcWorld.shatterBlock(shatterBlk, [0, -BLOCK_HALF_Y, 0], 15.0, [0, 1, 0], false);
+      for (let f = 0; f < 150; f++) tcWorld.step(1 / 60);
+      const perchedBefore = tcWorld.shards.filter(
+        (s) =>
+          s.position[1] > 0.155 &&
+          Math.abs(s.position[0]) < BLOCK_HALF_X + 0.02 &&
+          Math.abs(s.position[2]) < BLOCK_HALF_Z + 0.02
+      );
+      tcRw.getRigidBody(baseBlk.bodyHandle).setLinvel({ x: 0, y: 0, z: 4.5 }, true);
+      for (let f = 0; f < 120; f++) tcWorld.step(1 / 60);
+      let unsupportedMidAir = 0;
+      for (const p of perchedBefore) {
+        const cur = tcWorld.shards.find((s) => s.id === p.id);
+        if (!cur) continue;
+        const onBase =
+          Math.abs(cur.position[0] - baseBlk.position[0]) < BLOCK_HALF_X + 0.08 &&
+          Math.abs(cur.position[2] - baseBlk.position[2]) < BLOCK_HALF_Z + 0.08;
+        if (!onBase && cur.position[1] > 0.145) unsupportedMidAir++;
+      }
+      const tableclothAwake = tcWorld.data.ntree_awake;
+      tcWorld.dispose();
+
+      // Airborne 0.2 g micro-splinter must incur 0 false anvil crazing in mid-air
+      const airWorld = new PhysicsWorld(audio, 6, { seed: 42 });
+      airWorld.rebuildTower('sandbox', 2, 6, 42);
+      for (let f = 0; f < 20; f++) airWorld.step(1 / 60);
+      const airRw = airWorld.getWorld();
+      for (let i = 2; i < airWorld.blocks.length; i++) {
+        airRw.getRigidBody(airWorld.blocks[i].bodyHandle).setTranslation({ x: -5, y: -5, z: -5 }, false);
+      }
+      airRw.getRigidBody(airWorld.blocks[1].bodyHandle).setTranslation({ x: 2.0, y: 0.2, z: 2.0 }, true);
+      airRw.syncKinematics();
+      airWorld.shatterBlock(airWorld.blocks[1], [0, 0, 0], 11.0, [0, 1, 0], false);
+      for (let f = 0; f < 60; f++) airWorld.step(1 / 60);
+      const tinySplinter = [...airWorld.shards].sort((a, b) => a.massKg - b.massKg)[0];
+      airRw.getRigidBody(tinySplinter.bodyHandle).setTranslation({ x: 0, y: 0.24, z: 0 }, true);
+      airRw.getRigidBody(tinySplinter.bodyHandle).setLinvel({ x: 0, y: 0.2, z: 0 }, true);
+      const airBlk = airWorld.blocks[0];
+      airRw.getRigidBody(airBlk.bodyHandle).setTranslation({ x: 0, y: 0.35, z: 0 }, true);
+      airRw.getRigidBody(airBlk.bodyHandle).setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      airRw.getRigidBody(airBlk.bodyHandle).setLinvel({ x: 0, y: -3.0, z: 0 }, true);
+      airWorld.step(1 / 60);
+      airWorld.step(1 / 60);
+      const airborneSplinterFalseDamage = +airBlk.damage.toFixed(3);
+      airWorld.dispose();
+
+      const plowRatio = corridorInit.size > 0 ? movedCorridor / corridorInit.size : 0;
+      const pass =
+        postCollapseGhost === 0 &&
+        nudgeShardTested >= 8 &&
+        nudgeShardKilled === 0 &&
+        corridorInit.size >= 15 &&
+        plowRatio >= 0.90 &&
+        interiorPassThroughs === 0 &&
+        maxTiltDeg >= 1.5 &&
+        maxTiltDeg <= 35.0 &&
+        dragShardImpacts >= 10 &&
+        postDragGhost === 0 &&
+        postDragAwake === 0 &&
+        perchedBefore.length >= 6 &&
+        unsupportedMidAir === 0 &&
+        tableclothAwake === 0 &&
+        airborneSplinterFalseDamage === 0;
+
+      report.sandboxBlockShardPlowAndTablecloth = {
+        pass,
+        postCollapseGhost,
+        nudgeShardTested,
+        nudgeShardKilled,
+        corridorTotal: corridorInit.size,
+        movedCorridor,
+        plowRatio: +plowRatio.toFixed(3),
+        interiorPassThroughs,
+        maxTiltDeg: +maxTiltDeg.toFixed(2),
+        dragShardImpacts,
+        postDragGhost,
+        postDragAwake,
+        perchedCount: perchedBefore.length,
+        unsupportedMidAir,
+        tableclothAwake,
+        airborneSplinterFalseDamage,
+      };
+      if (!pass) {
+        failures.push(
+          `sandboxBlockShardPlowAndTablecloth failed: ${JSON.stringify(report.sandboxBlockShardPlowAndTablecloth)}`
+        );
+      }
+    }
+
+    const totalProbes = Object.keys(report).length;
     console.log(
       JSON.stringify(
         {
           overallPass: failures.length === 0,
-          passedProbes: `${9 - failures.length}/9`,
+          passedProbes: `${totalProbes - failures.length}/${totalProbes}`,
           probes: report,
           failures,
         },

@@ -520,12 +520,27 @@ async function main() {
         world.step(1 / 60);
         collectAudio();
       }
+      let postSettleGhostCount = 0;
+      let onTableSettledShards = 0;
+      for (const shd of world.shards) {
+        if (Math.hypot(shd.position[0], shd.position[2]) <= TABLE_RADIUS - 0.02) {
+          onTableSettledShards++;
+          if ((mjModel.geom_conaffinity[shd.colliderHandle] & MJ_CONTYPE_BLOCK) === 0) {
+            postSettleGhostCount++;
+          }
+        }
+      }
       const awake = mjData.ntree_awake;
       record(
         'D4 Sandbox & 512 Pool',
-        '46-block sequential shatter (> 800 shards, 512 pool wrap, 0% ghost cullet, 100% sleep)',
-        cumulativeShards >= 800 && world.shards.length <= 512 && ghostCount === 0 && awake === 0,
-        `cumShards=${cumulativeShards}, active=${world.shards.length}/512, ghost=${ghostCount}/${checkedFresh}, awake=${awake}`
+        '46-block sequential shatter (> 800 shards, 512 pool wrap, 0% spawn & post-settle ghost cullet, 100% sleep)',
+        cumulativeShards >= 800 &&
+          world.shards.length <= 512 &&
+          ghostCount === 0 &&
+          postSettleGhostCount === 0 &&
+          onTableSettledShards > 0 &&
+          awake === 0,
+        `cumShards=${cumulativeShards}, active=${world.shards.length}/512, spawnGhost=${ghostCount}/${checkedFresh}, postSettleGhost=${postSettleGhostCount}/${onTableSettledShards}, awake=${awake}`
       );
       world.dispose();
     }
