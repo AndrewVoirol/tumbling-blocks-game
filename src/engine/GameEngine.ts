@@ -3,11 +3,13 @@ import {
   BLOCK_HALF_X,
   BLOCK_HALF_Y,
   BLOCK_HALF_Z,
+  BLOCK_HEIGHT,
   INITIAL_LAYERS,
   LIGHTING_PRESETS,
   SHARD_SLOT_STRIDE_VERTS,
   TraceryMotif,
 } from '../physics/constants';
+import type { SceneRaycastHit } from '../physics/MujocoPhysicsEngine';
 import {
   BlockCriticalityCandidate,
   ensureRapierInitialized,
@@ -196,12 +198,21 @@ export class GameEngine {
     | 'place_top'
     | 'pinch_pan' = 'none';
   private pendingTapHit: { blockId: number; hit: RayOBBHit } | null = null;
+  private pendingForegroundShardHit: SceneRaycastHit | null = null;
   private pointerDownExplicitTs: number | undefined = undefined;
   private grabAnchorOrigin: Vec3 = [0, 0, 0];
   private touchInspect: TouchBlockInspectInfo | null = null;
   private touchInspectSeq: number = 0;
   private pendingLockedTouchBlockId: number | null = null;
   private lastObservedTurnPhase: TurnPhase = 'SELECT_BLOCK';
+  private sandboxPreToppleFocusY: number = Math.max(1.32, INITIAL_LAYERS * BLOCK_HEIGHT * 0.52);
+  private sandboxHasElevatedStack: boolean = false;
+  private sandboxToppleCameraHold: boolean = false;
+  private sandboxToppleHadImpact: boolean = false;
+  private sandboxPostImpactQuietSec: number = 0;
+  private sandboxCurrentFocusY: number = Math.max(1.32, INITIAL_LAYERS * BLOCK_HEIGHT * 0.52);
+  private sandboxPostToppleSlewActive: boolean = false;
+  private lastObservedPhysCollapseActive: boolean = false;
 
   public modalOpen: boolean = false;
   public onlineLobbyOpen: boolean = false;
@@ -618,20 +629,7 @@ export class GameEngine {
     }
 
     this.pumpMultiplayerStep(nowMs);
-
-    // Smooth camera focus adjustment: frame top of tower when placing an extracted block!
-    const topSlotY =
-      this.physics.openTopSlots.length > 0
-        ? this.physics.openTopSlots[0].position[1]
-        : this.physics.currentLayers * 0.15;
-
-    if (!this.benchCameraLocked) {
-      if (this.physics.turnPhase === 'EXTRACTED') {
-        this.camera.focusTopForPlacement(topSlotY);
-      } else if (this.physics.turnPhase !== 'COLLAPSED') {
-        this.camera.setFocusHeight(Math.max(1.32, topSlotY * 0.52));
-      }
-    }
+    this.updateCameraFocusTarget(dt);
 
     if (!shouldYieldGpu && this.rendererInitialized) {
       this.renderer.render(this.physics, this.camera, this.elapsedSec);
@@ -647,6 +645,173 @@ export class GameEngine {
 
   public setViewportBottomInset(fraction01: number): void {
     this.camera.setViewportBottomInset(fraction01);
+  }
+
+  private resetSandboxCameraHoldState(towerHeightCm: number = 27.0): void {
+    const focusY = Math.max(1.32, (towerHeightCm / 10.0) * 0.52);
+    this.sandboxPreToppleFocusY = focusY;
+    this.sandboxCurrentFocusY = focusY;
+    this.sandboxHasElevatedStack = false;
+    this.sandboxToppleCameraHold = false;
+    this.sandboxToppleHadImpact = false;
+    this.sandboxPostImpactQuietSec = 0;
+    this.sandboxPostToppleSlewActive = false;
+    this.lastObservedPhysCollapseActive = false;
+  }
+
+  /**
+   * Updates camera vertical focus target, holding `sandboxPreToppleFocusY` steady (`0.0 px` jump)
+   * throughout the entire Sandbox mid-air fall, primary crash, and shard cascade until settled (`>= 0.35 s`),
+   * then slewing smoothly (`tau = 1.5 s`) to the settled rubble target.
+   */
+  public updateCameraFocusTarget(dt: number): void {
+    if (this.benchCameraLocked || !this.physics) return;
+    const clampedDt = Number.isFinite(dt) ? Math.min(0.1, Math.max(0.0, dt)) : 1.0 / 60.0;
+
+    const topSlotY =
+      this.physics.openTopSlots.length > 0
+        ? this.physics.openTopSlots[0].position[1]
+        : this.physics.currentLayers * BLOCK_HEIGHT;
+    const nominalFocusY = Math.max(1.32, topSlotY * 0.52);
+
+    if (this.physics.turnPhase === 'EXTRACTED') {
+      this.camera.focusTopForPlacement(topSlotY);
+      return;
+    }
+
+    if (this.physics.gameMode !== 'sandbox') {
+      this.sandboxHasElevatedStack = false;
+      this.sandboxToppleCameraHold = false;
+      this.sandboxToppleHadImpact = false;
+      this.sandboxPostImpactQuietSec = 0;
+      this.sandboxPostToppleSlewActive = false;
+      this.lastObservedPhysCollapseActive = false;
+      this.sandboxCurrentFocusY = nominalFocusY;
+      if (this.physics.turnPhase !== 'COLLAPSED') {
+        this.camera.setFocusHeight(nominalFocusY);
+      }
+      return;
+    }
+
+    const physObj = this.physics as unknown as {
+      sandboxCollapseActive?: boolean;
+      isSandboxCollapseActive?: boolean;
+    };
+    const physCollapseActive = Boolean(
+      physObj.isSandboxCollapseActive ?? physObj.sandboxCollapseActive
+    );
+    const physCollapseRisingEdge = physCollapseActive && !this.lastObservedPhysCollapseActive;
+    this.lastObservedPhysCollapseActive = physCollapseActive;
+
+    if (!this.sandboxToppleCameraHold) {
+      if (
+        !physCollapseActive &&
+        this.physics.leanAngleDeg < 2.8 &&
+        this.physics.currentLayers >= 5
+      ) {
+        this.sandboxPreToppleFocusY = nominalFocusY;
+        this.sandboxCurrentFocusY = nominalFocusY;
+        this.sandboxHasElevatedStack = true;
+        this.sandboxPostToppleSlewActive = false;
+      }
+
+      if (
+        (this.sandboxHasElevatedStack && this.physics.leanAngleDeg >= 3.0) ||
+        physCollapseRisingEdge ||
+        (physCollapseActive && !this.sandboxPostToppleSlewActive && !this.sandboxToppleHadImpact)
+      ) {
+        if (this.sandboxPostToppleSlewActive) {
+          this.sandboxPreToppleFocusY = this.sandboxCurrentFocusY;
+        }
+        this.sandboxToppleCameraHold = true;
+        this.sandboxToppleHadImpact = false;
+        this.sandboxPostImpactQuietSec = 0;
+        this.sandboxPostToppleSlewActive = false;
+        this.sandboxCurrentFocusY = this.sandboxPreToppleFocusY;
+      }
+    }
+
+    if (this.sandboxToppleCameraHold) {
+      this.camera.setFocusHeight(this.sandboxPreToppleFocusY);
+
+      if (
+        this.physics.shatteredCount > 0 ||
+        this.physics.currentLayers < 4 ||
+        this.physics.leanAngleDeg >= 35.0
+      ) {
+        this.sandboxToppleHadImpact = true;
+      }
+
+      let maxOnTableSpeedSim = 0;
+      for (let i = 0; i < this.physics.blocks.length; i++) {
+        const b = this.physics.blocks[i];
+        if (b.shattered || b.extracted) continue;
+        if (b.position[1] < -0.15 || Math.hypot(b.position[0], b.position[2]) > 4.45) continue;
+        const sp = Math.hypot(b.linVel[0], b.linVel[1], b.linVel[2]);
+        if (sp > maxOnTableSpeedSim) maxOnTableSpeedSim = sp;
+      }
+      for (let i = 0; i < this.physics.shards.length; i++) {
+        const s = this.physics.shards[i] as {
+          position: Vec3;
+          preLinVel?: Vec3;
+          linVel?: Vec3;
+        };
+        if (s.position[1] < -0.15 || Math.hypot(s.position[0], s.position[2]) > 4.45) continue;
+        const sv = s.preLinVel ?? s.linVel;
+        if (sv) {
+          const sp = Math.hypot(sv[0], sv[1], sv[2]);
+          if (sp > maxOnTableSpeedSim) maxOnTableSpeedSim = sp;
+        }
+      }
+
+      if (
+        !this.sandboxToppleHadImpact &&
+        !physCollapseActive &&
+        this.physics.leanAngleDeg < 2.2 &&
+        this.physics.currentLayers >= 5 &&
+        maxOnTableSpeedSim < 0.22
+      ) {
+        // Tower swayed gently past 3 deg and settled upright without toppling
+        this.sandboxToppleCameraHold = false;
+        this.sandboxCurrentFocusY = nominalFocusY;
+        return;
+      }
+
+      const collapseQuiet =
+        this.sandboxToppleHadImpact &&
+        maxOnTableSpeedSim < 0.28 &&
+        this.physics.wobbleSpeedDegPerSec < 8.0;
+      if (collapseQuiet) {
+        this.sandboxPostImpactQuietSec += clampedDt;
+      } else {
+        this.sandboxPostImpactQuietSec = 0;
+      }
+
+      if (this.sandboxPostImpactQuietSec >= 0.35) {
+        this.sandboxToppleCameraHold = false;
+        this.sandboxHasElevatedStack = false;
+        this.sandboxPostToppleSlewActive = true;
+        this.sandboxCurrentFocusY = this.sandboxPreToppleFocusY;
+      }
+      return;
+    }
+
+    if (this.sandboxPostToppleSlewActive) {
+      const diff = nominalFocusY - this.sandboxCurrentFocusY;
+      const rawStep = diff * (1.0 - Math.exp(-clampedDt / 1.5));
+      const maxStep = 0.22 * clampedDt;
+      const step = Math.max(-maxStep, Math.min(maxStep, rawStep));
+      this.sandboxCurrentFocusY += step;
+      if (Math.abs(nominalFocusY - this.sandboxCurrentFocusY) < 0.002) {
+        this.sandboxCurrentFocusY = nominalFocusY;
+        this.sandboxPostToppleSlewActive = false;
+      }
+      this.camera.setFocusHeight(this.sandboxCurrentFocusY);
+      return;
+    }
+
+    this.sandboxCurrentFocusY = nominalFocusY;
+    this.camera.setFocusHeight(nominalFocusY);
   }
 
   private syncPhaseTouchInspectClear(): boolean {
@@ -2195,6 +2360,7 @@ export class GameEngine {
     if (this.interactionMode !== 'orbit' && this.interactionMode !== 'none') {
       this.interactionMode = 'none';
       this.pendingTapHit = null;
+      this.pendingForegroundShardHit = null;
       this.activePointerId = null;
     }
   }
@@ -3665,11 +3831,13 @@ export class GameEngine {
     this.lastPinchDist = 0;
     this.lastPinchMidpoint = [0, 0];
     this.pendingTapHit = null;
+    this.pendingForegroundShardHit = null;
     this.touchInspect = null;
     this.pendingLockedTouchBlockId = null;
     this.audio.updateSlideFriction(0, 0);
     this.physics.rebuildTower(mode, players);
     this.lastObservedTurnPhase = this.physics.turnPhase;
+    this.resetSandboxCameraHoldState(27.0);
     this.camera.resetView(27.0);
     this.updateCursorStyle();
     this.emitTelemetry(true);
@@ -3863,6 +4031,16 @@ export class GameEngine {
   public triggerCollapseDemo(): void {
     if (this.mpRole) return;
     this.audio.unlock();
+    if (this.physics.gameMode === 'sandbox') {
+      if (this.sandboxPostToppleSlewActive || this.sandboxToppleCameraHold) {
+        this.sandboxPreToppleFocusY = this.sandboxCurrentFocusY;
+      }
+      this.sandboxToppleCameraHold = true;
+      this.sandboxToppleHadImpact = false;
+      this.sandboxPostImpactQuietSec = 0;
+      this.sandboxPostToppleSlewActive = false;
+      this.lastObservedPhysCollapseActive = true;
+    }
     this.physics.triggerSandboxCollapseImpulse();
     this.emitTelemetry(true);
   }
@@ -3879,6 +4057,55 @@ export class GameEngine {
       if (hit && hit.t < bestT) {
         bestT = hit.t;
         bestResult = { blockId: b.id, hit };
+      }
+    }
+    if (bestResult || this.physics.gameMode !== 'sandbox') {
+      return bestResult;
+    }
+
+    // Pass 2 (+2.5 mm Sandbox rubble OBB pick margin): catches clicks on beveled corners or foreshortened
+    // vertical/tabletop bricks while keeping tight tower-course slot picking (< 0.5 mm) 100% unchanged!
+    const paddedHalfExt: Vec3 = [
+      BLOCK_HALF_X + 0.025,
+      BLOCK_HALF_Y + 0.025,
+      BLOCK_HALF_Z + 0.025,
+    ];
+    for (let i = 0; i < this.physics.blocks.length; i++) {
+      const b = this.physics.blocks[i];
+      if (b.shattered) continue;
+      const rHorizDm = Math.hypot(b.position[0], b.position[2]);
+      const upVec = quatRotateVec3(b.rotation, [0, 1, 0]);
+      const isRubbleOrFreeBlock =
+        this.physics.currentLayers <= 2 ||
+        rHorizDm > BLOCK_HALF_X * 1.15 ||
+        b.position[1] <= BLOCK_HEIGHT * 1.35 ||
+        Math.abs(upVec[1]) < 0.96;
+      if (!isRubbleOrFreeBlock) continue;
+
+      const hit = intersectRayOBB(rayOrigin, rayDir, b.position, b.rotation, paddedHalfExt);
+      if (hit && hit.t < bestT) {
+        bestT = hit.t;
+        const clampedLocal: Vec3 = [
+          Math.max(-BLOCK_HALF_X, Math.min(BLOCK_HALF_X, hit.localPoint[0])),
+          Math.max(-BLOCK_HALF_Y, Math.min(BLOCK_HALF_Y, hit.localPoint[1])),
+          Math.max(-BLOCK_HALF_Z, Math.min(BLOCK_HALF_Z, hit.localPoint[2])),
+        ];
+        const wOff = quatRotateVec3(b.rotation, clampedLocal);
+        const clampedWorld: Vec3 = [
+          b.position[0] + wOff[0],
+          b.position[1] + wOff[1],
+          b.position[2] + wOff[2],
+        ];
+        bestResult = {
+          blockId: b.id,
+          hit: {
+            t: hit.t,
+            localPoint: clampedLocal,
+            worldPoint: clampedWorld,
+            localNormal: hit.localNormal,
+            worldNormal: hit.worldNormal,
+          },
+        };
       }
     }
     return bestResult;
@@ -3923,7 +4150,36 @@ export class GameEngine {
     const minGrazeRad = (25.0 * Math.PI) / 180.0;
 
     if (elevRad >= minGrazeRad) {
-      return this.intersectHorizontalPlane(rayOrigin, rayDir, anchorPoint[1]);
+      const absRayY = Math.abs(rayDir[1]);
+      // C^1-continuous grazing radial excursion envelope: exact 1:1 cursor tracking inside `0.72 * maxExcursionDm`
+      // (`<= 2.02 dm` at `< 10 deg` grazing, `<= 3.24 dm` at steeper angles), smoothly saturating to `2.80 dm`
+      // when `|rayDir[1]| < 0.17` and `<= 4.50 dm` across `0.17..0.32` with zero jump discontinuity!
+      const grazeU = Math.max(0.0, Math.min(1.0, (0.32 - absRayY) / 0.15));
+      const grazeS = grazeU * grazeU * (3.0 - 2.0 * grazeU);
+      const maxExcursionDm = 4.50 - (4.50 - 2.80) * grazeS;
+      const kneeDm = 0.72 * maxExcursionDm;
+      const spanDm = maxExcursionDm - kneeDm;
+
+      if (rayOrigin[1] >= anchorPoint[1] && rayDir[1] >= -0.02) {
+        const hDirLen = Math.hypot(rayDir[0], rayDir[2]);
+        if (hDirLen < 1e-5) return [anchorPoint[0], anchorPoint[1], anchorPoint[2]];
+        return [
+          anchorPoint[0] + (rayDir[0] / hDirLen) * maxExcursionDm,
+          anchorPoint[1],
+          anchorPoint[2] + (rayDir[2] / hDirLen) * maxExcursionDm,
+        ];
+      }
+      const pt = this.intersectHorizontalPlane(rayOrigin, rayDir, anchorPoint[1]);
+      if (!pt) return null;
+      const rx = pt[0] - anchorPoint[0];
+      const rz = pt[2] - anchorPoint[2];
+      const rad = Math.hypot(rx, rz);
+      if (rad > kneeDm && rad > 1e-6) {
+        const clampedRad = kneeDm + spanDm * Math.tanh((rad - kneeDm) / spanDm);
+        const s = clampedRad / rad;
+        return [anchorPoint[0] + rx * s, anchorPoint[1], anchorPoint[2] + rz * s];
+      }
+      return pt;
     }
 
     const tiltBeta = Math.min(Math.PI * 0.5, minGrazeRad - elevRad);
@@ -4145,6 +4401,7 @@ export class GameEngine {
     this.camera.isUserOrbiting = false;
     this.activePointerId = null;
     this.pendingTapHit = null;
+    this.pendingForegroundShardHit = null;
     this.pendingLockedTouchBlockId = null;
   }
 
@@ -4244,7 +4501,7 @@ export class GameEngine {
         ((blk.isLegalTarget && this.physics.turnPhase === 'SELECT_BLOCK') ||
           (!this.mpRole && this.physics.gameMode === 'sandbox'))
       ) {
-        let occludedByForegroundShard = false;
+        let fgShardToDefer: SceneRaycastHit | null = null;
         if (
           !this.mpRole &&
           this.physics.gameMode === 'sandbox' &&
@@ -4262,12 +4519,37 @@ export class GameEngine {
             includeTable: false,
             maxDistanceDm: blockHitDistDm,
           });
-          if (fgShardHit?.kind === 'shard' && fgShardHit.distanceDm < blockHitDistDm - 1e-4) {
-            occludedByForegroundShard = true;
+          let distantFgShardOccludes = false;
+          if (
+            fgShardHit?.kind === 'shard' &&
+            fgShardHit.shardId !== undefined &&
+            fgShardHit.distanceDm < blockHitDistDm - 1e-4
+          ) {
+            const isUncollapsedTowerMidAirShard =
+              this.physics.currentLayers >= 12 &&
+              this.physics.shatteredCount <= 1 &&
+              fgShardHit.worldPointDm[1] > 0.85 &&
+              blockHitDistDm - fgShardHit.distanceDm > 1.15;
+            if (isUncollapsedTowerMidAirShard) {
+              distantFgShardOccludes = true;
+            } else {
+              fgShardToDefer = fgShardHit;
+            }
           }
-        }
-        if (!occludedByForegroundShard) {
+          if (distantFgShardOccludes) {
+            fgShardToDefer = null;
+          } else {
+            this.pendingTapHit = pick;
+            this.pendingForegroundShardHit = fgShardToDefer;
+            this.grabAnchorOrigin = [...pick.hit.worldPoint];
+            this.interactionMode = 'block_pending';
+            this.pendingLockedTouchBlockId = null;
+            this.updateCursorStyle();
+            return;
+          }
+        } else {
           this.pendingTapHit = pick;
+          this.pendingForegroundShardHit = null;
           this.grabAnchorOrigin = [...pick.hit.worldPoint];
           this.interactionMode = 'block_pending';
           this.pendingLockedTouchBlockId = null;
@@ -4442,7 +4724,14 @@ export class GameEngine {
       return;
     }
 
-    if (this.interactionMode === 'block_pending' && this.pointerMovedDist >= 5.0 && this.pendingTapHit) {
+    const dragPromoteThresholdPx =
+      pointerType === 'touch' && this.pendingForegroundShardHit !== null ? 8.0 : 5.0;
+    if (
+      this.interactionMode === 'block_pending' &&
+      this.pointerMovedDist >= dragPromoteThresholdPx &&
+      this.pendingTapHit
+    ) {
+      this.pendingForegroundShardHit = null;
       if (this.mpRole === 'guest') {
         const localPt: Vec3 = [...this.pendingTapHit.hit.localPoint];
         const worldPt: Vec3 = [...this.pendingTapHit.hit.worldPoint];
@@ -4589,8 +4878,35 @@ export class GameEngine {
         }
       }
     } else if (this.interactionMode === 'block_pending') {
-      // Pointer moved < 5.0 px: acoustic & tactile tap-test without leaving SELECT_BLOCK!
-      if (this.pendingTapHit && this.canLocalPlayerManipulateBlocks()) {
+      // Pointer moved < 5.0 px: if a foreground shard occluded the intact Sandbox block, tap-flick that shard;
+      // otherwise perform acoustic & tactile tap-test on the intact block without leaving SELECT_BLOCK!
+      if (
+        this.pendingForegroundShardHit &&
+        this.pendingForegroundShardHit.shardId !== undefined &&
+        !this.mpRole &&
+        this.physics.gameMode === 'sandbox' &&
+        typeof this.physics.nudgeShard === 'function'
+      ) {
+        const fgHit = this.pendingForegroundShardHit;
+        const nudged = this.physics.nudgeShard(fgHit.shardId!, fgHit.worldPointDm, dir);
+        if (nudged) {
+          const shd = this.physics.shards.find((s) => s.id === fgHit.shardId);
+          const audioHooks = this.audio as unknown as OptionalAcousticsHooks;
+          audioHooks.playShardImpacts?.(
+            [
+              {
+                pos: fgHit.worldPointDm,
+                speed: 0.42,
+                massKg: shd?.massKg ?? 0.0025,
+                surface: 'wood',
+                slotIndex: shd?.slotIndex ?? 0,
+              },
+            ],
+            this.camera.position,
+            this.camera.getRightVector()
+          );
+        }
+      } else if (this.pendingTapHit && this.canLocalPlayerManipulateBlocks()) {
         let tapTriggered = false;
         if (this.mpRole === 'guest') {
           const blk = this.physics.blocks[this.pendingTapHit.blockId];
@@ -4712,6 +5028,7 @@ export class GameEngine {
     this.activePointerId = null;
     this.interactionMode = 'none';
     this.pendingTapHit = null;
+    this.pendingForegroundShardHit = null;
     this.pendingLockedTouchBlockId = null;
     this.updateCursorStyle();
     this.emitTelemetry(true);
@@ -4791,6 +5108,7 @@ export class GameEngine {
     this.activePointerId = null;
     this.interactionMode = 'none';
     this.pendingTapHit = null;
+    this.pendingForegroundShardHit = null;
     this.touchInspect = null;
     this.pendingLockedTouchBlockId = null;
     this.updateCursorStyle();

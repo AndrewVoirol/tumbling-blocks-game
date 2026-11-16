@@ -43,6 +43,8 @@ export interface MujocoCalibratedConfig {
   readonly contactSolref: readonly [number, number];
   /** Underdamped Voronoi glass-shard contact `solref = [timeconst_sec, dampratio]` (`>= 2/360 s` for 3D chatter & bounce) */
   readonly shardSolref: readonly [number, number];
+  /** Compliant Voronoi shard `solimp = [d0, dwidth, width_m, midpoint, power]` preventing sub-gram hydraulic pinch singularities */
+  readonly shardSolimp?: readonly [number, number, number, number, number];
   /** Contact normal/frictional `solimp = [d0, dwidth, width_m, midpoint, power]` */
   readonly contactSolimp: readonly [number, number, number, number, number];
   /** Independent tangential friction `solreffriction = [timeconst_sec, dampratio]` */
@@ -95,6 +97,7 @@ export const MUJOCO_CALIBRATED_CONFIG: MujocoCalibratedConfig = {
   contactSolref: [0.0042, 1.12],
   // Underdamped glass shard bounce (`timeconst = 6.0 ms > 2 * 1/360 s`, `zeta = 0.48` -> e ≈ 0.18 glass restitution)
   shardSolref: [0.0060, 0.48],
+  shardSolimp: [0.962, 0.990, 0.0008, 0.5, 2.0],
   contactSolimp: [0.9945, 0.9995, 0.00022, 0.5, 2.0],
   contactSolrefFriction: [0.0045, 1.18],
 

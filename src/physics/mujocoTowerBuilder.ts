@@ -394,6 +394,8 @@ export function buildMujocoTowerXml(
   const fShard = `${cfg.shardFriction[0]} ${cfg.shardFriction[1]} ${cfg.shardFriction[2]}`;
   const solref = `${cfg.contactSolref[0]} ${cfg.contactSolref[1]}`;
   const shardSolref = `${cfg.shardSolref[0]} ${cfg.shardSolref[1]}`;
+  const shardImp = cfg.shardSolimp ?? [0.93, 0.972, 0.0015, 0.5, 2.0];
+  const shardSolimp = `${shardImp[0]} ${shardImp[1]} ${shardImp[2]} ${shardImp[3]} ${shardImp[4]}`;
   const solimp = `${cfg.contactSolimp[0]} ${cfg.contactSolimp[1]} ${cfg.contactSolimp[2]} ${cfg.contactSolimp[3]} ${cfg.contactSolimp[4]}`;
   const grabSolref = `${cfg.grabConnectSolref[0]} ${cfg.grabConnectSolref[1]}`;
   const grabSolimp = `${cfg.grabConnectSolimp[0]} ${cfg.grabConnectSolimp[1]} ${cfg.grabConnectSolimp[2]} ${cfg.grabConnectSolimp[3]} ${cfg.grabConnectSolimp[4]}`;
@@ -476,7 +478,7 @@ export function buildMujocoTowerXml(
       `    <body name="shd_${s}" pos="${parkXM.toFixed(4)} ${parkYM.toFixed(4)} ${parkZM.toFixed(4)}" sleep="init">` +
         `<inertial pos="0 0 0" quat="1 0 0 0" mass="0.0045" diaginertia="1e-6 1e-6 1e-6"/>` +
         `<freejoint/>` +
-        `<geom name="g_shd_${s}" group="${MJ_GEOM_GROUP_PARKED}" type="mesh" mesh="voronoi_arch_${archIdx}" condim="3" friction="${fShard}" solref="${solref}" solimp="${solimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
+        `<geom name="g_shd_${s}" group="${MJ_GEOM_GROUP_PARKED}" type="mesh" mesh="voronoi_arch_${archIdx}" condim="3" solmix="1.8" friction="${fShard}" solref="0.0052 0.86" solimp="${shardSolimp}" contype="0" conaffinity="${MJ_CONAFFINITY_PARKING}"/>` +
         `</body>`
     );
   }
@@ -521,7 +523,7 @@ ${voronoiBank.xmlAssets}  </asset>
   <worldbody>
     <geom name="oak_table" group="${MJ_GEOM_GROUP_TABLE}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="6" friction="${fTable}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_TABLE}" conaffinity="${MJ_CONAFFINITY_TABLE}"/>
     <geom name="parking_shelf" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="3" friction="1.0 0.02 0.01" priority="10" solref="0.008 1.35" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
-    <geom name="oak_table_shard" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${solimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
+    <geom name="oak_table_shard" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${shardSolimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
     <body name="hand_anchor" mocap="true" pos="0 2.0 0"/>
 ${bodyXmlChunks.join('\n')}
   </worldbody>

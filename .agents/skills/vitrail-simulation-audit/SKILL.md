@@ -9,13 +9,13 @@ description: >-
 
 # Vitrail Simulation Mastery & Swarm Audit Playbook
 
-Use this playbook and its executable 9-probe dynamical harness (`scripts/audit-dynamics.mjs`) to verify physical accuracy across continuous AND multi-stage stateful trajectories—catching defects that single-shot endpoint unit tests miss—and to partition multi-agent `swarm` work cleanly without file collisions.
+Use this playbook and its executable 10-probe dynamical harness (`scripts/audit-dynamics.mjs`) to verify physical accuracy across continuous AND multi-stage stateful trajectories—catching defects that single-shot endpoint unit tests miss—and to partition multi-agent `swarm` work cleanly without file collisions.
 
 ---
 
 ## 1. Fast Verification Pipeline (Run Before & After Any Simulation Change)
 
-1. **9-Probe Continuous & Multi-Stage Dynamics Harness (`~7 s`, exits `1` on any regression)**:
+1. **10-Probe Continuous & Multi-Stage Dynamics Harness (`~8 s`, exits `1` on any regression)**:
    ```bash
    node .agents/skills/vitrail-simulation-audit/scripts/audit-dynamics.mjs
    ```
@@ -29,6 +29,7 @@ Use this playbook and its executable 9-probe dynamical harness (`scripts/audit-d
    - `multiStageSupportLossAndTelemetry`: Multi-stage Sandbox play (shatter upper courses so Voronoi shards sleep perched at `y ~ 20–22 cm` + rest 1 crooked `22°` top-notch outlier block -> verify consensus `leanAngleDeg < 2.0°` -> buckle/shatter supporting tower underneath -> verify `0` unsupported elevated shards freeze in mid-air and HUD telemetry transitions cleanly to `currentLayers = 0` / `Toppled`).
    - `postCollapse100PctSleepAndSilence`: Sandbox `18L` collapse reaches `ntree_awake === 0` (`<= 2.4 s`) with `0` post-`1.6 s` `wobbleRock` / `glassImpact` buzz (`condim="3"` frictioned `parking_shelf`, invariant `multiccd="enable"`).
    - `fulcrumSeesawAndClampedWobbleIsolation`: `6.5°` rubble fulcrum seesaw rocks (`>= 5` flips, `>= 3` `wobbleRock` on seesaw, `0` on fulcrum) and sleeps, while clamped Layer-1 bearing blocks (`>= 1.1 N` top load) emit `0` false wobbles.
+   - `sandboxBlockShardPlowAndTablecloth`: `0` post-collapse & post-drag `0x20` ghost cullet (`conaffinity === 0x22` on table), `12/12` `nudgeShard` tap-to-flick survival, `100%` corridor shard snowplow (`interiorPassThroughs === 0`), `2°–11°` bevel sled climb, preserved top-deck hero shards for Tablecloth Pull, and `0` airborne splinter false block damage.
 2. **MuJoCo 4.0 Calibration Scorecard (`8/8` Gates, `~5 s`)**:
    ```bash
    npm run calibrate:physics
@@ -41,9 +42,9 @@ Use this playbook and its executable 9-probe dynamical harness (`scripts/audit-d
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `64/64` Vitest Suite (`8` suites: `T1–T9`, `C1–C8`, `6` Faithful-Glass Fidelity Checks, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
+5. **Complete `74/74` Vitest Suite (`9` suites: `T1–T9`, `C1–C8`, `10` Faithful-Glass & Sandbox Checks `M1–M10`, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `6` Mobile Plinth, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
    ```bash
-   npx vitest run
+   npx vitest run --maxWorkers=3
    npm run eval:preship
    npm run verify:mp:live
    node scripts/fuzz-stateful-trajectories.mjs --seeds 500 --actions 80
@@ -78,8 +79,9 @@ When running a native `swarm` (`workspace: "share"` for concurrent authors, `wor
 
 ---
 
-## 4. Eye-and-Ear Realism & Two-Sided Physics/Audio Invariants (`M1–M6` + `eval:preship`)
+## 4. Eye-and-Ear Realism & Two-Sided Physics/Audio Invariants (`M1–M10` + `eval:preship`)
 
 1. **Unloaded Rebound vs. Spawn Silence (`M1`)**: Assert `>= 1.15–1.7 mm` crisp rebound on `10–12 mm` unloaded oak drops paired `1:1` with `hasOnsetContact` impulses (`0` timer buzz), while gating only `< 0.30 s` initial stack spawn audio (`inInitialTowerSpawnSettle`, `settleClinks = 0`) without damping physics across `12L–30L` towers.
 2. **Free Extraction Tribology, Cullet Masks & Substrate Audio (`M2–M4`)**: Reject artificial slot-rail/pitch locks (`78%` / `0.94`), kinetic drop below `μk = 0.215`, phantom air clinks, `0x20` ghosting cullet (require `0x22` on-table / `0x02` off-rim), and `-8%` oak modal detuning (`2865 Hz` glass prism modes stay substrate-invariant + coupled `95–135 Hz` white-oak plate thud).
 3. **Worker Interpolation, Multi-Domain Fuzzer & Invariant `multiccd` (`M5–M6`)**: Verify `getRenderPoseAlpha` slerp (`120 Hz` parity), `>= 500 Hz / >= 14` iters collapse stability on MT, static `0.275` breakaway friction inside `mj_copyState` rollouts, Glazier AI `currentLayers - 5` top-course guard + `>= 0.30 s && movedDm < 0.32` bind abort, 3D `speed3d < 0.12` off-rim checks, and invariant `multiccd="enable"` (never toggle `mjDSBL_MULTICCD` off on beveled prisms; scale cascades via timestep/iterations + local pre-substep velocity passivity).
+4. **Sandbox Shard Plowing, 2-Zone Grip, Jaw-Pinch Re-Solidification & Collapse Continuity (`M7–M10`)**: Keep `Math.abs(planes[p*4+3])` worker Voronoi raycasts, `'block_pending'` foreground-shard disambiguation (`0%` orbit hijack), `0.00 mm` `eq_data` tether parity (never steering yaw to `curMoveYaw`), `< 0.8 N` mid-pile pause bleed (`grabPausedLeadCapDm`), `0` post-settle ghost cullet after `0.20 s` multi-block jaw-pinch escape, `isAxialColumnSettle` `15 mm` column-drop guard, live standing-column-only $C^1$ `tanh` buckle, and latched `sandboxPreToppleFocusY` (`0.0 px` mid-fall camera jump + smooth post-settle slew across worker snapshots).

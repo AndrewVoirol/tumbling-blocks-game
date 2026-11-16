@@ -139,6 +139,7 @@ export class MujocoWorkerBridge {
   public liveHeightCm: number = INITIAL_LAYERS * BLOCK_HEIGHT * 10;
   public peakHeightCm: number = INITIAL_LAYERS * BLOCK_HEIGHT * 10;
   public lockedMinRow: number | null = INITIAL_LAYERS;
+  public sandboxCollapseActive: boolean = false;
 
   private worker: WorkerEndpointLike;
   private audio: GlassAudioEngine;
@@ -146,6 +147,7 @@ export class MujocoWorkerBridge {
   private commandSeq: number = 0;
   private grabLockUntilSeq: number = 0;
   private releaseLockUntilSeq: number = 0;
+  private sandboxCollapseLatchUntilSeq: number = 0;
   private preGrabTurnPhase: TurnPhase = 'SELECT_BLOCK';
   private simTime: number = 0;
   private initialLayers: number = INITIAL_LAYERS;
@@ -300,7 +302,7 @@ export class MujocoWorkerBridge {
     const t = nowMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
     const elapsed = t - this.lastSnapArrivalMs;
     if (elapsed < 0) return 0.0;
-    if (elapsed > 90) return 1.0;
+    if (elapsed > 140) return 1.0;
     const denom = Math.max(6.5, this.ewmaSnapIntervalMs * 1.12);
     return Math.min(1.0, Math.max(0.0, elapsed / denom));
   }
@@ -413,8 +415,10 @@ export class MujocoWorkerBridge {
     } else {
       if (this.lastSnapArrivalMs > 0) {
         const dtSnap = nowMs - this.lastSnapArrivalMs;
-        if (dtSnap >= 2 && dtSnap <= 60) {
-          this.ewmaSnapIntervalMs = this.ewmaSnapIntervalMs * 0.72 + dtSnap * 0.28;
+        if (dtSnap >= 6 && dtSnap <= 125) {
+          const alphaEwma = dtSnap > this.ewmaSnapIntervalMs ? 0.65 : 0.28;
+          this.ewmaSnapIntervalMs =
+            this.ewmaSnapIntervalMs * (1.0 - alphaEwma) + dtSnap * alphaEwma;
         }
       }
       this.prevSnapArrivalMs = this.lastSnapArrivalMs;
@@ -646,6 +650,14 @@ export class MujocoWorkerBridge {
     this.liveHeightCm = snap.liveHeightCm;
     this.peakHeightCm = snap.peakHeightCm;
     this.lockedMinRow = snap.lockedMinRow;
+    if (this.sandboxCollapseLatchUntilSeq > 0) {
+      if (ackSeq >= this.sandboxCollapseLatchUntilSeq) {
+        this.sandboxCollapseLatchUntilSeq = 0;
+        this.sandboxCollapseActive = Boolean(snap.sandboxCollapseActive);
+      }
+    } else if (snap.sandboxCollapseActive !== undefined) {
+      this.sandboxCollapseActive = snap.sandboxCollapseActive;
+    }
 
     this.replayAudioEvents(snap.audioEvents);
   }
@@ -826,7 +838,7 @@ export class MujocoWorkerBridge {
     }
 
     if (this.stepInFlight) {
-      this.accumDtWhileInFlight = Math.min(0.085, this.accumDtWhileInFlight + frameDt);
+      this.accumDtWhileInFlight = Math.min(0.16, this.accumDtWhileInFlight + frameDt);
       this.lastStepResult = {
         substeps: 0,
         simTime: this.simTime,
@@ -835,8 +847,12 @@ export class MujocoWorkerBridge {
       };
       return this.lastStepResult;
     }
-    const totalDt = Math.min(0.085, frameDt + this.accumDtWhileInFlight);
-    this.accumDtWhileInFlight = 0;
+    const pendingDt = Math.min(0.16, frameDt + this.accumDtWhileInFlight);
+    // Cap per-message worker slice to <= 46 ms (~2.7 frames) when catching up from an in-flight fracture spike
+    // so the worker maintains 1.00x real-time simulation speed AND >= 25-45 Hz snapshots instead of 85 ms mega-batches,
+    // while keeping single `step(1/60 = 16.7 ms)` calls 100% synchronous and unsplit!
+    const totalDt = this.accumDtWhileInFlight > 0.012 ? Math.min(0.046, pendingDt) : Math.min(0.085, pendingDt);
+    this.accumDtWhileInFlight = Math.max(0, pendingDt - totalDt);
     this.stepInFlight = true;
     this.post({
       type: 'step',
@@ -908,6 +924,8 @@ export class MujocoWorkerBridge {
     this.liveHeightCm = +(targetLayers * BLOCK_HEIGHT * 10).toFixed(1);
     this.peakHeightCm = this.liveHeightCm;
     this.lockedMinRow = this.gameMode === 'sandbox' ? null : targetLayers;
+    this.sandboxCollapseActive = false;
+    this.sandboxCollapseLatchUntilSeq = 0;
     this.latestTelemetry = null;
     this.solverWarningCount = 0;
     this.mechanicalEnergyJ = this.blocks.reduce(
@@ -1446,10 +1464,13 @@ export class MujocoWorkerBridge {
   }
 
   public triggerSandboxCollapseImpulse(): void {
+    const seq = ++this.commandSeq;
+    this.sandboxCollapseActive = true;
+    this.sandboxCollapseLatchUntilSeq = seq;
     this.post({
       type: 'triggerSandboxCollapseImpulse',
       epoch: this.epoch,
-      seq: ++this.commandSeq,
+      seq,
     });
   }
 
@@ -1546,82 +1567,106 @@ export class MujocoWorkerBridge {
     let bestHit: SceneRaycastHit | null = null;
 
     if (includeBlocks) {
-      const hx = BLOCK_HALF_X - 0.0008;
-      const hz = BLOCK_HALF_Z - 0.0014;
-      for (let i = 0; i < this.blocks.length; i++) {
-        const b = this.blocks[i];
-        if (b.shattered) continue;
-        if (b.extracted && this.activeBlockId !== b.id) continue;
-        const hy =
-          b.isLooseSlot && b.assignedLayer < this.initialLayers - 1
-            ? BLOCK_HALF_Y - 0.0018
-            : BLOCK_HALF_Y;
+      const raycastBlockPass = (padDm: number, rubbleOnly: boolean): void => {
+        const hx = BLOCK_HALF_X + padDm;
+        const hy = BLOCK_HALF_Y + padDm;
+        const hz = BLOCK_HALF_Z + padDm;
+        for (let i = 0; i < this.blocks.length; i++) {
+          const b = this.blocks[i];
+          if (b.shattered) continue;
+          if (b.extracted && this.activeBlockId !== b.id) continue;
+          if (rubbleOnly) {
+            const rHorizDm = Math.hypot(b.position[0], b.position[2]);
+            const upVec = quatRotateVec3(b.rotation, [0, 1, 0]);
+            const isRubbleOrFree =
+              this.currentLayers <= 2 ||
+              rHorizDm > BLOCK_HALF_X * 1.15 ||
+              b.position[1] <= BLOCK_HEIGHT * 1.35 ||
+              Math.abs(upVec[1]) < 0.96;
+            if (!isRubbleOrFree) continue;
+          }
 
-        const rel: Vec3 = [
-          rayOriginDm[0] - b.position[0],
-          rayOriginDm[1] - b.position[1],
-          rayOriginDm[2] - b.position[2],
-        ];
-        const lOrig = quatInverseRotateVec3(b.rotation, rel);
-        const lDir = quatInverseRotateVec3(b.rotation, [dx, dy, dz]);
+          const rel: Vec3 = [
+            rayOriginDm[0] - b.position[0],
+            rayOriginDm[1] - b.position[1],
+            rayOriginDm[2] - b.position[2],
+          ];
+          const lOrig = quatInverseRotateVec3(b.rotation, rel);
+          const lDir = quatInverseRotateVec3(b.rotation, [dx, dy, dz]);
 
-        let tMin = 0.0;
-        let tMax = bestT;
-        let hitLocalN: Vec3 = [0, 1, 0];
-        let inside = true;
-        const halfs: [number, number, number] = [hx, hy, hz];
-        for (let a = 0; a < 3; a++) {
-          const o = lOrig[a];
-          const d = lDir[a];
-          const h = halfs[a];
-          if (Math.abs(d) > 1e-9) {
-            let t1 = (-h - o) / d;
-            let t2 = (h - o) / d;
-            let sgn = -1;
-            if (t1 > t2) {
-              const tmp = t1;
-              t1 = t2;
-              t2 = tmp;
-              sgn = 1;
-            }
-            if (t1 > tMin) {
-              tMin = t1;
-              hitLocalN = a === 0 ? [sgn, 0, 0] : a === 1 ? [0, sgn, 0] : [0, 0, sgn];
-            }
-            if (t2 < tMax) tMax = t2;
-            if (tMin > tMax) {
+          let tMin = 0.0;
+          let tMax = bestT;
+          let hitLocalN: Vec3 = [0, 1, 0];
+          let inside = true;
+          const halfs: [number, number, number] = [hx, hy, hz];
+          for (let a = 0; a < 3; a++) {
+            const o = lOrig[a];
+            const d = lDir[a];
+            const h = halfs[a];
+            if (Math.abs(d) > 1e-9) {
+              let t1 = (-h - o) / d;
+              let t2 = (h - o) / d;
+              let sgn = -1;
+              if (t1 > t2) {
+                const tmp = t1;
+                t1 = t2;
+                t2 = tmp;
+                sgn = 1;
+              }
+              if (t1 > tMin) {
+                tMin = t1;
+                hitLocalN = a === 0 ? [sgn, 0, 0] : a === 1 ? [0, sgn, 0] : [0, 0, sgn];
+              }
+              if (t2 < tMax) tMax = t2;
+              if (tMin > tMax) {
+                inside = false;
+                break;
+              }
+            } else if (Math.abs(o) > h) {
               inside = false;
               break;
             }
-          } else if (Math.abs(o) > h) {
-            inside = false;
-            break;
+          }
+          if (inside && tMin >= 0 && tMin < bestT) {
+            bestT = tMin;
+            const localPt: Vec3 = [
+              Math.max(-BLOCK_HALF_X, Math.min(BLOCK_HALF_X, lOrig[0] + lDir[0] * tMin)),
+              Math.max(-BLOCK_HALF_Y, Math.min(BLOCK_HALF_Y, lOrig[1] + lDir[1] * tMin)),
+              Math.max(-BLOCK_HALF_Z, Math.min(BLOCK_HALF_Z, lOrig[2] + lDir[2] * tMin)),
+            ];
+            const worldPt: Vec3 =
+              padDm > 0
+                ? (() => {
+                    const wOff = quatRotateVec3(b.rotation, localPt);
+                    return [
+                      b.position[0] + wOff[0],
+                      b.position[1] + wOff[1],
+                      b.position[2] + wOff[2],
+                    ] as Vec3;
+                  })()
+                : [
+                    rayOriginDm[0] + dx * tMin,
+                    rayOriginDm[1] + dy * tMin,
+                    rayOriginDm[2] + dz * tMin,
+                  ];
+            const worldN = quatRotateVec3(b.rotation, hitLocalN);
+            bestHit = {
+              kind: 'block',
+              distanceDm: tMin,
+              worldPointDm: worldPt,
+              localPointDm: localPt,
+              normal: worldN,
+              geomId: b.colliderHandle,
+              bodyId: b.bodyHandle,
+              blockId: b.id,
+            };
           }
         }
-        if (inside && tMin >= 0 && tMin < bestT) {
-          bestT = tMin;
-          const worldPt: Vec3 = [
-            rayOriginDm[0] + dx * tMin,
-            rayOriginDm[1] + dy * tMin,
-            rayOriginDm[2] + dz * tMin,
-          ];
-          const localPt: Vec3 = [
-            lOrig[0] + lDir[0] * tMin,
-            lOrig[1] + lDir[1] * tMin,
-            lOrig[2] + lDir[2] * tMin,
-          ];
-          const worldN = quatRotateVec3(b.rotation, hitLocalN);
-          bestHit = {
-            kind: 'block',
-            distanceDm: tMin,
-            worldPointDm: worldPt,
-            localPointDm: localPt,
-            normal: worldN,
-            geomId: b.colliderHandle,
-            bodyId: b.bodyHandle,
-            blockId: b.id,
-          };
-        }
+      };
+
+      raycastBlockPass(0.0, false);
+      if (!bestHit && this.gameMode === 'sandbox') {
+        raycastBlockPass(0.025, true);
       }
     }
 

@@ -149,6 +149,7 @@ export interface WorkerSnapshotPayload {
   liveHeightCm: number;
   peakHeightCm: number;
   lockedMinRow: number | null;
+  sandboxCollapseActive?: boolean;
   solverWarningCount: number;
   mechanicalEnergyJ: number;
   solverDiagnostics?: {
@@ -623,6 +624,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
       liveHeightCm: eng.liveHeightCm,
       peakHeightCm: eng.peakHeightCm,
       lockedMinRow: eng.lockedMinRow,
+      sandboxCollapseActive: eng.isSandboxCollapseActive,
       solverWarningCount: eng.getSolverWarningCount(),
       mechanicalEnergyJ: eng.computeMechanicalEnergyJ(),
       solverDiagnostics: eng.getSolverDiagnostics(),

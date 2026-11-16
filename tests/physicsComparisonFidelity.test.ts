@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { GlassAudioEngine } from '../src/audio/GlassAudioEngine';
 import { GameEngine } from '../src/engine/GameEngine';
-import { quatFromAxisAngle, quatInverseRotateVec3 } from '../src/math/vecMat';
+import { quatFromAxisAngle, quatInverseRotateVec3, quatRotateVec3 } from '../src/math/vecMat';
 import {
   BLOCK_HALF_X,
   BLOCK_HALF_Y,
@@ -9,7 +9,12 @@ import {
   SIM_TIME_SCALE,
   TABLE_RADIUS,
 } from '../src/physics/constants';
-import { MJ_CONTYPE_BLOCK } from '../src/physics/mujocoTowerBuilder';
+import {
+  MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE,
+  MJ_CONTYPE_BLOCK,
+  MJ_CONTYPE_CULLET_SHARD,
+  MJ_CONTYPE_HERO_SHARD,
+} from '../src/physics/mujocoTowerBuilder';
 import {
   attachMujocoWorkerHost,
   type WorkerInboundMessage,
@@ -975,4 +980,1334 @@ describe('Vitrail A/B Physics & Acoustic Fidelity Comparison (M1–M6)', () => {
     expect(dropBlk.damage > 0.35 || dropBlk.shattered).toBe(true);
     anvilWorld.dispose();
   }, 55000);
+
+  it('M9: Sandbox shard-pile drag (Broadside & End-Drag front/center/rear, pre- & post-sleep) incurs 0 spastic shard bursts and smooth multi-height topple', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    // 1. Multi-seed, multi-grip Broadside & End-Drag (`center`, `front`, `rear-push`) across settled AND
+    // still-settling (`sandboxCollapseActive === true`) `0x22` shard piles: zero spastic velocity/spin bursts,
+    // zero nose-dives, positive bevel climb, and rock-steady End-Drag yaw + deliberate perpendicular swing.
+    const dragModes: Array<{
+      name: string;
+      yaw: number;
+      grabLocal: [number, number, number];
+    }> = [
+      { name: 'broadside-center', yaw: Math.PI * 0.5, grabLocal: [0, BLOCK_HALF_Y, 0] },
+      { name: 'end-center', yaw: 0, grabLocal: [0, BLOCK_HALF_Y, 0] },
+      { name: 'end-front', yaw: 0, grabLocal: [0.24, BLOCK_HALF_Y, 0] },
+      { name: 'end-rear-push', yaw: 0, grabLocal: [-0.24, BLOCK_HALF_Y, 0] },
+    ];
+
+    for (const { seed, settleFrames, dragSpeedMps } of [
+      { seed: 42, settleFrames: 180, dragSpeedMps: 0.10 },
+      { seed: 42, settleFrames: 180, dragSpeedMps: 0.18 },
+      { seed: 77, settleFrames: 95, dragSpeedMps: 0.12 }, // Mid-settle (`!hadFullSleepAfterCollapse`) regression check!
+    ]) {
+      for (const mode of dragModes) {
+        const pw = new PhysicsWorld(audio, 18, { seed });
+        pw.rebuildTower('sandbox', 2, 18, seed);
+        for (let f = 0; f < 25; f++) pw.step(1 / 60);
+        pw.triggerSandboxCollapseImpulse();
+        for (let f = 0; f < settleFrames; f++) pw.step(1 / 60);
+
+        const rw = pw.getWorld();
+        const mjModel = rw.getModel()!;
+        const d = rw.getData()!;
+        const onTableIntact = pw.blocks.filter(
+          (b) =>
+            !b.shattered &&
+            b.position[1] > 0 &&
+            Math.hypot(b.position[0], b.position[2]) < TABLE_RADIUS - 0.4
+        );
+        const pusher = onTableIntact[0]!;
+        // Aim straight through the collapsed on-table `0x22` shard pile centroid and clear only intact blocks
+        // obstructing the `[-2.0, +1.6]` sweep corridor (leaving peripheral rubble untouched so mid-settle stays awake)
+        const solidTableShards = pw.shards.filter(
+          (s) =>
+            Math.hypot(s.position[0], s.position[2]) < TABLE_RADIUS - 0.35 &&
+            (mjModel.geom_conaffinity[s.colliderHandle] & 0x20) !== 0
+        );
+        const meanZ =
+          solidTableShards.length > 0
+            ? solidTableShards.reduce((acc, s) => acc + s.position[2], 0) / solidTableShards.length
+            : 0.0;
+        const startX = -1.55;
+        const startZ = Math.max(-1.1, Math.min(1.1, meanZ));
+        for (let i = 1; i < onTableIntact.length; i++) {
+          const blk = onTableIntact[i]!;
+          if (blk.position[0] > -2.1 && blk.position[0] < 2.15 && Math.abs(blk.position[2] - startZ) < 0.72) {
+            const sideZ = startZ >= 0 ? -2.2 - (i % 4) * 0.32 : 2.2 + (i % 4) * 0.32;
+            syncBlockPoseClean(
+              pw,
+              blk.id,
+              [-1.4 + Math.floor(i / 4) * 0.85, BLOCK_HALF_Y, sideZ],
+              [0, 0, 0, 1]
+            );
+          }
+        }
+        let corridorCount = solidTableShards.filter(
+          (s) => s.position[0] > -0.85 && s.position[0] < 1.35 && Math.abs(s.position[2] - startZ) < 0.12
+        ).length;
+        let placedIdx = 0;
+        for (const s of solidTableShards) {
+          if (s.position[0] < -0.95 && Math.abs(s.position[2] - startZ) < 0.55) {
+            const slotX = -0.35 + (placedIdx % 12) * 0.11 + Math.floor(placedIdx / 12) * 0.055;
+            const slotZ = startZ + ((placedIdx % 3) - 1) * 0.042;
+            const rbS = rw.getRigidBody(s.bodyHandle)!;
+            rbS.setTranslation({ x: slotX, y: 0.065, z: slotZ }, true);
+            rbS.setLinvel({ x: 0, y: 0, z: 0 }, true);
+            placedIdx++;
+            corridorCount++;
+          } else if (corridorCount < 16 && Math.abs(s.position[2] - startZ) > 0.35) {
+            const slotX = -0.30 + (placedIdx % 10) * 0.12;
+            const slotZ = startZ + ((placedIdx % 3) - 1) * 0.042;
+            const rbS = rw.getRigidBody(s.bodyHandle)!;
+            rbS.setTranslation({ x: slotX, y: 0.065, z: slotZ }, true);
+            rbS.setLinvel({ x: 0, y: 0, z: 0 }, true);
+            placedIdx++;
+            corridorCount++;
+          }
+        }
+        const qInit = quatFromAxisAngle([0, 1, 0], mode.yaw);
+        syncBlockPoseClean(
+          pw,
+          pusher.id,
+          [startX, BLOCK_HALF_Y, startZ],
+          [qInit[0], qInit[1], qInit[2], qInit[3]]
+        );
+        for (let f = 0; f < 36; f++) pw.step(1 / 60);
+
+        const wOff = quatRotateVec3(pusher.rotation, mode.grabLocal);
+        const grabStart: [number, number, number] = [
+          pusher.position[0] + wOff[0],
+          pusher.position[1] + wOff[1],
+          pusher.position[2] + wOff[2],
+        ];
+        pw.startGrabBlock(pusher.id, mode.grabLocal, grabStart);
+
+        const distDm = 2.9;
+        const totalFrames = Math.round(((distDm * 0.1) / dragSpeedMps) * 60);
+        let maxShardSpeedMps = 0;
+        let maxShardVyMps = 0;
+        let maxShardSpinRadS = 0;
+        let minNosePitchDeg = 0;
+        let maxNosePitchDeg = 0;
+        let maxYawDriftDeg = 0;
+        let plowedShards = 0;
+        const initShardPos = new Map(
+          pw.shards.map((s) => [s.id, [s.position[0], s.position[2]] as [number, number]])
+        );
+
+        for (let f = 1; f <= totalFrames; f++) {
+          const gx = grabStart[0] + (distDm * f) / totalFrames;
+          const dyPlane = pw.grabPlaneY - grabStart[1];
+          // Include oblique 30-deg camera ray parallax (`-dy * cot(30 deg)`) to verify fixed `grabPlaneY` stability
+          pw.updateGrabTarget([gx - dyPlane * 1.6, pw.grabPlaneY, grabStart[2]]);
+          pw.step(1 / 60);
+
+          const fwdAxis =
+            mode.yaw > 0.5
+              ? quatRotateVec3(pusher.rotation, [0, 0, -1])
+              : quatRotateVec3(pusher.rotation, [1, 0, 0]);
+          const initFwd =
+            mode.yaw > 0.5
+              ? quatRotateVec3(qInit, [0, 0, -1])
+              : quatRotateVec3(qInit, [1, 0, 0]);
+          const signFwd = initFwd[0] >= 0 ? 1 : -1;
+          const noseDeg =
+            (Math.asin(Math.max(-1, Math.min(1, fwdAxis[1] * signFwd))) * 180) / Math.PI;
+          if (noseDeg < minNosePitchDeg) minNosePitchDeg = noseDeg;
+          if (noseDeg > maxNosePitchDeg) maxNosePitchDeg = noseDeg;
+
+          const yawDot =
+            (fwdAxis[0] * signFwd) / Math.max(1e-4, Math.hypot(fwdAxis[0], fwdAxis[2]));
+          const yawDrift = (Math.acos(Math.max(-1, Math.min(1, yawDot))) * 180) / Math.PI;
+          if (yawDrift > maxYawDriftDeg) maxYawDriftDeg = yawDrift;
+
+          for (const s of pw.shards) {
+            if (
+              s.position[0] < -2.0 ||
+              s.position[0] > 2.3 ||
+              Math.abs(s.position[2] - startZ) > 0.95
+            ) {
+              continue;
+            }
+            const sInfo = rw.getMapping(s.bodyHandle);
+            if (!sInfo || !sInfo.enabled) continue;
+            const dof = sInfo.dofAdr;
+            const sp = Math.hypot(d.qvel[dof], d.qvel[dof + 1], d.qvel[dof + 2]);
+            const vy = d.qvel[dof + 1];
+            const w = Math.hypot(d.qvel[dof + 3], d.qvel[dof + 4], d.qvel[dof + 5]);
+            if (sp > maxShardSpeedMps) maxShardSpeedMps = sp;
+            if (vy > maxShardVyMps) maxShardVyMps = vy;
+            if (w > maxShardSpinRadS) maxShardSpinRadS = w;
+          }
+        }
+        for (const s of pw.shards) {
+          const p0 = initShardPos.get(s.id);
+          if (p0 && Math.hypot(s.position[0] - p0[0], s.position[2] - p0[1]) > 0.05) {
+            plowedShards++;
+          }
+        }
+        pw.endGrab(false);
+        pw.dispose();
+
+        expect(plowedShards).toBeGreaterThanOrEqual(8);
+        expect(maxShardSpeedMps).toBeLessThanOrEqual(dragSpeedMps * 2.8 + 0.09);
+        expect(maxShardVyMps).toBeLessThanOrEqual(0.28);
+        expect(maxShardSpinRadS).toBeLessThanOrEqual(20.5);
+        expect(minNosePitchDeg).toBeGreaterThanOrEqual(-2.8);
+        expect(maxNosePitchDeg).toBeLessThanOrEqual(12.5);
+        expect(maxYawDriftDeg).toBeLessThanOrEqual(mode.name.startsWith('end-') ? 11.5 : 18.0);
+      }
+    }
+
+    // Deliberate perpendicular lever swing on block end still rotates freely (> 18 deg)
+    {
+      const swingWorld = new PhysicsWorld(audio, 1, { seed: 42 });
+      swingWorld.rebuildTower('sandbox', 2, 1, 42);
+      for (let f = 0; f < 15; f++) swingWorld.step(1 / 60);
+      syncBlockPoseClean(swingWorld, 1, [-3.0, BLOCK_HALF_Y, -1.0], [0, 0, 0, 1]);
+      syncBlockPoseClean(swingWorld, 2, [-3.0, BLOCK_HALF_Y, 1.0], [0, 0, 0, 1]);
+      syncBlockPoseClean(swingWorld, 0, [0, BLOCK_HALF_Y, 0], [0, 0, 0, 1]);
+      for (let f = 0; f < 10; f++) swingWorld.step(1 / 60);
+      swingWorld.startGrabBlock(0, [0.30, BLOCK_HALF_Y, 0], [0.30, BLOCK_HALF_Y * 2, 0]);
+      for (let f = 1; f <= 35; f++) {
+        swingWorld.updateGrabTarget([0.30, BLOCK_HALF_Y * 2, (0.85 * f) / 35]);
+        swingWorld.step(1 / 60);
+      }
+      const fwdAfter = quatRotateVec3(swingWorld.blocks[0]!.rotation, [1, 0, 0]);
+      const swingYawDeg =
+        (Math.acos(Math.max(-1, Math.min(1, fwdAfter[0]))) * 180) / Math.PI;
+      expect(swingYawDeg).toBeGreaterThan(18.0);
+      swingWorld.dispose();
+    }
+
+    // 1b. Untouched collapsed rubble drag + mid-drag pointer pause + post-endGrab settle (no artificial block clearing!):
+    // verifies zero spastic block-shard-block / elevated-heap pinch bursts and zero false block shatters.
+    for (const seed of [22, 42, 55]) {
+      const uw = new PhysicsWorld(audio, 18, { seed });
+      uw.rebuildTower('sandbox', 2, 18, seed);
+      for (let f = 0; f < 25; f++) uw.step(1 / 60);
+      uw.triggerSandboxCollapseImpulse();
+      for (let f = 0; f < 160; f++) uw.step(1 / 60);
+
+      const urw = uw.getWorld();
+      const ud = urw.getData()!;
+      const candidates = uw.blocks.filter(
+        (b) =>
+          !b.shattered &&
+          b.position[1] > 0 &&
+          b.position[1] < 0.35 &&
+          Math.hypot(b.position[0], b.position[2]) < TABLE_RADIUS - 0.5
+      );
+      candidates.sort(
+        (a, b) => Math.hypot(b.position[0], b.position[2]) - Math.hypot(a.position[0], a.position[2])
+      );
+      const blk = candidates[0]!;
+      const shatBefore = uw.shatteredCount;
+      const centroid = uw.shards.reduce(
+        (acc, s) => [acc[0] + s.position[0], acc[1] + s.position[2]],
+        [0, 0]
+      );
+      centroid[0] /= Math.max(1, uw.shards.length);
+      centroid[1] /= Math.max(1, uw.shards.length);
+      const dx = centroid[0] - blk.position[0];
+      const dz = centroid[1] - blk.position[2];
+      const len = Math.hypot(dx, dz) || 1;
+      const ux = dx / len;
+      const uz = dz / len;
+      const wOff = quatRotateVec3(blk.rotation, [0, BLOCK_HALF_Y, 0]);
+      const grabStart: [number, number, number] = [
+        blk.position[0] + wOff[0],
+        blk.position[1] + wOff[1],
+        blk.position[2] + wOff[2],
+      ];
+      uw.startGrabBlock(blk.id, [0, BLOCK_HALF_Y, 0], grabStart);
+
+      let curX = grabStart[0];
+      let curZ = grabStart[2];
+      let maxDragSp = 0;
+      let maxPauseOrPostSp = 0;
+      let maxAllSpin = 0;
+      for (let f = 1; f <= 200; f++) {
+        const isPausedOrPost = (f >= 86 && f <= 120) || f >= 161;
+        if (f <= 85 || (f >= 121 && f <= 160)) {
+          curX += ux * 0.02;
+          curZ += uz * 0.02;
+          uw.updateGrabTarget([curX, uw.grabPlaneY, curZ]);
+        } else if (f === 161) {
+          uw.endGrab(false);
+        }
+        uw.step(1 / 60);
+        for (const s of uw.shards) {
+          const sInfo = urw.getMapping(s.bodyHandle);
+          if (!sInfo || !sInfo.enabled) continue;
+          if (
+            ud.qpos[sInfo.qposAdr + 1] < -0.01 ||
+            Math.hypot(s.position[0], s.position[2]) > TABLE_RADIUS - 0.1
+          ) {
+            continue;
+          }
+          const dof = sInfo.dofAdr;
+          const sp = Math.hypot(ud.qvel[dof], ud.qvel[dof + 1], ud.qvel[dof + 2]);
+          const w = Math.hypot(ud.qvel[dof + 3], ud.qvel[dof + 4], ud.qvel[dof + 5]);
+          if (w > maxAllSpin) maxAllSpin = w;
+          if (isPausedOrPost) {
+            if (sp > maxPauseOrPostSp) maxPauseOrPostSp = sp;
+          } else if (sp > maxDragSp) {
+            maxDragSp = sp;
+          }
+        }
+      }
+      expect(uw.shatteredCount - shatBefore).toBe(0);
+      expect(maxDragSp).toBeLessThanOrEqual(0.45);
+      expect(maxPauseOrPostSp).toBeLessThanOrEqual(0.48);
+      expect(maxAllSpin).toBeLessThanOrEqual(20.5);
+      uw.dispose();
+    }
+
+    // 1c. Smooth 90-degree curved drag under 2-Zone Physical Grip Law (`lx=0` Body Pinch holds constant heading,
+    // `lx=0.26` Outward End-Tow aligns passively along curve, `lx=-0.24` Rear Tip pivots smoothly without whip)
+    for (const lx of [0, 0.26, -0.24]) {
+      const cw = new PhysicsWorld(audio, 1, { seed: 42 });
+      cw.rebuildTower('sandbox', 2, 1, 42);
+      for (let f = 0; f < 12; f++) cw.step(1 / 60);
+      syncBlockPoseClean(cw, 1, [-3.2, BLOCK_HALF_Y, -1.0], [0, 0, 0, 1]);
+      syncBlockPoseClean(cw, 2, [-3.2, BLOCK_HALF_Y, 1.0], [0, 0, 0, 1]);
+      syncBlockPoseClean(cw, 0, [-1.0, BLOCK_HALF_Y, -1.0], [0, 0, 0, 1]);
+      for (let f = 0; f < 10; f++) cw.step(1 / 60);
+      const b0 = cw.blocks[0]!;
+      const grabLocal: [number, number, number] = [lx, BLOCK_HALF_Y, 0];
+      const g0: [number, number, number] = [b0.position[0] + lx, BLOCK_HALF_Y * 2, b0.position[2]];
+      cw.startGrabBlock(0, grabLocal, g0);
+      const R = 1.6;
+      const cx = g0[0];
+      const cz = g0[2] + R;
+      for (let f = 1; f <= 90; f++) {
+        const th = (Math.PI * 0.5 * f) / 90;
+        cw.updateGrabTarget([cx + R * Math.sin(th), cw.grabPlaneY, cz - R * Math.cos(th)]);
+        cw.step(1 / 60);
+      }
+      const fwd = quatRotateVec3(b0.rotation, [1, 0, 0]);
+      const headingDeg = (Math.atan2(fwd[2], fwd[0]) * 180) / Math.PI;
+      if (Math.abs(lx) <= BLOCK_HALF_X * 0.58) {
+        expect(Math.abs(headingDeg)).toBeLessThan(14.0);
+      } else if (lx > 0) {
+        expect(headingDeg).toBeGreaterThan(50.0);
+        expect(headingDeg).toBeLessThan(98.0);
+      } else {
+        expect(headingDeg).toBeLessThan(-45.0);
+        expect(headingDeg).toBeGreaterThan(-95.0);
+      }
+      cw.dispose();
+    }
+
+    // 2. Smooth height-consistent Sandbox topple across `6L, 12L, 15L, 18L, 24L, 30L`
+    // (`0` <16L cliff, `0` flat mid-tower velocity clamp, `0` premature upright shatters)
+    for (const layers of [6, 12, 15, 18, 24, 30]) {
+      const tw = new PhysicsWorld(audio, layers, { seed: 42 });
+      tw.rebuildTower('sandbox', 2, layers, 42);
+      for (let f = 0; f < 25; f++) tw.step(1 / 60);
+      const topInitY = tw.blocks[tw.blocks.length - 1]!.position[1];
+      tw.triggerSandboxCollapseImpulse();
+      const trw = tw.getWorld();
+      const td = trw.getData()!;
+      const midIdx = Math.floor(layers * 0.52) * 3;
+      const topIdx = tw.blocks.length - 1;
+      const midDof = trw.getMapping(tw.blocks[midIdx]!.bodyHandle)!.dofAdr;
+      const topDof = trw.getMapping(tw.blocks[topIdx]!.bodyHandle)!.dofAdr;
+      const vMidInit = Math.hypot(td.qvel[midDof], td.qvel[midDof + 2]);
+      const vTopInit = Math.hypot(td.qvel[topDof], td.qvel[topDof + 2]);
+      expect(vTopInit).toBeGreaterThan(vMidInit * 1.18);
+
+      let tFirstShatterSec = -1;
+      let dropAtFrame6Mm = 0;
+      for (let f = 1; f <= 60; f++) {
+        tw.step(1 / 60);
+        if (tFirstShatterSec < 0 && tw.shatteredCount > 0) {
+          tFirstShatterSec = f / 60;
+        }
+        if (f === 6) {
+          const topBlk = tw.blocks[tw.blocks.length - 1]!;
+          dropAtFrame6Mm = (topInitY - topBlk.position[1]) * 100;
+        }
+      }
+      expect(dropAtFrame6Mm).toBeGreaterThan(4.0);
+      expect(tFirstShatterSec).toBeGreaterThanOrEqual(0.11);
+      expect(tw.shatteredCount).toBeGreaterThanOrEqual(layers <= 6 ? 2 : 5);
+      tw.dispose();
+    }
+
+    // 3. Worker bridge catch-up slicing: maintains smooth snapshot cadence & real-time catch-up under in-flight backlog
+    const channel = new MessageChannel();
+    const clientEndpoint: WorkerEndpointLike = {
+      onmessage: null,
+      postMessage(msg: WorkerInboundMessage, transfer?: Transferable[]) {
+        channel.port1.postMessage(msg, transfer as never);
+      },
+      terminate() {
+        channel.port1.close();
+        channel.port2.close();
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const hostScope = {
+      onmessage: null as ((ev: MessageEvent<WorkerInboundMessage>) => void) | null,
+      postMessage(msg: WorkerOutboundMessage, transfer?: Transferable[]) {
+        channel.port2.postMessage(msg, transfer as never);
+      },
+    };
+    channel.port1.onmessage = (ev) => clientEndpoint.onmessage?.(ev as MessageEvent<WorkerOutboundMessage>);
+    channel.port2.onmessage = (ev) => hostScope.onmessage?.(ev as MessageEvent<WorkerInboundMessage>);
+
+    const hostHandle = attachMujocoWorkerHost(hostScope);
+    const bridge = await MujocoWorkerBridge.create(audio, 18, 42, clientEndpoint);
+    let snapCount = 0;
+    const origApply = clientEndpoint.onmessage;
+    clientEndpoint.onmessage = (ev) => {
+      if (ev.data.type === 'snapshot' && !ev.data.isFullRebuild) snapCount++;
+      origApply?.(ev);
+    };
+    bridge.rebuildTower('sandbox', 2, 18, 42);
+    await new Promise((r) => setTimeout(r, 40));
+    snapCount = 0;
+    const sim0 = bridge.getSimTime();
+    bridge.triggerSandboxCollapseImpulse();
+    // Simulate a 10-frame (`167 ms`) main-thread rAF stream arriving while heavy steps execute
+    for (let f = 0; f < 10; f++) {
+      bridge.step(1 / 60);
+      await new Promise((r) => setTimeout(r, 14));
+    }
+    await new Promise((r) => setTimeout(r, 90));
+    expect(snapCount).toBeGreaterThanOrEqual(2);
+    expect(bridge.getSimTime() - sim0).toBeGreaterThanOrEqual(0.11);
+    bridge.dispose();
+    hostHandle.dispose();
+    clientEndpoint.terminate?.();
+  }, 120000);
+
+  it('M10: Round 3 V1–V5 surgical fixes: 0 helicopter flail & 0 mm tether desync, broadside shard sled, jaw-pinch escape + re-solidification, foreground-shard disambiguation + bevel pick margin, and column-drop/stump/camera invariants', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    // --- 1. Zero Helicopter Flail, Zero Tether Desync (`0.00 mm`) & Stationary `grabFlickVelXZ` Decay ---
+    for (const withShards of [false, true]) {
+      for (const localXDm of [0.0, 0.15, 0.30, -0.30]) {
+        const pw = new PhysicsWorld(audio, withShards ? 10 : 2, { seed: 42 });
+        pw.rebuildTower('sandbox', 2, withShards ? 10 : 2, 42);
+        for (let f = 0; f < 20; f++) pw.step(1 / 60);
+        const rw = pw.getWorld();
+        const blk = pw.blocks[0]!;
+        for (let i = 1; i < pw.blocks.length; i++) {
+          if (withShards && i <= 4) {
+            syncBlockPoseClean(pw, i, [0.1 * i, 0.16, 0.0], [0, 0, 0, 1]);
+            pw.shatterBlock(pw.blocks[i]!, [0, 0, 0], 11.5, [0, 1, 0], true);
+          } else {
+            pw.blocks[i]!.extracted = true;
+            rw.getRigidBody(pw.blocks[i]!.bodyHandle)!.setTranslation({ x: -6 - i * 0.8, y: -5, z: -5 }, false);
+          }
+        }
+        rw.syncKinematics();
+        syncBlockPoseClean(pw, 0, [-0.5, BLOCK_HALF_Y, 0.4], [0, 0, 0, 1]);
+        for (let f = 0; f < (withShards ? 90 : 15); f++) pw.step(1 / 60);
+
+        const grabLocal: [number, number, number] = [localXDm, BLOCK_HALF_Y, 0];
+        const wOff0 = quatRotateVec3(blk.rotation, grabLocal);
+        const g0: [number, number, number] = [
+          blk.position[0] + wOff0[0],
+          blk.position[1] + wOff0[1],
+          blk.position[2] + wOff0[2],
+        ];
+        expect(pw.startGrabBlock(0, grabLocal, g0)).toBe(true);
+
+        const engInternal = pw as unknown as {
+          map: { grabEqualityId: number; blockDofAdr: number[] };
+          grabFlickVelXZ: [number, number];
+        };
+        const mjModel = rw.getModel()!;
+        const mjData = rw.getData()!;
+        const eqBase = engInternal.map.grabEqualityId * 11;
+        const dof0 = engInternal.map.blockDofAdr[0]!;
+        const initFwd = quatRotateVec3(blk.rotation, [1, 0, 0]);
+        const initYaw = Math.atan2(-initFwd[2], initFwd[0]);
+
+        let maxHeadingDriftDeg = 0;
+        let maxYawRateRadS = 0;
+        let maxEqDesyncMm = 0;
+        let maxWorldTetherDesyncMm = 0;
+
+        // Trajectory: +10 cm (+X) -> -10 cm (-X, 180° reversal!) -> -Z (90° corner) -> -X (90° corner)
+        const totalMoveFrames = 80;
+        for (let f = 1; f <= totalMoveFrames; f++) {
+          let tx = g0[0];
+          let tz = g0[2];
+          if (f <= 20) {
+            tx = g0[0] + (1.0 * f) / 20;
+          } else if (f <= 44) {
+            tx = g0[0] + 1.0 - (2.0 * (f - 20)) / 24;
+          } else if (f <= 62) {
+            tx = g0[0] - 1.0;
+            tz = g0[2] - (0.9 * (f - 44)) / 18;
+          } else {
+            tx = g0[0] - 1.0 - (0.9 * (f - 62)) / 18;
+            tz = g0[2] - 0.9;
+          }
+          pw.updateGrabTarget([tx, pw.grabPlaneY, tz], 1000 + f * 16.67);
+          pw.step(1 / 60);
+
+          const eqDxMm = Math.abs(mjModel.eq_data[eqBase + 3] - grabLocal[0] * 0.1) * 1000;
+          const eqDzMm = Math.abs(mjModel.eq_data[eqBase + 5] - grabLocal[2] * 0.1) * 1000;
+          maxEqDesyncMm = Math.max(maxEqDesyncMm, eqDxMm, eqDzMm);
+
+          const exactWorldOff = quatRotateVec3(blk.rotation, grabLocal);
+          const worldDxMm =
+            Math.hypot(
+              pw.grabCurrentWorldOnBlock[0] - (blk.position[0] + exactWorldOff[0]),
+              pw.grabCurrentWorldOnBlock[2] - (blk.position[2] + exactWorldOff[2])
+            ) * 100;
+          maxWorldTetherDesyncMm = Math.max(maxWorldTetherDesyncMm, worldDxMm);
+
+          const curFwd = quatRotateVec3(blk.rotation, [1, 0, 0]);
+          const curYaw = Math.atan2(-curFwd[2], curFwd[0]);
+          let dYaw = curYaw - initYaw;
+          while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+          while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+          maxHeadingDriftDeg = Math.max(maxHeadingDriftDeg, (Math.abs(dYaw) * 180) / Math.PI);
+
+          const wWorld = quatRotateVec3(blk.rotation, [
+            mjData.qvel[dof0 + 3],
+            mjData.qvel[dof0 + 4],
+            mjData.qvel[dof0 + 5],
+          ]);
+          maxYawRateRadS = Math.max(maxYawRateRadS, Math.abs(wWorld[1]));
+        }
+
+        // Hold pointer completely stationary (zero updateGrabTarget calls) for 0.38 s (23 frames)
+        for (let f = 0; f < 23; f++) pw.step(1 / 60);
+        const decayedFlickSpd = Math.hypot(
+          engInternal.grabFlickVelXZ[0],
+          engInternal.grabFlickVelXZ[1]
+        );
+        expect(decayedFlickSpd).toBeLessThan(0.01);
+        expect(maxEqDesyncMm).toBeLessThan(0.05);
+        expect(maxWorldTetherDesyncMm).toBeLessThan(0.05);
+
+        if (Math.abs(localXDm) <= BLOCK_HALF_X * 0.58) {
+          expect(maxHeadingDriftDeg).toBeLessThan(14.0);
+          expect(maxYawRateRadS).toBeLessThan(4.0);
+        } else {
+          // End-grip (`±30 mm`) pivots smoothly around 90° corners without 1,544 deg/s (26.9 rad/s) helicopter flail
+          expect(maxYawRateRadS).toBeLessThan(12.5);
+        }
+        pw.endGrab(false);
+        pw.dispose();
+      }
+    }
+
+    // --- 2. Effortless Broadside Shard Sled (`localX = 0` & `localX = 14 mm`) ---
+    for (const localXDm of [0.0, 0.14]) {
+      const sw = new PhysicsWorld(audio, 18, { seed: 42 });
+      sw.rebuildTower('sandbox', 2, 18, 42);
+      for (let f = 0; f < 25; f++) sw.step(1 / 60);
+      sw.triggerSandboxCollapseImpulse();
+      for (let f = 0; f < 160; f++) sw.step(1 / 60);
+      const srw = sw.getWorld();
+      const sModel = srw.getModel()!;
+      const survivors = sw.blocks.filter((b) => !b.shattered && !b.extracted);
+      const sledBlk = survivors[0]!;
+      const culletShards = sw.shards.filter(
+        (s) => (sModel.geom_conaffinity[s.colliderHandle] & 0x20) !== 0
+      );
+      const meanZ =
+        culletShards.length > 0
+          ? Math.max(
+              -0.9,
+              Math.min(
+                0.9,
+                culletShards.reduce((acc, s) => acc + s.position[2], 0) / culletShards.length
+              )
+            )
+          : 0.0;
+      for (let i = 1; i < survivors.length; i++) {
+        const blk = survivors[i]!;
+        if (
+          blk.position[0] > -2.1 &&
+          blk.position[0] < 2.15 &&
+          Math.abs(blk.position[2] - meanZ) < 0.72
+        ) {
+          const sideZ = meanZ >= 0 ? -2.1 - (i % 4) * 0.30 : 2.1 + (i % 4) * 0.30;
+          syncBlockPoseClean(
+            sw,
+            blk.id,
+            [-1.8 + Math.floor(i / 4) * 0.45, BLOCK_HALF_Y, sideZ],
+            [0, 0, 0, 1]
+          );
+        }
+      }
+      let corridorIdx = 0;
+      for (const s of sw.shards) {
+        // Clear any hero/cullet shards overlapping the `[-1.80, -0.92]` launchpad so `sledBlk` starts flat on oak
+        if (s.position[0] > -1.85 && s.position[0] < -0.92 && Math.abs(s.position[2] - meanZ) < 0.55) {
+          const rbS = srw.getRigidBody(s.bodyHandle)!;
+          if (corridorIdx < 72) {
+            rbS.setTranslation(
+              {
+                x: -0.45 + Math.floor(corridorIdx / 6) * 0.085,
+                y: 0.065 + (corridorIdx % 2) * 0.045,
+                z: meanZ + ((corridorIdx % 6) - 2.5) * 0.065,
+              },
+              true
+            );
+            corridorIdx++;
+          } else {
+            rbS.setTranslation({ x: -2.4, y: 0.06, z: meanZ >= 0 ? -2.2 : 2.2 }, true);
+          }
+          rbS.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          continue;
+        }
+        if (s.position[0] < -0.95 || Math.abs(s.position[2] - meanZ) > 0.45) {
+          if (corridorIdx < 72) {
+            const rbS = srw.getRigidBody(s.bodyHandle)!;
+            rbS.setTranslation(
+              {
+                x: -0.45 + Math.floor(corridorIdx / 6) * 0.085,
+                y: 0.065 + (corridorIdx % 2) * 0.045,
+                z: meanZ + ((corridorIdx % 6) - 2.5) * 0.065,
+              },
+              true
+            );
+            rbS.setLinvel({ x: 0, y: 0, z: 0 }, true);
+            corridorIdx++;
+          }
+        }
+      }
+      const qBroad = quatFromAxisAngle([0, 1, 0], Math.PI * 0.5);
+      syncBlockPoseClean(
+        sw,
+        sledBlk.id,
+        [-1.35, BLOCK_HALF_Y, meanZ],
+        [qBroad[0], qBroad[1], qBroad[2], qBroad[3]]
+      );
+      for (let f = 0; f < 30; f++) sw.step(1 / 60);
+
+      const grabLoc: [number, number, number] = [localXDm, BLOCK_HALF_Y, 0];
+      const wOff = quatRotateVec3(sledBlk.rotation, grabLoc);
+      const gStart: [number, number, number] = [
+        sledBlk.position[0] + wOff[0],
+        sledBlk.position[1] + wOff[1],
+        sledBlk.position[2] + wOff[2],
+      ];
+      sw.startGrabBlock(sledBlk.id, grabLoc, gStart);
+      let maxBroadsideClimbDeg = 0;
+      let maxBroadsideTwistDeg = 0;
+      const startX = sledBlk.position[0];
+      for (let f = 1; f <= 85; f++) {
+        sw.updateGrabTarget([gStart[0] + (2.4 * f) / 85, sw.grabPlaneY, gStart[2]]);
+        sw.step(1 / 60);
+        // Leading broadside edge along +X corresponds to local +Z when yaw = +90 deg
+        const leadDir = quatRotateVec3(sledBlk.rotation, [0, 0, 1]);
+        const climbDeg = (Math.asin(Math.max(-1, Math.min(1, leadDir[1]))) * 180) / Math.PI;
+        if (climbDeg > maxBroadsideClimbDeg) maxBroadsideClimbDeg = climbDeg;
+        const twistDeg =
+          (Math.acos(Math.max(-1, Math.min(1, leadDir[0] / Math.max(1e-4, Math.hypot(leadDir[0], leadDir[2]))))) *
+            180) /
+          Math.PI;
+        if (twistDeg > maxBroadsideTwistDeg) maxBroadsideTwistDeg = twistDeg;
+      }
+      const travelMm = (sledBlk.position[0] - startX) * 100;
+      expect(maxBroadsideClimbDeg).toBeGreaterThanOrEqual(1.6);
+      expect(maxBroadsideTwistDeg).toBeLessThan(14.0);
+      expect(travelMm).toBeGreaterThan(170);
+      sw.endGrab(false);
+      sw.dispose();
+    }
+
+    // --- 3. Multi-Body Shard Jaw Pinch, Mid-Pile Pause, Medium (`0.65 m/s`) Sweep, `0x22` Re-Solidification & Hero Tablecloth ---
+    for (const driveSpeedMps of [0.25, 0.65]) {
+      const jw = new PhysicsWorld(audio, 12, { seed: 42 });
+      jw.rebuildTower('sandbox', 2, 12, 42);
+      for (let f = 0; f < 20; f++) jw.step(1 / 60);
+      const jrw = jw.getWorld();
+      const jModel = jrw.getModel()!;
+      const jData = jrw.getData()!;
+      for (let i = 3; i < jw.blocks.length; i++) {
+        if (i <= 7) {
+          syncBlockPoseClean(jw, i, [0.0, 0.16, 0.0], [0, 0, 0, 1]);
+          jw.shatterBlock(jw.blocks[i]!, [0, 0, 0], 11.5, [0, 1, 0], true);
+        } else {
+          jw.blocks[i]!.extracted = true;
+          jrw.getRigidBody(jw.blocks[i]!.bodyHandle)!.setTranslation({ x: -6 - i * 0.8, y: -5, z: -5 }, false);
+        }
+      }
+      jrw.syncKinematics();
+      const qJaw = quatFromAxisAngle([0, 1, 0], Math.PI * 0.5);
+      // Stationary anvil rubble block at x = +0.55 dm, dragged block starting at x = -0.75 dm
+      syncBlockPoseClean(jw, 1, [0.55, BLOCK_HALF_Y, 0.0], [qJaw[0], qJaw[1], qJaw[2], qJaw[3]]);
+      syncBlockPoseClean(jw, 2, [0.95, BLOCK_HALF_Y, 0.0], [qJaw[0], qJaw[1], qJaw[2], qJaw[3]]);
+      syncBlockPoseClean(jw, 0, [-0.75, BLOCK_HALF_Y, 0.0], [qJaw[0], qJaw[1], qJaw[2], qJaw[3]]);
+      for (let i = 0; i < Math.min(28, jw.shards.length); i++) {
+        const s = jw.shards[i]!;
+        const rbS = jrw.getRigidBody(s.bodyHandle)!;
+        rbS.setTranslation(
+          {
+            x: -0.25 + (i % 7) * 0.09,
+            y: 0.065,
+            z: ((i % 4) - 1.5) * 0.12,
+          },
+          true
+        );
+        rbS.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      }
+      for (let f = 0; f < 65; f++) jw.step(1 / 60);
+
+      const shatBeforeSweep = jw.shatteredCount;
+      const pusher = jw.blocks[0]!;
+      const g0: [number, number, number] = [pusher.position[0], BLOCK_HALF_Y * 2, pusher.position[2]];
+      jw.startGrabBlock(0, [0, BLOCK_HALF_Y, 0], g0);
+
+      const sweepDistDm = 1.15;
+      const sweepFrames = Math.max(10, Math.round(((sweepDistDm * 0.1) / driveSpeedMps) * 60));
+      let maxShardSpMps = 0;
+      let maxPausedSpinRadS = 0;
+      const jMap = (jw as unknown as { map: { shardDofAdr: number[] } }).map;
+
+      for (let f = 1; f <= sweepFrames; f++) {
+        const gx = g0[0] + (sweepDistDm * f) / sweepFrames;
+        jw.updateGrabTarget([gx, jw.grabPlaneY, g0[2]], 2000 + f * 16.67);
+        jw.step(1 / 60);
+        for (const s of jw.shards) {
+          if (Math.hypot(s.position[0], s.position[2]) > TABLE_RADIUS - 0.1) continue;
+          const dof = jMap.shardDofAdr[s.slotIndex]!;
+          const sp = Math.hypot(jData.qvel[dof], jData.qvel[dof + 1], jData.qvel[dof + 2]);
+          if (sp > maxShardSpMps) maxShardSpMps = sp;
+        }
+      }
+
+      // Stationary pause for 0.60 s (36 frames) right inside the multi-body block-shard jaw!
+      for (let f = 1; f <= 36; f++) {
+        jw.step(1 / 60);
+        for (const s of jw.shards) {
+          if (Math.hypot(s.position[0], s.position[2]) > TABLE_RADIUS - 0.1) continue;
+          const dof = jMap.shardDofAdr[s.slotIndex]!;
+          const sp = Math.hypot(jData.qvel[dof], jData.qvel[dof + 1], jData.qvel[dof + 2]);
+          if (sp > maxShardSpMps) maxShardSpMps = sp;
+          if (f >= 10) {
+            const w = Math.hypot(jData.qvel[dof + 3], jData.qvel[dof + 4], jData.qvel[dof + 5]);
+            if (w > maxPausedSpinRadS) maxPausedSpinRadS = w;
+          }
+        }
+      }
+
+      // Release mid-pile and step 1.5 s to full settle
+      jw.endGrab(false, 2000 + (sweepFrames + 36) * 16.67);
+      for (let f = 1; f <= 95; f++) {
+        jw.step(1 / 60);
+        for (const s of jw.shards) {
+          if (Math.hypot(s.position[0], s.position[2]) > TABLE_RADIUS - 0.1) continue;
+          const dof = jMap.shardDofAdr[s.slotIndex]!;
+          const sp = Math.hypot(jData.qvel[dof], jData.qvel[dof + 1], jData.qvel[dof + 2]);
+          if (sp > maxShardSpMps) maxShardSpMps = sp;
+        }
+      }
+
+      expect(jw.shatteredCount - shatBeforeSweep).toBe(0);
+      expect(maxShardSpMps).toBeLessThanOrEqual(1.45 * driveSpeedMps + 0.14);
+      expect(maxPausedSpinRadS).toBeLessThan(2.2);
+
+      // Mandatory 100% Re-Solidification Guarantee (`0` post-settle ghost shards!)
+      let postSettleGhost = 0;
+      for (const s of jw.shards) {
+        const offRim = Math.hypot(s.position[0], s.position[2]) > TABLE_RADIUS + 0.01;
+        if (!offRim && jModel.geom_contype[s.colliderHandle] === MJ_CONTYPE_CULLET_SHARD) {
+          if (
+            (jModel.geom_conaffinity[s.colliderHandle] & MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE) !==
+            MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE
+          ) {
+            postSettleGhost++;
+          }
+        }
+      }
+      expect(postSettleGhost).toBe(0);
+      jw.dispose();
+    }
+
+    // Hero shards (`0x04`) resting peacefully on top of a flat brick preserve block collision (Tablecloth Pull guard)
+    {
+      const tw = new PhysicsWorld(audio, 4, { seed: 42 });
+      tw.rebuildTower('sandbox', 2, 4, 42);
+      for (let f = 0; f < 15; f++) tw.step(1 / 60);
+      const trw = tw.getWorld();
+      const tModel = trw.getModel()!;
+      for (let i = 2; i < tw.blocks.length; i++) {
+        syncBlockPoseClean(tw, i, [-3.2, BLOCK_HALF_Y, -2.0 + i * 0.4], [0, 0, 0, 1]);
+      }
+      syncBlockPoseClean(tw, 0, [0, BLOCK_HALF_Y, 0], [0, 0, 0, 1]);
+      syncBlockPoseClean(tw, 1, [0, 0.28, 0], [0, 0, 0, 1]);
+      tw.shatterBlock(tw.blocks[1]!, [0, 0, 0], 9.0, [0, 1, 0], false);
+      const hero = tw.shards.find(
+        (s) => tModel.geom_contype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD
+      )!;
+      expect(hero).toBeDefined();
+      trw.getRigidBody(hero.bodyHandle)!.setTranslation({ x: 0, y: BLOCK_HALF_Y * 2 + 0.06, z: 0 }, true);
+      trw.getRigidBody(hero.bodyHandle)!.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      for (let f = 0; f < 45; f++) tw.step(1 / 60);
+      expect(hero.position[1]).toBeGreaterThan(BLOCK_HALF_Y * 1.85);
+      expect(tModel.geom_conaffinity[hero.colliderHandle] & MJ_CONTYPE_BLOCK).toBe(MJ_CONTYPE_BLOCK);
+      tw.dispose();
+    }
+
+    // 3b. 60 Hz `±0.12 mm` pointer-tremor mid-pile pause relaxes `<connect>` crush `< 0.80 N` + single-block bevel-to-table wedge escape + symmetric `±30 mm` end-tow
+    {
+      const bw = new PhysicsWorld(audio, 6, { seed: 42 });
+      bw.rebuildTower('sandbox', 2, 6, 42);
+      for (let f = 0; f < 15; f++) bw.step(1 / 60);
+      const brw = bw.getWorld();
+      const bm = brw.getModel()!;
+      const bd = brw.getData()!;
+      for (let i = 2; i < bw.blocks.length; i++) {
+        bw.blocks[i]!.extracted = true;
+        brw.getRigidBody(bw.blocks[i]!.bodyHandle)!.setTranslation({ x: -8, y: -5, z: -5 }, false);
+      }
+      const qJaw = quatFromAxisAngle([0, 1, 0], Math.PI * 0.5);
+      syncBlockPoseClean(bw, 1, [0.28, BLOCK_HALF_Y, 0.0], [qJaw[0], qJaw[1], qJaw[2], qJaw[3]]);
+      syncBlockPoseClean(bw, 0, [-0.35, BLOCK_HALF_Y, 0.0], [qJaw[0], qJaw[1], qJaw[2], qJaw[3]]);
+      bm.body_mass[bw.blocks[1]!.bodyHandle] = 2.5;
+      const b1Dof = (bw as unknown as { map: { blockDofAdr: number[] } }).map.blockDofAdr[1]!;
+      bm.dof_M0[b1Dof + 0] = 2.5;
+      bm.dof_M0[b1Dof + 1] = 2.5;
+      bm.dof_M0[b1Dof + 2] = 2.5;
+      for (let f = 0; f < 20; f++) bw.step(1 / 60);
+      bw.startGrabBlock(0, [0, BLOCK_HALF_Y, 0], [-0.35, BLOCK_HALF_Y * 2, 0], 1000);
+      for (let f = 1; f <= 20; f++) {
+        bw.updateGrabTarget([-0.35 + (0.65 * f) / 20, bw.grabPlaneY, 0], 1000 + f * 16.67);
+        bw.step(1 / 60);
+      }
+      let maxLateTremorCrushN = 0;
+      for (let f = 1; f <= 36; f++) {
+        const tremorDm = (f % 2 === 0 ? 1 : -1) * 0.0012;
+        bw.updateGrabTarget([0.30 + tremorDm, bw.grabPlaneY, 0], 1333.4 + f * 16.67);
+        bw.step(1 / 60);
+        if (f >= 28 && bd.ne >= 3) {
+          const fEqH = Math.hypot(bd.efc_force[0], bd.efc_force[2]);
+          if (fEqH > maxLateTremorCrushN) maxLateTremorCrushN = fEqH;
+        }
+      }
+      expect(maxLateTremorCrushN).toBeLessThan(0.8);
+      bw.endGrab(false);
+      bw.dispose();
+
+      // Symmetric +30 mm and -30 mm outward end-tow over shards
+      const towAngles: number[] = [];
+      for (const lx of [0.30, -0.30]) {
+        const tw2 = new PhysicsWorld(audio, 6, { seed: 42 });
+        tw2.rebuildTower('sandbox', 2, 6, 42);
+        for (let f = 0; f < 15; f++) tw2.step(1 / 60);
+        const rw2 = tw2.getWorld();
+        for (let i = 1; i < tw2.blocks.length; i++) {
+          if (i <= 3) {
+            syncBlockPoseClean(tw2, i, [0, 0.16, 0], [0, 0, 0, 1]);
+            tw2.shatterBlock(tw2.blocks[i]!, [0, 0, 0], 11.0, [0, 1, 0], true);
+          } else {
+            tw2.blocks[i]!.extracted = true;
+            rw2.getRigidBody(tw2.blocks[i]!.bodyHandle)!.setTranslation({ x: -8, y: -5, z: -5 }, false);
+          }
+        }
+        const sgn = Math.sign(lx);
+        syncBlockPoseClean(tw2, 0, [-0.8 * sgn, BLOCK_HALF_Y, 0], [0, 0, 0, 1]);
+        for (let f = 0; f < 40; f++) tw2.step(1 / 60);
+        const g0: [number, number, number] = [tw2.blocks[0]!.position[0] + lx, BLOCK_HALF_Y * 2, 0];
+        tw2.startGrabBlock(0, [lx, BLOCK_HALF_Y, 0], g0, 1000);
+        for (let f = 1; f <= 45; f++) {
+          tw2.updateGrabTarget(
+            [g0[0] + (sgn * 1.8 * f) / 45, tw2.grabPlaneY, (0.45 * f) / 45],
+            1000 + f * 16.67
+          );
+          tw2.step(1 / 60);
+        }
+        const tipOut = quatRotateVec3(tw2.blocks[0]!.rotation, [sgn, 0, 0]);
+        towAngles.push((Math.atan2(tipOut[2], tipOut[0] * sgn) * 180) / Math.PI);
+        tw2.dispose();
+      }
+      expect(Math.abs(towAngles[0]! - towAngles[1]!)).toBeLessThan(6.0);
+    }
+
+    // --- 4. Foreground-Shard Click Disambiguation + `+2.5 mm` Sandbox Bevel Pick Margin + Grazing Ray Clamp ---
+    {
+      const canvasMock = {
+        width: 1280,
+        height: 800,
+        style: { cursor: 'default' },
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 800 }),
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        setPointerCapture: () => {},
+        releasePointerCapture: () => {},
+      } as unknown as HTMLCanvasElement;
+      const eng = new GameEngine(canvasMock);
+      await eng.initHeadless();
+      const engPhys = (eng as unknown as { physics: PhysicsWorld }).physics;
+      engPhys.rebuildTower('sandbox', 2, 6, 42);
+      for (let f = 0; f < 20; f++) engPhys.step(1 / 60);
+      const erw = engPhys.getWorld();
+      for (let i = 2; i < engPhys.blocks.length; i++) {
+        engPhys.blocks[i]!.extracted = true;
+        erw.getRigidBody(engPhys.blocks[i]!.bodyHandle)!.setTranslation({ x: -6 - i * 0.8, y: -5, z: -5 }, false);
+      }
+      erw.syncKinematics();
+      syncBlockPoseClean(engPhys, 1, [1.8, 0.22, 1.8], [0, 0, 0, 1]);
+      engPhys.shatterBlock(engPhys.blocks[1]!, [0, 0, 0], 11.0, [0, 1, 0], true);
+      syncBlockPoseClean(engPhys, 0, [0.0, BLOCK_HALF_Y, 1.4], [0, 0, 0, 1]);
+      for (let f = 0; f < 45; f++) engPhys.step(1 / 60);
+
+      const cam = (eng as unknown as {
+        camera: {
+          position: [number, number, number];
+          azimuth: number;
+          elevation: number;
+          isUserOrbiting: boolean;
+          update: (dt: number, aspect: number) => void;
+          viewProjMatrix: Float32Array;
+        };
+      }).camera;
+      cam.update(0.016, 1280 / 800);
+      const vp = cam.viewProjMatrix;
+      const project = (p: [number, number, number]): [number, number] => {
+        const cx = vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12];
+        const cy = vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13];
+        const cw = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+        return [((cx / cw) * 0.5 + 0.5) * 1280, (0.5 - (cy / cw) * 0.5) * 800];
+      };
+
+      // Place a foreground shard directly along the ray from `cam.position` to `blk0.position` (`t = 0.78`)
+      const blk0 = engPhys.blocks[0]!;
+      const fgShard = [...engPhys.shards].sort((a, b) => b.massKg - a.massKg)[0]!;
+      const placeForegroundOccluder = (): [number, number] => {
+        const u = 0.82;
+        const ox = cam.position[0] + (blk0.position[0] - cam.position[0]) * u;
+        const oy = cam.position[1] + (blk0.position[1] - cam.position[1]) * u;
+        const oz = cam.position[2] + (blk0.position[2] - cam.position[2]) * u;
+        const rbFg = erw.getRigidBody(fgShard.bodyHandle)!;
+        rbFg.setTranslation({ x: ox, y: oy, z: oz }, true);
+        rbFg.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        rbFg.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        fgShard.position = [ox, oy, oz];
+        erw.syncKinematics();
+        return project([ox, oy, oz]);
+      };
+
+      // 4a. `< 5 px` tap on foreground-occluded block -> nudges foreground shard, `0` camera orbit, `0` block grab!
+      const [fx0, fy0] = placeForegroundOccluder();
+      const azBeforeTap = cam.azimuth;
+      const elBeforeTap = cam.elevation;
+      eng.handlePointerDown(fx0, fy0, 1, 0, false, undefined, 'mouse', 5000);
+      eng.handlePointerMove(fx0 + 2, fy0 + 1, 1, undefined, 'mouse', 5016);
+      eng.handlePointerUp(fx0 + 2, fy0 + 1, 1, undefined, 'mouse', 5032);
+      cam.update(0.016, 1280 / 800);
+      const fgDof = (engPhys as unknown as { map: { shardDofAdr: number[] } }).map
+        .shardDofAdr[fgShard.slotIndex]!;
+      const fgTapSpeed = Math.hypot(
+        erw.getData()!.qvel[fgDof],
+        erw.getData()!.qvel[fgDof + 1],
+        erw.getData()!.qvel[fgDof + 2]
+      );
+      expect(fgTapSpeed).toBeGreaterThan(0.15);
+      expect(engPhys.activeBlockId).toBeNull();
+      expect(cam.isUserOrbiting).toBe(false);
+      expect(Math.abs(cam.azimuth - azBeforeTap)).toBeLessThan(1e-6);
+      expect(Math.abs(cam.elevation - elBeforeTap)).toBeLessThan(1e-6);
+
+      // 4b. `>= 5 px` drag on foreground-occluded block -> starts grabbing `blk0` with `0` camera orbit!
+      const [fx1, fy1] = placeForegroundOccluder();
+      eng.handlePointerDown(fx1, fy1, 1, 0, false, undefined, 'mouse', 6000);
+      eng.handlePointerMove(fx1 + 10, fy1, 1, undefined, 'mouse', 6020);
+      cam.update(0.016, 1280 / 800);
+      expect(engPhys.activeBlockId).toBe(blk0.id);
+      expect(cam.isUserOrbiting).toBe(false);
+      expect(Math.abs(cam.azimuth - azBeforeTap)).toBeLessThan(1e-6);
+      eng.handlePointerUp(fx1 + 10, fy1, 1, undefined, 'mouse', 6040);
+
+      // 4c. `+2.0 mm` (`+0.020 dm`) outside exact bevel edge of Sandbox rubble block -> grabs via Pass 2 (`+2.5 mm` margin)!
+      for (const s of engPhys.shards) {
+        erw.getRigidBody(s.bodyHandle)!.setTranslation({ x: -3.0, y: 0.05, z: -3.0 }, true);
+      }
+      syncBlockPoseClean(engPhys, 0, [0.0, BLOCK_HALF_Y, 1.4], [0, 0, 0, 1]);
+      erw.syncKinematics();
+      const bevelMarginPt: [number, number, number] = [
+        blk0.position[0] + BLOCK_HALF_X + 0.020,
+        blk0.position[1] + BLOCK_HALF_Y * 0.5,
+        blk0.position[2],
+      ];
+      const [bxPx, byPx] = project(bevelMarginPt);
+      eng.handlePointerDown(bxPx, byPx, 1, 0, false, undefined, 'mouse', 7000);
+      eng.handlePointerMove(bxPx + 9, byPx, 1, undefined, 'mouse', 7020);
+      expect(engPhys.activeBlockId).toBe(blk0.id);
+      expect(cam.isUserOrbiting).toBe(false);
+
+      // 4d. Grazing `< 10 deg` camera ray (`|ray.dir[1]| < 0.17`) clamps excursion `<= 2.85 dm` AND transitions C^1-smoothly across `ray.dir[1] = -0.22 .. -0.12` without background shoot (`<= 3.6 dm`) or cliff jump (`< 0.05 dm` across `-0.172 -> -0.168`)
+      const anchorAtGrab: [number, number, number] = [...engPhys.grabCurrentWorldOnBlock];
+      cam.elevation = 0.065;
+      (cam as unknown as { targetElevation: number }).targetElevation = 0.065;
+      cam.update(1.0, 1280 / 800);
+      eng.handlePointerMove(640, 395, 1, undefined, 'mouse', 7032);
+      const radialExcursionDm = Math.hypot(
+        engPhys.grabWorldAnchor[0] - anchorAtGrab[0],
+        engPhys.grabWorldAnchor[2] - anchorAtGrab[2]
+      );
+      expect(radialExcursionDm).toBeLessThanOrEqual(2.85);
+      eng.handlePointerUp(640, 395, 1, undefined, 'mouse', 7040);
+
+      cam.elevation = 0.22;
+      (cam as unknown as { targetElevation: number }).targetElevation = 0.22;
+      cam.update(1.0, 1280 / 800);
+      const testAnchor: [number, number, number] = [0, BLOCK_HALF_Y, 0];
+      const pt18 = eng.projectBlockDragPlane(
+        cam.position,
+        [0, -0.18, -Math.sqrt(1 - 0.18 * 0.18)],
+        testAnchor
+      )!;
+      const pt172 = eng.projectBlockDragPlane(
+        cam.position,
+        [0, -0.172, -Math.sqrt(1 - 0.172 * 0.172)],
+        testAnchor
+      )!;
+      const pt168 = eng.projectBlockDragPlane(
+        cam.position,
+        [0, -0.168, -Math.sqrt(1 - 0.168 * 0.168)],
+        testAnchor
+      )!;
+      const r18 = Math.hypot(pt18[0] - testAnchor[0], pt18[2] - testAnchor[2]);
+      const r172 = Math.hypot(pt172[0] - testAnchor[0], pt172[2] - testAnchor[2]);
+      const r168 = Math.hypot(pt168[0] - testAnchor[0], pt168[2] - testAnchor[2]);
+      expect(r18).toBeLessThanOrEqual(3.0);
+      expect(Math.abs(r172 - r168)).toBeLessThan(0.05);
+
+      // 4e. Distant (`16.5 cm` > `11.5 cm`) foreground shard in collapsed Sandbox rubble still defers (`0%` orbit hijack on drag), and `6.5 px` touch tap (`<= 8.0 px` touch slop) still flicks foreground shard!
+      syncBlockPoseClean(engPhys, 2, [1.5, 0.22, 1.5], [0, 0, 0, 1]);
+      engPhys.blocks[2]!.extracted = false;
+      engPhys.shatterBlock(engPhys.blocks[2]!, [0, 0, 0], 11.0, [0, 1, 0], true);
+      syncBlockPoseClean(engPhys, 0, [0.0, BLOCK_HALF_Y, 0.4], [0, 0, 0, 1]);
+      cam.azimuth = 0;
+      (cam as unknown as { targetAzimuth: number }).targetAzimuth = 0;
+      cam.elevation = 0.16;
+      (cam as unknown as { targetElevation: number }).targetElevation = 0.16;
+      for (let f = 0; f < 40; f++) cam.update(0.05, 1280 / 800);
+      const rDx = blk0.position[0] - cam.position[0];
+      const rDy = blk0.position[1] - cam.position[1];
+      const rDz = blk0.position[2] - cam.position[2];
+      const dBlk = Math.hypot(rDx, rDy, rDz);
+      const uFar = (dBlk - 1.65) / dBlk;
+      const fxFar = cam.position[0] + rDx * uFar;
+      const fyFar = cam.position[1] + rDy * uFar;
+      const fzFar = cam.position[2] + rDz * uFar;
+      erw.getRigidBody(fgShard.bodyHandle)!.setTranslation({ x: fxFar, y: fyFar, z: fzFar }, true);
+      erw.getRigidBody(fgShard.bodyHandle)!.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      fgShard.position = [fxFar, fyFar, fzFar];
+      erw.syncKinematics();
+      const [farPx, farPy] = project([fxFar, fyFar, fzFar]);
+      eng.handlePointerDown(farPx, farPy, 1, 0, false, undefined, 'mouse', 7100);
+      expect(eng.getInteractionMode()).toBe('block_pending');
+      eng.handlePointerMove(farPx + 12, farPy, 1, undefined, 'mouse', 7120);
+      expect(engPhys.activeBlockId).toBe(blk0.id);
+      expect(cam.isUserOrbiting).toBe(false);
+      eng.handlePointerUp(farPx + 12, farPy, 1, undefined, 'mouse', 7140);
+
+      erw.getRigidBody(fgShard.bodyHandle)!.setTranslation({ x: fxFar, y: fyFar, z: fzFar }, true);
+      erw.getRigidBody(fgShard.bodyHandle)!.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      fgShard.position = [fxFar, fyFar, fzFar];
+      erw.syncKinematics();
+      const [tchPx, tchPy] = project([fxFar, fyFar, fzFar]);
+      eng.handlePointerDown(tchPx, tchPy, 2, 0, false, undefined, 'touch', 7200);
+      eng.handlePointerMove(tchPx + 6.5, tchPy, 2, undefined, 'touch', 7215);
+      eng.handlePointerUp(tchPx + 6.5, tchPy, 2, undefined, 'touch', 7230);
+      const touchTapSp = Math.hypot(
+        erw.getData()!.qvel[fgDof],
+        erw.getData()!.qvel[fgDof + 1],
+        erw.getData()!.qvel[fgDof + 2]
+      );
+      expect(touchTapSp).toBeGreaterThan(0.15);
+      expect(engPhys.activeBlockId).toBeNull();
+      eng.dispose();
+    }
+
+    // --- 5. Topple, Column-Drop, Stump Rocket & Camera Focus-Hold Invariants ---
+    // 5a. `8` upright courses (`L10..L17`) dropping `15 mm` onto a `9L` stump (`L9` extracted) -> `0` shattered blocks!
+    {
+      const cw = new PhysicsWorld(audio, 18, { seed: 42 });
+      cw.rebuildTower('sandbox', 2, 18, 42);
+      for (let f = 0; f < 25; f++) cw.step(1 / 60);
+      const crw = cw.getWorld();
+      for (const b of cw.blocks) {
+        if (b.assignedLayer === 9) {
+          syncBlockPoseClean(
+            cw,
+            b.id,
+            [2.8, BLOCK_HALF_Y, (b.assignedSlot - 1) * 0.45],
+            [0, 0, 0, 1]
+          );
+        }
+      }
+      for (const b of cw.blocks) {
+        if (b.assignedLayer !== 9) crw.wakeBody(b.bodyHandle);
+      }
+      for (let f = 0; f < 90; f++) cw.step(1 / 60);
+      expect(cw.shatteredCount).toBe(0);
+      const columnCrazed = cw.blocks.filter((b) => b.assignedLayer !== 9 && b.damage > 0.05).length;
+      expect(columnCrazed).toBeLessThanOrEqual(1);
+      cw.dispose();
+    }
+
+    // 5b. Yanking `L4` from an `8L` Sandbox stump keeps `L7` upward apex hop `< 8.5 cm` (vs `25+ cm` seesaw rocket!)
+    {
+      const yw = new PhysicsWorld(audio, 8, { seed: 42 });
+      yw.rebuildTower('sandbox', 2, 8, 42);
+      for (let f = 0; f < 20; f++) yw.step(1 / 60);
+      const l4Center = yw.blocks.find((b) => b.assignedLayer === 4 && b.assignedSlot === 1)!;
+      const l7Blocks = yw.blocks.filter((b) => b.assignedLayer === 7);
+      const l7InitY = l7Blocks[0]!.position[1];
+      let maxL7HopCm = 0;
+      const gStart: [number, number, number] = [
+        l4Center.position[0] + BLOCK_HALF_X,
+        l4Center.position[1],
+        l4Center.position[2],
+      ];
+      yw.startGrabBlock(l4Center.id, [BLOCK_HALF_X, 0, 0], gStart);
+      for (let f = 1; f <= 36; f++) {
+        if (f <= 14) {
+          yw.updateGrabTarget(
+            [gStart[0] + (2.6 * f) / 14, gStart[1] - 0.12, gStart[2]],
+            8000 + f * 16.67
+          );
+        } else if (f === 15) {
+          yw.endGrab(false, 8000 + f * 16.67);
+        }
+        yw.step(1 / 60);
+        for (const topB of l7Blocks) {
+          const hopCm = (topB.position[1] - l7InitY) * 10;
+          if (hopCm > maxL7HopCm) maxL7HopCm = hopCm;
+        }
+      }
+      expect(maxL7HopCm).toBeLessThan(8.5);
+      yw.dispose();
+    }
+
+    // 5c. `triggerSandboxCollapseImpulse()` on a `7L` stump surrounded by flat tabletop rubble (`L7..L17` scattered)
+    // leaves flat tabletop rubble 100% stationary (`< 0.02 m/s`) while overturning the `7L` stump cleanly!
+    {
+      const rwStump = new PhysicsWorld(audio, 18, { seed: 42 });
+      rwStump.rebuildTower('sandbox', 2, 18, 42);
+      for (let f = 0; f < 20; f++) rwStump.step(1 / 60);
+      const rubbleBlocks: number[] = [];
+      for (const b of rwStump.blocks) {
+        if (b.assignedLayer >= 7) {
+          const ang = ((b.id - 21) / 33) * Math.PI * 2;
+          const rad = 1.65 + (b.id % 4) * 0.38;
+          syncBlockPoseClean(
+            rwStump,
+            b.id,
+            [Math.cos(ang) * rad, BLOCK_HALF_Y, Math.sin(ang) * rad],
+            [0, 0, 0, 1]
+          );
+          if (rad > 2.2 && Math.cos(ang) < -0.2) {
+            rubbleBlocks.push(b.id);
+          }
+        }
+      }
+      for (let f = 0; f < 35; f++) rwStump.step(1 / 60);
+      expect(rubbleBlocks.length).toBeGreaterThanOrEqual(4);
+
+      rwStump.triggerSandboxCollapseImpulse();
+      const sData = rwStump.getWorld().getData()!;
+      const sMap = (rwStump as unknown as { map: { blockDofAdr: number[] } }).map;
+      let maxRubbleKickMps = 0;
+      for (const id of rubbleBlocks) {
+        const dof = sMap.blockDofAdr[id]!;
+        const sp = Math.hypot(sData.qvel[dof], sData.qvel[dof + 1], sData.qvel[dof + 2]);
+        if (sp > maxRubbleKickMps) maxRubbleKickMps = sp;
+      }
+      expect(maxRubbleKickMps).toBeLessThan(0.02);
+
+      for (let f = 0; f < 65; f++) rwStump.step(1 / 60);
+      const stumpTopRemainingY = Math.max(
+        ...rwStump.blocks
+          .filter((b) => b.assignedLayer < 7 && !b.shattered)
+          .map((b) => b.position[1])
+      );
+      expect(stumpTopRemainingY).toBeLessThan(0.55);
+      rwStump.dispose();
+    }
+
+    // 5d. `18L` Buckle progressive fall (`impactTime >= 0.36 s`), `0` rim shard geysers (`maxRimShardYM < 0.085 m`),
+    // and `GameEngine` Sandbox camera `focusHeight` held steady (`0.000 dm` mid-air jump as `currentLayers` crosses `< 8`)!
+    {
+      const canvasMock = {
+        width: 1280,
+        height: 800,
+        style: { cursor: 'default' },
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 800 }),
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        setPointerCapture: () => {},
+        releasePointerCapture: () => {},
+      } as unknown as HTMLCanvasElement;
+      const eng = new GameEngine(canvasMock);
+      await eng.initHeadless();
+      const engPhys = (eng as unknown as { physics: PhysicsWorld }).physics;
+      const cam = (eng as unknown as {
+        camera: { desiredTargetY: number; update: (dt: number, aspect: number) => void };
+      }).camera;
+
+      engPhys.rebuildTower('sandbox', 2, 18, 42);
+      for (let f = 0; f < 25; f++) {
+        engPhys.step(1 / 60);
+        eng.updateCameraFocusTarget(1 / 60);
+        cam.update(1 / 60, 1280 / 800);
+      }
+      const focusBeforeTopple = cam.desiredTargetY;
+      expect(focusBeforeTopple).toBeGreaterThan(1.38);
+
+      engPhys.triggerSandboxCollapseImpulse();
+      let impactTimeSec = -1;
+      let sawMidAirLayersBelow8 = false;
+      let maxMidAirFocusDropDm = 0;
+      let maxRimShardYM = 0;
+
+      for (let f = 1; f <= 180; f++) {
+        engPhys.step(1 / 60);
+        eng.updateCameraFocusTarget(1 / 60);
+        cam.update(1 / 60, 1280 / 800);
+
+        if (impactTimeSec < 0 && engPhys.shatteredCount > 0) {
+          impactTimeSec = f / 60;
+        }
+        if (impactTimeSec < 0 && engPhys.currentLayers < 8) {
+          sawMidAirLayersBelow8 = true;
+          const dropDm = Math.abs(focusBeforeTopple - cam.desiredTargetY);
+          if (dropDm > maxMidAirFocusDropDm) maxMidAirFocusDropDm = dropDm;
+        }
+        for (const s of engPhys.shards) {
+          const rM = Math.hypot(s.position[0], s.position[2]) * 0.1;
+          const yM = s.position[1] * 0.1;
+          if (rM > 0.29 && yM > maxRimShardYM) {
+            maxRimShardYM = yM;
+          }
+        }
+      }
+
+      expect(impactTimeSec).toBeGreaterThanOrEqual(0.36);
+      expect(sawMidAirLayersBelow8).toBe(true);
+      expect(maxMidAirFocusDropDm).toBeLessThan(1e-5);
+      expect(maxRimShardYM).toBeLessThan(0.085);
+
+      // Continue stepping past full settle to verify smooth post-collapse slew down toward 1.32 dm (`< 1.34 dm`)
+      for (let f = 0; f < 240; f++) {
+        engPhys.step(1 / 60);
+        eng.updateCameraFocusTarget(1 / 60);
+        cam.update(1 / 60, 1280 / 800);
+      }
+      expect(cam.desiredTargetY).toBeLessThan(1.34);
+      eng.dispose();
+
+      // Verify identical post-collapse camera slew in Worker mode (`MujocoWorkerBridge` clears `sandboxCollapseActive`)
+      const wChan = new MessageChannel();
+      const wClient: WorkerEndpointLike = {
+        onmessage: null,
+        postMessage(msg: WorkerInboundMessage, transfer?: Transferable[]) {
+          wChan.port1.postMessage(msg, transfer as never);
+        },
+        terminate() {
+          wChan.port1.close();
+          wChan.port2.close();
+        },
+        addEventListener() {},
+        removeEventListener() {},
+      };
+      const wHostScope = {
+        onmessage: null as ((ev: MessageEvent<WorkerInboundMessage>) => void) | null,
+        postMessage(msg: WorkerOutboundMessage, transfer?: Transferable[]) {
+          wChan.port2.postMessage(msg, transfer as never);
+        },
+      };
+      wChan.port1.onmessage = (ev) => wClient.onmessage?.(ev as MessageEvent<WorkerOutboundMessage>);
+      wChan.port2.onmessage = (ev) => wHostScope.onmessage?.(ev as MessageEvent<WorkerInboundMessage>);
+      const wHostHandle = attachMujocoWorkerHost(wHostScope);
+      const wBridge = await MujocoWorkerBridge.create(audio, 18, 42, wClient);
+      const wEng = new GameEngine(canvasMock);
+      (wEng as unknown as { physics: MujocoWorkerBridge }).physics = wBridge;
+      const wCam = (wEng as unknown as {
+        camera: { desiredTargetY: number; update: (dt: number, aspect: number) => void };
+      }).camera;
+      wBridge.rebuildTower('sandbox', 2, 18, 42);
+      await new Promise((r) => setTimeout(r, 30));
+      (wEng as unknown as { resetSandboxCameraHoldState: (h: number) => void }).resetSandboxCameraHoldState(
+        27.0
+      );
+      for (let f = 0; f < 8; f++) {
+        wBridge.step(1 / 60);
+        await new Promise((r) => setTimeout(r, 6));
+        wEng.updateCameraFocusTarget(1 / 60);
+        wCam.update(1 / 60, 1280 / 800);
+      }
+      const wFocusPre = wCam.desiredTargetY;
+      wEng.triggerCollapseDemo();
+      let wMaxMidFallDrop = 0;
+      for (let f = 0; f < 340; f++) {
+        wBridge.step(1 / 60);
+        await new Promise((r) => setTimeout(r, 5));
+        wEng.updateCameraFocusTarget(1 / 60);
+        wCam.update(1 / 60, 1280 / 800);
+        if (wBridge.shatteredCount === 0 && wBridge.currentLayers < 8) {
+          wMaxMidFallDrop = Math.max(wMaxMidFallDrop, Math.abs(wFocusPre - wCam.desiredTargetY));
+        }
+      }
+      expect(wMaxMidFallDrop).toBeLessThan(1e-5);
+      expect(wBridge.sandboxCollapseActive).toBe(false);
+      expect(wCam.desiredTargetY).toBeLessThan(1.34);
+      wBridge.dispose();
+      wHostHandle.dispose();
+      wClient.terminate?.();
+    }
+
+    // 5e. Natural `18L` gravity topple breaks up overdamped "sliced-bread" collinear landing (`< 45%` vs `62.5%` prior)
+    {
+      const nw = new PhysicsWorld(audio, 18, { seed: 42 });
+      nw.rebuildTower('sandbox', 2, 18, 42);
+      for (let f = 0; f < 20; f++) nw.step(1 / 60);
+      const nrw = nw.getWorld();
+      for (const b of nw.blocks) {
+        if ((b.assignedLayer === 1 || b.assignedLayer === 2) && b.assignedSlot >= 1) {
+          b.extracted = true;
+          nrw.getRigidBody(b.bodyHandle)!.setTranslation({ x: -6 - b.id, y: -5, z: -5 }, false);
+        }
+      }
+      nrw.syncKinematics();
+      for (const b of nw.blocks) {
+        if (!b.extracted) nrw.wakeBody(b.bodyHandle);
+      }
+      for (let f = 0; f < 180; f++) nw.step(1 / 60);
+      const midSurvivors = nw.blocks.filter(
+        (b) => !b.shattered && !b.extracted && b.assignedLayer >= 5 && b.assignedLayer <= 12
+      );
+      let closeCollinear = 0;
+      for (let i = 0; i < midSurvivors.length; i++) {
+        let hasClose = false;
+        for (let j = 0; j < midSurvivors.length; j++) {
+          if (i === j || midSurvivors[i]!.assignedLayer === midSurvivors[j]!.assignedLayer) continue;
+          const dMm =
+            Math.hypot(
+              midSurvivors[i]!.position[0] - midSurvivors[j]!.position[0],
+              midSurvivors[i]!.position[2] - midSurvivors[j]!.position[2]
+            ) * 100;
+          if (dMm < 28) hasClose = true;
+        }
+        if (hasClose) closeCollinear++;
+      }
+      expect(closeCollinear / Math.max(1, midSurvivors.length)).toBeLessThan(0.45);
+      nw.dispose();
+    }
+  }, 120000);
 });
