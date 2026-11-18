@@ -314,10 +314,17 @@ export function computeGlassBarModes(params: GlassBarModalParams = {}): GlassBar
       Math.pow(2.0 * Math.PI * rawTimoHz, 2) + (order === 1 ? winklerOmegaSq : winklerOmegaSq * 0.45);
     const freqHz = Math.sqrt(clampedOmegaSq) / (2.0 * Math.PI);
 
-    // Crack-induced symmetry breaking splits modes into closely spaced beating doublets
-    const splitRatio = damage > 0.001 ? damage * (0.0045 + 0.0105 * damage) * (1.0 + 0.12 * (order - 1)) : 0.0;
-    const doubletFreqHz = freqHz * (1.0 + splitRatio);
-    const splitBeatHz = doubletFreqHz - freqHz;
+    // Crack-induced symmetry breaking splits modes into closely spaced beating doublets.
+    // In ductile solder-held cracked bricks (damage in [0.78, 0.96]), degenerate free-free flexural
+    // and torsional modal frequencies split into an acoustic doublet producing an audible beat frequency
+    // in the range 30-48 Hz for the primary flexural mode (e.g. ~32 Hz at d=0.78, ~47 Hz at d=0.96),
+    // strictly 0 at d=0, and ~14 Hz (> 10 Hz) at intermediate crazing d=0.45.
+    const splitRatio =
+      damage > 0.001
+        ? damage * (0.0088 + 0.0098 * damage * damage) * (1.0 + 0.12 * (order - 1))
+        : 0.0;
+    const splitBeatHz = rawTimoHz * splitRatio;
+    const doubletFreqHz = freqHz + splitBeatHz;
 
     // Total loss factor = bulk soda-lime + Zener thermoelastic + viscoelastic Sn-Pb came + crack Coulomb + clamping
     const omega = 2.0 * Math.PI * freqHz;
@@ -706,12 +713,14 @@ export function computeStribeckSlipProfile(params: {
   slipPowerMilliwatts?: number;
   torsionRadPerSec?: number;
   damage?: number;
+  seamCrossingIntensity?: number;
 }): StribeckSlipAudioProfile {
   const v = clamp(Math.abs(params.slideSpeedMps), 0.0, 2.0);
   const fn = clamp(params.clampingLoadN, 0.0, 60.0);
   const powerMw = clamp(params.slipPowerMilliwatts ?? fn * v * 180.0, 0.0, 250.0);
   const omega = clamp(Math.abs(params.torsionRadPerSec ?? 0.0), 0.0, 12.0);
   const damage = clamp(params.damage ?? 0.0, 0.0, 1.0);
+  const seamIntensity = clamp(params.seamCrossingIntensity ?? 0.0, 0.0, 1.0);
 
   const effSpeed = v + 0.012 * omega;
   if (effSpeed < 0.0025 && powerMw < 0.4) {
@@ -739,7 +748,11 @@ export function computeStribeckSlipProfile(params: {
   // Velocity-weakening slope magnitude |d(mu)/dv| peaks in the slow tense extraction window (0.5 - 6 cm/s)
   const weakeningWindow = clamp(Math.pow(ratio + 0.12, 0.55) * Math.exp(-0.55 * ratio) * 1.45, 0.0, 1.0);
   const loadTension01 = clamp((fn - 0.85) / 8.5, 0.0, 1.0);
-  const stickSlipIndex01 = clamp(loadTension01 * (0.35 + 0.65 * weakeningWindow), 0.0, 1.0);
+  const stickSlipIndex01 = clamp(
+    loadTension01 * (0.35 + 0.65 * weakeningWindow) + 0.28 * seamIntensity,
+    0.0,
+    1.0
+  );
 
   const speedDrive01 = clamp((effSpeed - 0.0025) / 0.16, 0.0, 1.0);
   const unloadedFactor = 1.0 - 0.72 * loadTension01;
@@ -747,7 +760,7 @@ export function computeStribeckSlipProfile(params: {
 
   // Macroscopic mocap-pull tangential stick-slip displacement d_ss = (mu_s - mu_k)*F_N / k_pull (~0.65..1.8 mm)
   const dStickSlipMeters = 0.00065 + 0.00115 * loadTension01;
-  const stickSlipPulseHz = clamp(14.0 + effSpeed / dStickSlipMeters, 14.0, 185.0);
+  const stickSlipPulseHz = clamp(14.0 + effSpeed / dStickSlipMeters + 24.0 * seamIntensity, 14.0, 185.0);
 
   const barModes = computeGlassBarModes({ damage, clampingLoadN: fn });
   const fFlex1 = barModes[0]?.freqHz ?? 2865.0;
@@ -759,9 +772,9 @@ export function computeStribeckSlipProfile(params: {
 
   const powerBoost = clamp(powerMw / 55.0, 0.0, 1.0);
   const raspGain = clamp(
-    airyRaspIndex01 * 0.036 + speedDrive01 * 0.012,
+    airyRaspIndex01 * 0.036 + speedDrive01 * 0.012 + seamIntensity * 0.022,
     0.0,
-    0.055
+    0.065
   );
   const singGain = clamp(
     stickSlipIndex01 * (0.028 + 0.068 * Math.max(speedDrive01, powerBoost * 0.85)),

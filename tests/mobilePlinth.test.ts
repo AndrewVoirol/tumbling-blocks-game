@@ -1059,39 +1059,56 @@ describe('Cathedral Plinth Mobile HUD & E1–E8 Contracts', () => {
       const autoTuckExtracted = await cdp!.evaluate<string | null>(`new Promise((resolve) => {
         const eng = window.__VITRAIL_ENGINE__;
         eng.resetGame('solo', 2);
-        requestAnimationFrame(() => {
-          document.querySelector('button.plinth-sill-mode')?.click();
-          requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (document.querySelector('.mobile-hud-root')?.getAttribute('data-detent') !== 'half') {
+        const startMs = Date.now();
+        const waitSillAndHalf = () => {
+          const modeBtn = document.querySelector('button.plinth-sill-mode');
+          if (!modeBtn) {
+            if (Date.now() - startMs > 1500) {
+              resolve('missing_sill_mode_before_extracted');
+              return;
+            }
+            requestAnimationFrame(waitSillAndHalf);
+            return;
+          }
+          modeBtn.click();
+          const halfDeadline = Date.now() + 1500;
+          const waitHalf = () => {
+            if (document.querySelector('.mobile-hud-root')?.getAttribute('data-detent') === 'half') {
+              const blk = eng.physics.blocks.find((b) => b.isLegalTarget && b.isLooseSlot && b.assignedLayer >= 4 && b.assignedLayer <= 14);
+              const plan = eng.computeOptimalExtractionPlan(blk.id, 'master');
+              eng.physics.startGrabBlock(blk.id, plan.localGrab, plan.startWorld);
+              for (let i = 0; i < 140 && eng.physics.turnPhase !== 'EXTRACTED'; i++) {
+                const dist = Math.min(1.9, (i + 1) * 0.028);
+                eng.physics.updateGrabTarget([
+                  plan.startWorld[0] + plan.pullDirXZ[0] * dist,
+                  plan.startWorld[1],
+                  plan.startWorld[2] + plan.pullDirXZ[1] * dist,
+                ]);
+                eng.physics.step(1 / 60);
+              }
+              eng.physics.endGrab(false);
+              for (let i = 0; i < 12; i++) eng.physics.step(1 / 60);
+              const deadline = Date.now() + 1500;
+              const poll = () => {
+                const det = document.querySelector('.mobile-hud-root')?.getAttribute('data-detent') ?? null;
+                if (det === 'closed' || Date.now() > deadline) {
+                  resolve(eng.physics.turnPhase + ':' + det);
+                  return;
+                }
+                requestAnimationFrame(poll);
+              };
+              requestAnimationFrame(poll);
+              return;
+            }
+            if (Date.now() > halfDeadline) {
               resolve('not_half_before_extracted');
               return;
             }
-            const blk = eng.physics.blocks.find((b) => b.isLegalTarget && b.isLooseSlot && b.assignedLayer >= 4 && b.assignedLayer <= 14);
-            const plan = eng.computeOptimalExtractionPlan(blk.id, 'master');
-            eng.physics.startGrabBlock(blk.id, plan.localGrab, plan.startWorld);
-            for (let i = 0; i < 140 && eng.physics.turnPhase !== 'EXTRACTED'; i++) {
-              const dist = Math.min(1.9, (i + 1) * 0.028);
-              eng.physics.updateGrabTarget([
-                plan.startWorld[0] + plan.pullDirXZ[0] * dist,
-                plan.startWorld[1],
-                plan.startWorld[2] + plan.pullDirXZ[1] * dist,
-              ]);
-              eng.physics.step(1 / 60);
-            }
-            eng.physics.endGrab(false);
-            for (let i = 0; i < 12; i++) eng.physics.step(1 / 60);
-            const deadline = Date.now() + 500;
-            const poll = () => {
-              const det = document.querySelector('.mobile-hud-root')?.getAttribute('data-detent') ?? null;
-              if (det === 'closed' || Date.now() > deadline) {
-                resolve(eng.physics.turnPhase + ':' + det);
-                return;
-              }
-              requestAnimationFrame(poll);
-            };
-            requestAnimationFrame(poll);
-          }));
-        });
+            requestAnimationFrame(waitHalf);
+          };
+          requestAnimationFrame(waitHalf);
+        };
+        requestAnimationFrame(waitSillAndHalf);
       })`);
       expect(autoTuckExtracted).toBe('EXTRACTED:closed');
 

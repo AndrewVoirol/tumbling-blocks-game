@@ -121,7 +121,7 @@ fn fs_optical_depth_block(input: BlockOptDepthOut) -> @location(0) vec4<f32> {
   let cameBlock = max(vitrailEntry.cameMask, vitrailExit.cameMask);
   let fresnelTau = -log(max(0.14, (1.0 - fEntry) * 0.9572 * (1.0 - crackShadow * 0.38) * (1.0 - cameBlock * 0.82)));
 
-  let tauRGB = sigma * min(chordDm, 0.38) * 0.78 + vec3<f32>(fresnelTau);
+  let tauRGB = sigma * min(chordDm, 0.78) * 0.78 + vec3<f32>(fresnelTau);
   let casterExitY = clamp(min(input.worldPos.y, exitWorldPos.y), 0.0, 9.5);
   return vec4<f32>(tauRGB, casterExitY);
 }
@@ -275,7 +275,7 @@ fn vs_block_caustic_flux(
   let fEntry = dielectricFresnel(cosClamped, 1.0, GLASS_IOR_G);
   let cameOcc = max(vitrailEntry.cameMask, vitrailExit.cameMask);
   let fresnelTau = -log(max(0.14, (1.0 - fEntry) * 0.9572 * (1.0 - cameOcc * 0.85)));
-  let tauSelf = sigma * min(chordDm, 0.38) * 0.78 + vec3<f32>(fresnelTau);
+  let tauSelf = sigma * min(chordDm, 0.78) * 0.78 + vec3<f32>(fresnelTau);
 
   let crackShadow = evaluateInternalCracks(pos, blk.crackAndDamage.xyz, blk.crackAndDamage.w, seed);
   let faceTint = (1.0 - fEntry) * 0.9572 * (1.0 - crackShadow * 0.40) * (1.0 - cameOcc * 0.90) * facingGate * exp(-sigma * 0.04);

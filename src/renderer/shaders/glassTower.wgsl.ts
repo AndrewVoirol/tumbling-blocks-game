@@ -656,9 +656,17 @@ fn traceTowerGlassRayDispersed(
     let seamFresnel = dielectricFresnel(cosEntry, 1.0, iorG);
     let isTightContact = 1.0 - smoothstep(0.001, 0.022, nearestT);
     let seamReflDir = reflect(worldRayDir, entryNWorld);
-    var seamEnv = skyTint * 0.22 + sunColor * pow(max(0.0, dot(seamReflDir, L)), 6.0) * 0.55;
+    let hitWorldP = mulBlockL2WPoint(nearestIdx, localEntryPos);
+    let hitSunUV = projectTableSunUV(hitWorldP);
+    var hitCaustic = vec3<f32>(0.0);
+    if (hitSunUV.x >= 0.002 && hitSunUV.x <= 0.998 && hitSunUV.y >= 0.002 && hitSunUV.y <= 0.998) {
+      hitCaustic = textureSampleLevel(uCausticTex, uLinearSampler, hitSunUV, 0.0).rgb;
+    }
+    let polariscope = uBlockCenters[97].w;
+    let polariscopeMod = 1.0 - 0.75 * polariscope;
+    var seamEnv = skyTint * 0.22 + sunColor * (pow(max(0.0, dot(seamReflDir, L)), 6.0) * 0.55 + hitCaustic * 0.45 * polariscopeMod);
     if (bounce == 0u) {
-      seamEnv = sampleCathedralEnvironment(seamReflDir, L, sunColor, skyTint, atelierMix);
+      seamEnv = sampleCathedralEnvironment(seamReflDir, L, sunColor, skyTint, atelierMix) + sunColor * hitCaustic * 0.35 * polariscopeMod;
     }
     internalScatter += seamEnv * throughput * seamFresnel * (0.24 + 0.24 * isTightContact) * scatterGate;
 
@@ -831,13 +839,23 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let rawSunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, input.worldPos, macroWorldN, L, 0.022);
   let windowGobo = evaluateStudioWindowGobo(input.worldPos, L, atelierMix);
   let sunDirLocal = ((*pBlk).worldToLocal * vec4<f32>(-L, 0.0)).xyz;
-  let selfChord = clamp(intersectLocalSlabRaw(input.localPos + sunDirLocal * 0.001, sunDirLocal).y, 0.015, 0.38);
+  let selfChord = clamp(intersectLocalSlabRaw(input.localPos + sunDirLocal * 0.001, sunDirLocal).y, 0.015, 0.78);
   let sigmaSelf = mix((*pBlk).absorptionAndMotif.xyz, (*pBlk).accentAndSeed.xyz, vitrail.accentMix) + SODA_LIME_IRON_SIGMA;
   let tauSelf = sigmaSelf * selfChord * 0.78 + vec3<f32>(0.088);
   let optSample = sampleSunOpticalDepth(uSunOpticalDepthTex, uScene.sunViewProj, input.worldPos);
   let tauUpstream = max(vec3<f32>(0.0), optSample.rgb - tauSelf) * (1.0 - rawSunVis);
-  let sunTransRGB = mix(exp(-tauUpstream * 0.80), vec3<f32>(1.0), rawSunVis) * windowGobo;
-  let directSunVis = rawSunVis * windowGobo;
+
+  let sunUV = projectTableSunUV(input.worldPos);
+  var causticFlux = vec3<f32>(0.0);
+  if (sunUV.x >= 0.002 && sunUV.x <= 0.998 && sunUV.y >= 0.002 && sunUV.y <= 0.998) {
+    causticFlux = textureSampleLevel(uCausticTex, uLinearSampler, sunUV, 0.0).rgb;
+  }
+
+  let polariscope = uBlockCenters[97].w;
+  let polariscopeMod = 1.0 - 0.75 * polariscope;
+  let rawSunTrans = mix(exp(-tauUpstream * 0.80), vec3<f32>(1.0), rawSunVis) * windowGobo;
+  let sunTransRGB = (rawSunTrans + causticFlux * (1.0 - rawSunVis * 0.45) * windowGobo) * polariscopeMod;
+  let directSunVis = rawSunVis * windowGobo * polariscopeMod;
 
   // Attenuate waterglass ripples smoothly onto the diamond-polished 1.25 mm outer bevels so bevels reflect sleek straight window strips!
   let ax = BLOCK_HX - abs(input.localPos.x);
@@ -873,7 +891,11 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let grazingExcess = max(0.0, fresnel - 0.32);
   let bodySwatchTint = exp(-sigmaSelf * 0.11);
   let reflContrib = envReflection * (vec3<f32>(untintedF) + bodySwatchTint * (grazingExcess * 0.72));
-  var finalRGB = refractedRGB * (1.0 - fresnel) + reflContrib + sunMicroSpec + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
+
+  let bevelBoost = 1.0 + (1.0 - flatFaceMask) * 1.5;
+  let oneMinusCos = 1.0 - cosTheta;
+  let surfaceCaustic = causticFlux * sunColor * (0.07 + 0.16 * (oneMinusCos * oneMinusCos)) * bevelBoost * windowGobo * polariscopeMod;
+  var finalRGB = refractedRGB * (1.0 - fresnel) + reflContrib + sunMicroSpec + surfaceCaustic + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCenters);
 
   // Recessed 60/40 tin-lead / copper-foil came conductor shading + patinated flux seam darkening when motifId > 0
   if (vitrail.cameMask > 0.001) {
@@ -893,7 +915,6 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let grabbed = flags.y;
   let isLegal = flags.z;
   let resistance = flags.w;
-  let polariscope = uBlockCenters[97].w;
   let pe = clamp((*pBlk).photoelastic, vec4<f32>(0.0), vec4<f32>(1.0));
   let blkCrack = (*pBlk).crackAndDamage;
   var surfCrackSample: InternalCrackSample;
@@ -971,8 +992,21 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
              + surfCrack * (sunColor * sunTransRGB * crackSpec * 0.48 + silverGlint);
   }
 
-  // Subtle Tactile UI Rim Feedback strictly along beveled glass edges
-  let bevelRim = (1.0 - smoothstep(0.002, 0.016, dMid)) * (0.35 + 0.65 * pow(1.0 - cosTheta, 2.5));
+  // Gap B: 58% Body (|x| <= 0.2175 dm) vs Outer 15.75 mm End-Tip (|x| > 0.2175 dm) 2-Zone Sandbox Grip Cues
+  // Strictly revealed on hover/grab in Sandbox (hover > 1.5 || grabbed > 1.5), keeping resting & competitive blocks untouched!
+  let dBoundary = abs(abs(input.localPos.x) - 0.2175);
+  let boundaryCameLine = 1.0 - smoothstep(0.0016, 0.0030, dBoundary);
+  let brassCameAnchor = vec3<f32>(0.96, 0.82, 0.45);
+  let jewelPivotTrailer = vec3<f32>(0.72, 0.88, 1.0);
+  let isEndZone = abs(input.localPos.x) > 0.2175;
+  let isBodyZone = !isEndZone;
+  if (hover > 1.5 || grabbed > 1.5) {
+    let boundaryCameLit = brassCameAnchor * (skyTint * 0.12 + sunColor * sunTransRGB * 0.26);
+    finalRGB = mix(finalRGB, boundaryCameLit, boundaryCameLine * 0.62);
+  }
+
+  // Subtle Tactile UI Rim Feedback strictly along beveled glass edges with Sandbox 2-zone anchor differentiation
+  let bevelRim = (1.0 - smoothstep(0.002, 0.016, dMid)) * (0.35 + 0.65 * pow(max(0.0, 1.0 - cosTheta), 2.5));
   if (grabbed > 0.5) {
     let looseCol = vec3<f32>(0.92, 0.88, 0.76);
     let snugCol = vec3<f32>(1.0, 0.68, 0.18);
@@ -982,10 +1016,46 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
       mix(snugCol, pinnedCol, clamp((resistance - 0.5) * 2.0, 0.0, 1.0)),
       resistance > 0.5
     );
-    finalRGB += resCol * bevelRim * 0.52;
+    if (grabbed > 1.5) {
+      let isGrabEnd = grabbed > 2.5;
+      let zoneHue = select(brassCameAnchor, jewelPivotTrailer, isGrabEnd);
+      let isGrabActiveZone = select(isBodyZone, isEndZone, isGrabEnd);
+      let zoneRimBoost = select(0.28, 0.68, isGrabActiveZone);
+      finalRGB += mix(resCol, zoneHue, 0.48) * bevelRim * zoneRimBoost;
+      if (vitrail.cameMask > 0.001) {
+        finalRGB += zoneHue * vitrail.cameMask * select(0.05, 0.22, isGrabActiveZone);
+      }
+    } else {
+      finalRGB += resCol * bevelRim * 0.52;
+    }
   } else if (hover > 0.5) {
     if (isLegal > 0.5) {
-      finalRGB += vec3<f32>(0.98, 0.88, 0.65) * bevelRim * 0.44;
+      if (hover > 1.5) {
+        let isHoverEnd = hover > 2.5;
+        if (isHoverEnd) {
+          let hoverEndRim = select(
+            vec3<f32>(0.80, 0.80, 0.74) * 0.16,
+            jewelPivotTrailer * 0.54,
+            isEndZone
+          );
+          finalRGB += hoverEndRim * bevelRim;
+          if (vitrail.cameMask > 0.001 && isEndZone) {
+            finalRGB += jewelPivotTrailer * vitrail.cameMask * 0.16;
+          }
+        } else {
+          let hoverBodyRim = select(
+            brassCameAnchor * 0.50,
+            vec3<f32>(0.84, 0.80, 0.68) * 0.16,
+            isEndZone
+          );
+          finalRGB += hoverBodyRim * bevelRim;
+          if (vitrail.cameMask > 0.001 && isBodyZone) {
+            finalRGB += brassCameAnchor * vitrail.cameMask * 0.16;
+          }
+        }
+      } else {
+        finalRGB += vec3<f32>(0.98, 0.88, 0.65) * bevelRim * 0.44;
+      }
     } else {
       finalRGB = mix(finalRGB, finalRGB * vec3<f32>(0.72, 0.68, 0.75), 0.35);
     }

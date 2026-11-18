@@ -46,6 +46,9 @@ import {
   MJ_CONTYPE_BLOCK,
   MJ_CONTYPE_CULLET_SHARD,
   MJ_CONTYPE_HERO_SHARD,
+  MJ_GEOM_GROUP_BLOCK,
+  MJ_GEOM_GROUP_PARKED,
+  MJ_GEOM_GROUP_SHARD,
   MJ_PARKING_SHELF_TOP_Y_M,
   MujocoTowerIndexMap,
 } from './mujocoTowerBuilder';
@@ -68,6 +71,13 @@ import {
   FAITHFUL_GLASS_FIDELITY_CONFIG,
   PhysicsFidelityConfig,
 } from './physicsFidelityProfile';
+import {
+  accumulateSolderCameContact,
+  MU_KINETIC_GLASS,
+  MU_KINETIC_SOLDER,
+  resetSolderCameAggregate,
+  scratchSolderCameAggregate,
+} from './solderCameTribology';
 import type {
   GameMode,
   GlassBlockState,
@@ -209,6 +219,43 @@ const MAX_SPLINTERS = 320;
 const liveMujocoEngines: MujocoPhysicsEngine[] = [];
 const MAX_CONCURRENT_LIVE_ENGINES = 5;
 
+const scratchCameHitDm: Vec3 = [0, 0, 0];
+const scratchCameRelVelSi: Vec3 = [0, 0, 0];
+const scratchRotTmpA: Vec3 = [0, 0, 0];
+const scratchRotTmpB: Vec3 = [0, 0, 0];
+
+function quatInverseRotateVec3InPlace(
+  q: Quat,
+  vx: number,
+  vy: number,
+  vz: number,
+  out: Vec3
+): void {
+  const qx = -q[0], qy = -q[1], qz = -q[2], qw = q[3];
+  const tx = 2 * (qy * vz - qz * vy);
+  const ty = 2 * (qz * vx - qx * vz);
+  const tz = 2 * (qx * vy - qy * vx);
+  out[0] = vx + qw * tx + (qy * tz - qz * ty);
+  out[1] = vy + qw * ty + (qz * tx - qx * tz);
+  out[2] = vz + qw * tz + (qx * ty - qy * tx);
+}
+
+function quatRotateVec3InPlace(
+  q: Quat,
+  vx: number,
+  vy: number,
+  vz: number,
+  out: Vec3
+): void {
+  const qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+  const tx = 2 * (qy * vz - qz * vy);
+  const ty = 2 * (qz * vx - qx * vz);
+  const tz = 2 * (qx * vy - qy * vx);
+  out[0] = vx + qw * tx + (qy * tz - qz * ty);
+  out[1] = vy + qw * ty + (qz * tx - qx * tz);
+  out[2] = vz + qw * tz + (qx * ty - qy * tx);
+}
+
 /**
  * Full-Stack MuJoCo 4.0 Physics Engine for Vitrail (`MujocoPhysicsEngine`)
  *
@@ -247,6 +294,9 @@ export class MujocoPhysicsEngine {
   public grabCurrentWorldOnBlock: Vec3 = [0, 0, 0];
   public grabPlaneY: number = 0;
   public grabResistance01: number = 0;
+  private framePeakSeamCrossingIntensity: number = 0;
+  private readonly scratchPreVelA: Vec3 = [0, 0, 0];
+  private readonly scratchPreVelB: Vec3 = [0, 0, 0];
   public isPointerDraggingBlock: boolean = false;
   public carriedFromDrag: boolean = false;
 
@@ -366,10 +416,15 @@ export class MujocoPhysicsEngine {
 
   private bodyToBlock = new Map<number, GlassBlockState>();
   private bodyToShard = new Map<number, GlassShardState>();
+  private bodyIdToBlock: Array<GlassBlockState | undefined> = [];
+  private bodyIdToShard: Array<GlassShardState | undefined> = [];
+  private bodyIdToMapping: Array<ReturnType<MujocoWorldCompat['getMapping']> | undefined> = [];
+  private bodyMappingCompatRef: MujocoWorldCompat | null = null;
   private cachedClampingLoadN: Float64Array = new Float64Array(0);
-  private blockLastCrazeTime = new Map<number, number>();
-  private blockLastImpactAudioTime = new Map<number, number>();
-  private blockLastWobbleTime = new Map<number, number>();
+  private blockLastCrazeArr: Float64Array = new Float64Array(128).fill(-10);
+  private blockLastImpactAudioArr: Float64Array = new Float64Array(128).fill(-10);
+  private blockLastWobbleArr: Float64Array = new Float64Array(128).fill(-10);
+  private blockPairLastContactArr: Float64Array = new Float64Array(128 * 128).fill(-10);
   private blockPairLastContactSimTime = new Map<number, number>();
   private blockRockTransferCount: Uint8Array = new Uint8Array(128);
   private blockLastRockTime: Float64Array = new Float64Array(128);
@@ -381,6 +436,9 @@ export class MujocoPhysicsEngine {
   private shardQuietSubsteps = new Uint16Array(MAX_ACTIVE_SHARDS);
   private shardNoSupportSubsteps = new Uint8Array(MAX_ACTIVE_SHARDS);
   private shardPinchSubsteps = new Uint8Array(MAX_ACTIVE_SHARDS);
+  private shardLastPinchSimTime = new Float64Array(MAX_ACTIVE_SHARDS).fill(-10);
+  private shardBlockNormalN = new Float64Array(MAX_ACTIVE_SHARDS);
+  private shardTableNormalN = new Float64Array(MAX_ACTIVE_SHARDS);
   private shardWedgeCooldownUntilSim = new Float64Array(MAX_ACTIVE_SHARDS).fill(-10);
   private activeWedgeEscapeCount: number = 0;
   private shardAirborneSubsteps = new Uint16Array(MAX_ACTIVE_SHARDS);
@@ -396,6 +454,45 @@ export class MujocoPhysicsEngine {
   private lowIntactBlkXM = new Float64Array(128);
   private lowIntactBlkYM = new Float64Array(128);
   private lowIntactBlkZM = new Float64Array(128);
+  private lowBlkCellLo = new Uint32Array(256);
+  private lowBlkCellHi = new Uint32Array(256);
+  private vcModel: MjModel | null = null;
+  private vcData: MjData | null = null;
+  private vcQpos!: Float64Array;
+  private vcQvel!: Float64Array;
+  private vcQacc!: Float64Array;
+  private vcQaccWarm!: Float64Array;
+  private vcQfrcApplied!: Float64Array;
+  private vcXfrcApplied!: Float64Array;
+  private vcQfrcConstraint!: Float64Array;
+  private vcTreeAsleep!: Int32Array;
+  private vcXpos!: Float64Array;
+  private vcXquat!: Float64Array;
+  private vcGeomXpos!: Float64Array;
+  private vcGeomXmat!: Float64Array;
+  private vcBodyMass!: Float64Array;
+  private vcBodySubtreemass!: Float64Array;
+  private vcBodyInertia!: Float64Array;
+  private vcBodyIquat!: Float64Array;
+  private vcBodyTreeId!: Int32Array;
+  private vcBodyContype!: Int32Array;
+  private vcBodyConaffinity!: Int32Array;
+  private vcBodyInvweight0!: Float64Array;
+  private vcGeomBodyId!: Int32Array;
+  private vcGeomType!: Int32Array;
+  private vcGeomDataId!: Int32Array;
+  private vcGeomContype!: Int32Array;
+  private vcGeomConaffinity!: Int32Array;
+  private vcGeomGroup!: Int32Array;
+  private vcGeomPos!: Float64Array;
+  private vcGeomQuat!: Float64Array;
+  private vcGeomSize!: Float64Array;
+  private vcGeomRbound!: Float64Array;
+  private vcGeomAabb!: Float64Array;
+  private vcDofM0!: Float64Array;
+  private vcDofInvweight0!: Float64Array;
+  private vcDofDamping!: Float64Array;
+  private vcIntegrator: number = 0;
   private awakeMovingBlockId = new Int16Array(128);
   private awakeMovingBlockXM = new Float64Array(128);
   private awakeMovingBlockYM = new Float64Array(128);
@@ -409,6 +506,12 @@ export class MujocoPhysicsEngine {
   private awakeMovingBlockWySi = new Float64Array(128);
   private awakeMovingBlockVTipSi = new Float64Array(128);
   private awakeMovingBlockCount: number = 0;
+  private movingBlkMinXM: number = Infinity;
+  private movingBlkMaxXM: number = -Infinity;
+  private movingBlkMinYM: number = Infinity;
+  private movingBlkMaxYM: number = -Infinity;
+  private movingBlkMinZM: number = Infinity;
+  private movingBlkMaxZM: number = -Infinity;
   private lastUserImpulsedBlockId: number = -1;
   private lastUserImpulsedSimTime: number = -10;
   private lastReleaseWasWhipFlick: boolean = false;
@@ -461,9 +564,30 @@ export class MujocoPhysicsEngine {
   private pendingWobbleEvents: WobbleRockEvent[] = [];
   private stepShardCandidates: ShardImpactEvent[] = [];
   private stepWobbleCandidates: WobbleRockEvent[] = [];
-  private scratchPairMap = new Map<number, ScratchGeomPairContact>();
+  private scratchPairHashKey = new Int32Array(8192);
+  private scratchPairHashStamp = new Uint32Array(8192);
+  private scratchPairHashIdx = new Int32Array(8192);
+  private scratchPairHashEpoch: number = 0;
   private scratchPairPool: ScratchGeomPairContact[] = [];
-  private scratchBlockImpacts = new Map<number, ScratchBlockWrenchAccum>();
+  private scratchBlockImpactById: Array<ScratchBlockWrenchAccum | undefined> = [];
+  private scratchActiveImpactIds: number[] = [];
+  private scratchImpactPool: ScratchBlockWrenchAccum[] = [];
+  private scratchContactEntryPool: ScratchBlockContactEntry[] = [];
+  private scratchBlocksToShatter: Array<{
+    blk: GlassBlockState;
+    localHit: Vec3;
+    impactSpeed: number;
+    worldNormal: Vec3;
+    hitTable: boolean;
+    closingSpeedReal: number;
+    isAnvilCrush: boolean;
+  }> = [];
+  private readonly scratchWorldPtDm: Vec3 = [0, 0, 0];
+  private readonly scratchN1to2: Vec3 = [0, 0, 0];
+  private readonly scratchN2to1: Vec3 = [0, 0, 0];
+  private readonly scratchWobbleQuat: Quat = [0, 0, 0, 1];
+  private readonly scratchWobbleVecA: Vec3 = [0, 0, 0];
+  private readonly scratchWobbleVecB: Vec3 = [0, 0, 0];
 
   private photoCap: number = 0;
   private photoHasVert: Uint8Array = new Uint8Array(0);
@@ -660,7 +784,8 @@ export class MujocoPhysicsEngine {
     if (players !== undefined) this.playerCount = Math.max(2, Math.min(4, players));
     this.towerSeed = seed !== undefined ? seed >>> 0 : 0;
     const towerLayers = Math.max(1, Math.min(32, Math.round(layers)));
-    this.audio.updateSlideFriction(0, 0, 0, 0);
+    this.framePeakSeamCrossingIntensity = 0;
+    this.audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
     this.unloadedBounceLastSimTime.fill(-10);
     this.unloadedBounceHopCount.fill(0);
     this.multiccdReentrySubstepsRemaining = 0;
@@ -765,6 +890,9 @@ export class MujocoPhysicsEngine {
     this.shardQuietSubsteps.fill(0);
     this.shardNoSupportSubsteps.fill(0);
     this.shardPinchSubsteps.fill(0);
+    this.shardLastPinchSimTime.fill(-10);
+    this.shardBlockNormalN.fill(0);
+    this.shardTableNormalN.fill(0);
     this.shardWedgeCooldownUntilSim.fill(-10);
     this.activeWedgeEscapeCount = 0;
     this.shardAirborneSubsteps.fill(0);
@@ -817,6 +945,7 @@ export class MujocoPhysicsEngine {
     this.stepShardCandidates.length = 0;
     this.stepWobbleCandidates.length = 0;
     this.frameShatterCount = 0;
+    this.framePeakSeamCrossingIntensity = 0;
     this.lastStepResult = {
       substeps: 0,
       simTime: 0,
@@ -829,6 +958,13 @@ export class MujocoPhysicsEngine {
     this.splinters = [];
     this.bodyToBlock.clear();
     this.bodyToShard.clear();
+    this.syncBodyLookupCapacity(this.model.nbody);
+    this.bodyIdToBlock.fill(undefined);
+    this.bodyIdToShard.fill(undefined);
+    this.bodyIdToMapping.fill(undefined);
+    this.bodyMappingCompatRef = this.worldCompat;
+    this.vcModel = null;
+    this.vcData = null;
     this.freeShardSlots = [];
     for (let slot = MAX_ACTIVE_SHARDS - 1; slot >= 0; slot--) {
       this.freeShardSlots.push(slot);
@@ -854,9 +990,7 @@ export class MujocoPhysicsEngine {
     this.clearContactSubsteps = 0;
     this.extractionArcTimer = 0;
     this.grabRampSec = 0;
-    this.blockLastCrazeTime.clear();
-    this.blockLastImpactAudioTime.clear();
-    this.blockLastWobbleTime.clear();
+    this.blockPairLastContactArr.fill(-10);
     this.blockPairLastContactSimTime.clear();
     this.awakeParkedBodies.length = 0;
     this.settleTimer = 0;
@@ -880,6 +1014,14 @@ export class MujocoPhysicsEngine {
     this.cachedClampingLoadN = new Float64Array(blockCap);
     this.blockPhotoelasticStress01 = new Float32Array(blockCap);
     this.blockPhotoelasticWrench = new Float32Array(blockCap * 4);
+    if (this.blockLastCrazeArr.length < blockCap) {
+      this.blockLastCrazeArr = new Float64Array(blockCap);
+      this.blockLastImpactAudioArr = new Float64Array(blockCap);
+      this.blockLastWobbleArr = new Float64Array(blockCap);
+    }
+    this.blockLastCrazeArr.fill(-10);
+    this.blockLastImpactAudioArr.fill(-10);
+    this.blockLastWobbleArr.fill(-10);
     if (this.blockRockTransferCount.length < blockCap) {
       this.blockRockTransferCount = new Uint8Array(blockCap);
       this.blockLastRockTime = new Float64Array(blockCap);
@@ -916,7 +1058,7 @@ export class MujocoPhysicsEngine {
       this.map.blockGeomIds
     );
     for (let i = 0; i < this.blocks.length; i++) {
-      this.bodyToBlock.set(this.blocks[i].bodyHandle, this.blocks[i]);
+      this.setBodyBlock(this.blocks[i]);
     }
 
     const seedWarmupContactPairs = () => {
@@ -935,8 +1077,16 @@ export class MujocoPhysicsEngine {
         if (g1 < 0 || g2 < 0) continue;
         const b1 = geomBodyId[g1];
         const b2 = geomBodyId[g2];
-        if ((b1 >= 2 && this.bodyToBlock.has(b1)) || (b2 >= 2 && this.bodyToBlock.has(b2))) {
-          const pairKey = g1 < g2 ? g1 * 4096 + g2 : g2 * 4096 + g1;
+        if (
+          (b1 >= 2 && b1 < this.bodyIdToBlock.length && this.bodyIdToBlock[b1] !== undefined) ||
+          (b2 >= 2 && b2 < this.bodyIdToBlock.length && this.bodyIdToBlock[b2] !== undefined)
+        ) {
+          const loG = g1 < g2 ? g1 : g2;
+          const hiG = g1 < g2 ? g2 : g1;
+          const pairKey = loG * 4096 + hiG;
+          if (hiG < 128) {
+            this.blockPairLastContactArr[(loG << 7) | hiG] = 0.0;
+          }
           this.blockPairLastContactSimTime.set(pairKey, 0.0);
         }
       }
@@ -948,6 +1098,11 @@ export class MujocoPhysicsEngine {
       this.blockPhotoelasticStress01.set(this.modelResetSnapshot.warmupPhotoelastic01);
       this.blockPhotoelasticWrench.set(this.modelResetSnapshot.warmupPhotoelasticWrench);
       for (const pk of this.modelResetSnapshot.warmupPairKeys) {
+        const loG = (pk / 4096) | 0;
+        const hiG = pk - loG * 4096;
+        if (loG >= 0 && hiG < 128) {
+          this.blockPairLastContactArr[(loG << 7) | hiG] = 0.0;
+        }
         this.blockPairLastContactSimTime.set(pk, 0.0);
       }
       // 2 quick steps re-establish warmstart contacts cleanly on the restored settled pose
@@ -1016,12 +1171,211 @@ export class MujocoPhysicsEngine {
     this.syncTransformsAndRules();
   }
 
+  private ensureCachedViews(): boolean {
+    const m = this.model;
+    const d = this.data;
+    if (!m || !d) return false;
+    if (
+      this.vcModel !== m ||
+      this.vcData !== d ||
+      this.vcQpos.buffer.byteLength === 0 ||
+      this.vcBodyMass.buffer.byteLength === 0
+    ) {
+      this.vcModel = m;
+      this.vcData = d;
+      this.vcQpos = d.qpos;
+      this.vcQvel = d.qvel;
+      this.vcQacc = d.qacc;
+      this.vcQaccWarm = d.qacc_warmstart;
+      this.vcQfrcApplied = d.qfrc_applied;
+      this.vcXfrcApplied = d.xfrc_applied;
+      this.vcQfrcConstraint = d.qfrc_constraint;
+      this.vcTreeAsleep = d.tree_asleep;
+      this.vcXpos = d.xpos;
+      this.vcXquat = d.xquat;
+      this.vcGeomXpos = d.geom_xpos;
+      this.vcGeomXmat = d.geom_xmat;
+      this.vcBodyMass = m.body_mass;
+      this.vcBodySubtreemass = m.body_subtreemass;
+      this.vcBodyInertia = m.body_inertia;
+      this.vcBodyIquat = m.body_iquat;
+      this.vcBodyTreeId = m.body_treeid;
+      this.vcBodyContype = m.body_contype;
+      this.vcBodyConaffinity = m.body_conaffinity;
+      this.vcBodyInvweight0 = m.body_invweight0;
+      this.vcGeomBodyId = m.geom_bodyid;
+      this.vcGeomType = m.geom_type;
+      this.vcGeomDataId = m.geom_dataid;
+      this.vcGeomContype = m.geom_contype;
+      this.vcGeomConaffinity = m.geom_conaffinity;
+      this.vcGeomGroup = m.geom_group;
+      this.vcGeomPos = m.geom_pos;
+      this.vcGeomQuat = m.geom_quat;
+      this.vcGeomSize = m.geom_size;
+      this.vcGeomRbound = m.geom_rbound;
+      this.vcGeomAabb = m.geom_aabb;
+      this.vcDofM0 = m.dof_M0;
+      this.vcDofInvweight0 = m.dof_invweight0;
+      this.vcDofDamping = m.dof_damping;
+      this.vcIntegrator = m.opt.integrator;
+    }
+    return true;
+  }
+
+  private syncBodyLookupCapacity(nbody: number): void {
+    if (this.bodyIdToBlock.length < nbody) {
+      const prevLen = this.bodyIdToBlock.length;
+      this.bodyIdToBlock.length = nbody;
+      this.bodyIdToShard.length = nbody;
+      this.bodyIdToMapping.length = nbody;
+      for (let i = prevLen; i < nbody; i++) {
+        this.bodyIdToBlock[i] = undefined;
+        this.bodyIdToShard[i] = undefined;
+        this.bodyIdToMapping[i] = undefined;
+      }
+    }
+  }
+
+  private getMappingFast(bodyId: number): ReturnType<MujocoWorldCompat['getMapping']> {
+    if (this.bodyMappingCompatRef !== this.worldCompat) {
+      this.bodyMappingCompatRef = this.worldCompat;
+      this.bodyIdToMapping.fill(undefined);
+    }
+    if (bodyId >= 0 && bodyId < this.bodyIdToMapping.length) {
+      let info = this.bodyIdToMapping[bodyId];
+      if (info === undefined) {
+        info = this.worldCompat.getMapping(bodyId);
+        this.bodyIdToMapping[bodyId] = info;
+      }
+      return info;
+    }
+    return this.worldCompat.getMapping(bodyId);
+  }
+
+  private setBodyBlock(block: GlassBlockState): void {
+    this.bodyToBlock.set(block.bodyHandle, block);
+    if (block.bodyHandle >= this.bodyIdToBlock.length) {
+      this.syncBodyLookupCapacity(block.bodyHandle + 16);
+    }
+    this.bodyIdToBlock[block.bodyHandle] = block;
+  }
+
+  private deleteBodyBlock(bodyHandle: number): void {
+    this.bodyToBlock.delete(bodyHandle);
+    if (bodyHandle >= 0 && bodyHandle < this.bodyIdToBlock.length) {
+      this.bodyIdToBlock[bodyHandle] = undefined;
+    }
+  }
+
+  private setBodyShard(shard: GlassShardState): void {
+    this.bodyToShard.set(shard.bodyHandle, shard);
+    if (shard.bodyHandle >= this.bodyIdToShard.length) {
+      this.syncBodyLookupCapacity(shard.bodyHandle + 16);
+    }
+    this.bodyIdToShard[shard.bodyHandle] = shard;
+  }
+
+  private deleteBodyShard(bodyHandle: number): void {
+    this.bodyToShard.delete(bodyHandle);
+    if (bodyHandle >= 0 && bodyHandle < this.bodyIdToShard.length) {
+      this.bodyIdToShard[bodyHandle] = undefined;
+    }
+  }
+
+  private setBodyGeomCollisionMaskCached(
+    bodyId: number,
+    geomId: number,
+    contype: number,
+    conaffinity: number
+  ): void {
+    this.vcGeomContype[geomId] = contype;
+    this.vcGeomConaffinity[geomId] = conaffinity;
+    if (contype === 0) {
+      this.vcGeomGroup[geomId] = MJ_GEOM_GROUP_PARKED;
+    } else if ((contype & (MJ_CONTYPE_HERO_SHARD | MJ_CONTYPE_CULLET_SHARD)) !== 0) {
+      this.vcGeomGroup[geomId] = MJ_GEOM_GROUP_SHARD;
+    } else {
+      this.vcGeomGroup[geomId] = MJ_GEOM_GROUP_BLOCK;
+    }
+    if (bodyId > 0) {
+      this.vcBodyContype[bodyId] = contype;
+      this.vcBodyConaffinity[bodyId] = conaffinity;
+    }
+  }
+
+  private updateFreeBodyMassAndInertiaCached(
+    bodyId: number,
+    dofAdr: number,
+    massKg: number,
+    ixSi: number,
+    iySi: number,
+    izSi: number,
+    rotDampingRateSecInv: number = 0
+  ): void {
+    const safeM = Math.max(1e-5, massKg);
+    const safeIx = Math.max(1e-10, ixSi);
+    const safeIy = Math.max(1e-10, iySi);
+    const safeIz = Math.max(1e-10, izSi);
+    const minRotM0 = safeM * 2.5e-5;
+    const effIx = Math.max(minRotM0, safeIx);
+    const effIy = Math.max(minRotM0, safeIy);
+    const effIz = Math.max(minRotM0, safeIz);
+
+    this.vcBodyMass[bodyId] = safeM;
+    this.vcBodySubtreemass[bodyId] = safeM;
+    const b3 = bodyId * 3;
+    this.vcBodyInertia[b3 + 0] = effIx;
+    this.vcBodyInertia[b3 + 1] = effIy;
+    this.vcBodyInertia[b3 + 2] = effIz;
+    const b4 = bodyId * 4;
+    this.vcBodyIquat[b4 + 0] = 1;
+    this.vcBodyIquat[b4 + 1] = 0;
+    this.vcBodyIquat[b4 + 2] = 0;
+    this.vcBodyIquat[b4 + 3] = 0;
+
+    this.vcDofM0[dofAdr + 0] = safeM;
+    this.vcDofM0[dofAdr + 1] = safeM;
+    this.vcDofM0[dofAdr + 2] = safeM;
+    this.vcDofM0[dofAdr + 3] = effIx;
+    this.vcDofM0[dofAdr + 4] = effIy;
+    this.vcDofM0[dofAdr + 5] = effIz;
+
+    this.vcDofDamping[dofAdr + 0] = 0;
+    this.vcDofDamping[dofAdr + 1] = 0;
+    this.vcDofDamping[dofAdr + 2] = 0;
+    if (rotDampingRateSecInv > 0 && this.vcIntegrator === 3) {
+      this.vcDofDamping[dofAdr + 3] = rotDampingRateSecInv * effIx;
+      this.vcDofDamping[dofAdr + 4] = rotDampingRateSecInv * effIy;
+      this.vcDofDamping[dofAdr + 5] = rotDampingRateSecInv * effIz;
+    } else {
+      this.vcDofDamping[dofAdr + 3] = 0;
+      this.vcDofDamping[dofAdr + 4] = 0;
+      this.vcDofDamping[dofAdr + 5] = 0;
+    }
+
+    const invM = 1.0 / safeM;
+    const invIx = 1.0 / effIx;
+    const invIy = 1.0 / effIy;
+    const invIz = 1.0 / effIz;
+    const avgInvI = (invIx + invIy + invIz) / 3.0;
+    const b2 = bodyId * 2;
+    this.vcBodyInvweight0[b2 + 0] = invM;
+    this.vcBodyInvweight0[b2 + 1] = avgInvI;
+    this.vcDofInvweight0[dofAdr + 0] = invM;
+    this.vcDofInvweight0[dofAdr + 1] = invM;
+    this.vcDofInvweight0[dofAdr + 2] = invM;
+    this.vcDofInvweight0[dofAdr + 3] = invIx;
+    this.vcDofInvweight0[dofAdr + 4] = invIy;
+    this.vcDofInvweight0[dofAdr + 5] = invIz;
+  }
+
   /**
    * Registers any dynamically appended block in `this.blocks` (e.g. `T3d` pool stress test) into `bodyToBlock`.
    */
   private ensureBlockRegistered(block: GlassBlockState): void {
-    if (!this.bodyToBlock.has(block.bodyHandle)) {
-      this.bodyToBlock.set(block.bodyHandle, block);
+    const bh = block.bodyHandle;
+    if (bh < 0 || bh >= this.bodyIdToBlock.length || this.bodyIdToBlock[bh] !== block) {
+      this.setBodyBlock(block);
     }
   }
 
@@ -1185,20 +1539,20 @@ export class MujocoPhysicsEngine {
           const b2 = geomBodyId[g2];
           if (!isWarmup && fn > 2.2) {
             if (g1 >= minShardGid && g1 <= maxShardGid) {
-              const s1 = this.bodyToShard.get(b1);
+              const s1 = this.bodyIdToShard[b1];
               if (s1 && fn > Math.max(2.2, s1.massKg * 420.0)) {
                 this.demotePinchedHeroShardIfWedged(s1, fn);
               }
             }
             if (g2 >= minShardGid && g2 <= maxShardGid) {
-              const s2 = this.bodyToShard.get(b2);
+              const s2 = this.bodyIdToShard[b2];
               if (s2 && fn > Math.max(2.2, s2.massKg * 420.0)) {
                 this.demotePinchedHeroShardIfWedged(s2, fn);
               }
             }
           }
-          const blk1 = !nonBlock1 && b1 >= 2 ? this.bodyToBlock.get(b1) : undefined;
-          const blk2 = !nonBlock2 && b2 >= 2 ? this.bodyToBlock.get(b2) : undefined;
+          const blk1 = !nonBlock1 && b1 >= 2 ? this.bodyIdToBlock[b1] : undefined;
+          const blk2 = !nonBlock2 && b2 >= 2 ? this.bodyIdToBlock[b2] : undefined;
           if ((blk1 && !blk1.shattered && !blk1.extracted) || (blk2 && !blk2.shattered && !blk2.extracted)) {
             const ft = c.dim >= 3 ? Math.hypot(efc[adr + 1], efc[adr + 2]) : 0;
             const cPos = c.pos;
@@ -1397,7 +1751,7 @@ export class MujocoPhysicsEngine {
       const b = this.blocks[i];
       if (!b.shattered && !b.extracted) {
         if (this.model) {
-          const info = this.worldCompat.getMapping(b.bodyHandle);
+          const info = this.getMappingFast(b.bodyHandle);
           if (info) {
             if (this.sandboxCollapseActive) {
               info.quietTicks = 0;
@@ -2058,7 +2412,8 @@ export class MujocoPhysicsEngine {
   public endGrab(dropIfPoisedOverTower: boolean = false, timestampMs?: number): void {
     this.isPointerDraggingBlock = false;
     this.grabResistance01 = 0;
-    this.audio.updateSlideFriction(0, 0, 0, 0);
+    this.framePeakSeamCrossingIntensity = 0;
+    this.audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
     this.resetActiveSlidingGeomFriction();
 
     if (this.data) {
@@ -2094,9 +2449,9 @@ export class MujocoPhysicsEngine {
         const rRelDm = Math.hypot(releasedBlock.position[0], releasedBlock.position[2]);
         const isSandboxFreeRubbleFlick =
           this.sandboxCollapseActive ||
+          this.hadFullSleepAfterCollapse ||
           this.currentLayers <= 2 ||
-          (this.shatteredCount >= 4 &&
-            (this.currentLayers <= 6 || releasedBlock.position[1] < BLOCK_HEIGHT * 2.8)) ||
+          releasedBlock.position[1] < BLOCK_HEIGHT * 2.8 ||
           rRelDm > BLOCK_LENGTH * 0.98 ||
           Math.abs(upVecRel[1]) < 0.88;
         const useDom =
@@ -2122,7 +2477,7 @@ export class MujocoPhysicsEngine {
             const dof = infoRel.dofAdr;
             const qvel = this.data.qvel;
             const curAlongMps = qvel[dof + 0] * ux + qvel[dof + 2] * uz;
-            const targetAlongMps = Math.min(1.18, flickSpeedMps * 0.58);
+            const targetAlongMps = Math.min(1.22, flickSpeedMps * 0.60);
             if (targetAlongMps > curAlongMps + 0.04) {
               const dvMps = targetAlongMps - curAlongMps;
               infoRel.settledAsleep = false;
@@ -2362,7 +2717,7 @@ export class MujocoPhysicsEngine {
         const entry = standingBlocks[i];
         const b = entry.block;
         const dof = entry.dof;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
+        const info = this.getMappingFast(b.bodyHandle);
         if (info) {
           info.settledAsleep = false;
           info.quietTicks = 0;
@@ -2414,7 +2769,7 @@ export class MujocoPhysicsEngine {
       // leaving flat tabletop rubble bricks completely stationary.
       for (const b of this.blocks) {
         if (b.shattered || b.extracted) continue;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
+        const info = this.getMappingFast(b.bodyHandle);
         if (!info || !info.enabled) continue;
         const qAdr = info.qposAdr;
         const xM = qpos[qAdr + 0];
@@ -3069,10 +3424,27 @@ export class MujocoPhysicsEngine {
         geomClear = alongClear > BLOCK_LENGTH * 0.98 || clearDist > BLOCK_LENGTH * 1.01;
       }
 
+      const lvSiX = info ? this.data.qvel[info.dofAdr + 0] : 0;
+      const lvSiY = info ? this.data.qvel[info.dofAdr + 1] : 0;
+      const lvSiZ = info ? this.data.qvel[info.dofAdr + 2] : 0;
+      const speedHorizSi = Math.hypot(lvSiX, lvSiZ);
+      const upVecCame = quatRotateVec3(q, [0, 1, 0]);
+      const canEvaluateSolderCame =
+        info !== null &&
+        !this.sandboxCollapseActive &&
+        this.turnPhase !== 'COLLAPSED' &&
+        speedHorizSi > 0.004 &&
+        Math.abs(upVecCame[1]) >= 0.85 &&
+        Math.abs(lvSiY) < 1.2;
+
+      if (canEvaluateSolderCame) {
+        resetSolderCameAggregate(scratchSolderCameAggregate);
+      }
+
       let slipPowerMw = 0;
       let touchingCount = 0;
       let shardContactNormalN = 0;
-      if (isLastSubstep || geomClear) {
+      if (isLastSubstep || geomClear || canEvaluateSolderCame) {
         const contacts = this.data.contact;
         const ncon = this.data.ncon;
         const geomBodyId = this.model.geom_bodyid;
@@ -3093,24 +3465,76 @@ export class MujocoPhysicsEngine {
               g2 === this.map.shardTableGeomId ||
               g1 === this.map.parkingShelfGeomId ||
               g2 === this.map.parkingShelfGeomId;
-            if (!isStaticSurface && c.dist < 0.002) touchingCount++;
-            if (isLastSubstep && c.efc_address >= 0 && c.dim >= 3) {
+            if ((isLastSubstep || geomClear) && !isStaticSurface && c.dist < 0.002) {
+              touchingCount++;
+            }
+            if (c.efc_address >= 0 && c.dim >= 3) {
               const adr = c.efc_address;
-              const pTangential =
-                Math.abs(efcForce[adr + 1] * efcVel[adr + 1]) +
-                Math.abs(efcForce[adr + 2] * efcVel[adr + 2]);
-              const pTorsional =
-                c.dim >= 4 ? Math.abs(efcForce[adr + 3] * efcVel[adr + 3]) : 0;
-              slipPowerMw += (pTangential + pTorsional) * 1000.0;
-              const otherG = b1 === block.bodyHandle ? g2 : g1;
-              if (otherG >= this.minShardGeomId && otherG <= this.maxShardGeomId) {
-                shardContactNormalN += Math.max(0.0, efcForce[adr]);
+              if (isLastSubstep) {
+                const pTangential =
+                  Math.abs(efcForce[adr + 1] * efcVel[adr + 1]) +
+                  Math.abs(efcForce[adr + 2] * efcVel[adr + 2]);
+                const pTorsional =
+                  c.dim >= 4 ? Math.abs(efcForce[adr + 3] * efcVel[adr + 3]) : 0;
+                slipPowerMw += (pTangential + pTorsional) * 1000.0;
+                const otherG = b1 === block.bodyHandle ? g2 : g1;
+                if (otherG >= this.minShardGeomId && otherG <= this.maxShardGeomId) {
+                  shardContactNormalN += Math.max(0.0, efcForce[adr]);
+                }
+              }
+              const otherBody = b1 === block.bodyHandle ? b2 : b1;
+              if (canEvaluateSolderCame && !isStaticSurface && otherBody >= 2) {
+                const otherBlk = this.bodyToBlock.get(otherBody);
+                if (otherBlk && !otherBlk.shattered && !otherBlk.extracted) {
+                  const fnN = Math.max(0.0, efcForce[adr]);
+                  if (fnN > 0.02) {
+                    const cPos = c.pos;
+                    quatInverseRotateVec3InPlace(
+                      q,
+                      cPos[0] * DM_PER_M - pos.x,
+                      cPos[1] * DM_PER_M - pos.y,
+                      cPos[2] * DM_PER_M - pos.z,
+                      scratchCameHitDm
+                    );
+                    const otherInfo = this.worldCompat.getMapping(otherBlk.bodyHandle);
+                    const ovx = otherInfo ? this.data.qvel[otherInfo.dofAdr + 0] : 0;
+                    const ovy = otherInfo ? this.data.qvel[otherInfo.dofAdr + 1] : 0;
+                    const ovz = otherInfo ? this.data.qvel[otherInfo.dofAdr + 2] : 0;
+                    // Contact-point velocity across `block`'s surface = (v_other - v_block)
+                    quatInverseRotateVec3InPlace(
+                      q,
+                      ovx - lvSiX,
+                      ovy - lvSiY,
+                      ovz - lvSiZ,
+                      scratchCameRelVelSi
+                    );
+                    accumulateSolderCameContact(
+                      scratchCameHitDm,
+                      scratchCameRelVelSi,
+                      fnN,
+                      scratchSolderCameAggregate
+                    );
+                  }
+                }
               }
             }
           }
           c.delete();
         }
         contacts.delete();
+      }
+
+      if (canEvaluateSolderCame && scratchSolderCameAggregate.contactCount > 0) {
+        if (scratchSolderCameAggregate.maxSeamCrossingIntensity > this.framePeakSeamCrossingIntensity) {
+          this.framePeakSeamCrossingIntensity = scratchSolderCameAggregate.maxSeamCrossingIntensity;
+        }
+        if (info && scratchSolderCameAggregate.totalResistForceN > 0 && speedHorizSi > 1e-4) {
+          const massKg = Math.max(0.01, this.model.body_mass[block.bodyHandle]);
+          const maxPassiveN = (0.85 * massKg * speedHorizSi) / Math.max(1e-4, subDtSec);
+          const resistN = Math.min(scratchSolderCameAggregate.totalResistForceN, 0.025, maxPassiveN);
+          this.data.qfrc_applied[info.dofAdr + 0] -= (lvSiX / speedHorizSi) * resistN;
+          this.data.qfrc_applied[info.dofAdr + 2] -= (lvSiZ / speedHorizSi) * resistN;
+        }
       }
 
       const lv = rb.linvel();
@@ -3134,9 +3558,24 @@ export class MujocoPhysicsEngine {
           const g3 = gid * 3;
           const sf = this.cfg.glassFriction;
           const kf = this.cfg.glassKineticFriction;
-          const targetSlideKf0 = kf[0];
+          let targetSlideKf0 = kf[0];
           const targetSlideKf1 = kf[1];
           const targetSlideKf2 = kf[2];
+          if (canEvaluateSolderCame && scratchSolderCameAggregate.contactCount > 0) {
+            const cameBlend = Math.max(
+              0.0,
+              Math.min(
+                1.0,
+                (scratchSolderCameAggregate.weightedEffectiveFriction - MU_KINETIC_GLASS) /
+                  (MU_KINETIC_SOLDER - MU_KINETIC_GLASS)
+              )
+            );
+            // Keep sliding friction anchored at `kf[0]` on pure glass interior and strictly below static
+            // breakaway `sf[0]` (`0.275`) on the solder perimeter so upper courses are never twisted/dragged.
+            const maxSolderSlideKf0 = Math.min(MU_KINETIC_SOLDER, sf[0] * 0.80, kf[0] + 0.058);
+            const cameWeight = cameBlend * cameBlend;
+            targetSlideKf0 = kf[0] + (maxSolderSlideKf0 - kf[0]) * cameWeight;
+          }
           this.model.geom_friction[g3 + 0] = sf[0] + (targetSlideKf0 - sf[0]) * kinBlend;
           this.model.geom_friction[g3 + 1] = sf[1] + (targetSlideKf1 - sf[1]) * kinBlend;
           this.model.geom_friction[g3 + 2] = sf[2] + (targetSlideKf2 - sf[2]) * kinBlend;
@@ -3163,7 +3602,8 @@ export class MujocoPhysicsEngine {
           this.grabResistance01,
           slipPowerMw,
           av.y * FROUDE_VEL_SCALE,
-          clampingLoadN
+          clampingLoadN,
+          this.framePeakSeamCrossingIntensity
         );
       }
 
@@ -3191,7 +3631,8 @@ export class MujocoPhysicsEngine {
           const outLen = Math.hypot(relX, relZ) || 1;
           this.extractionOutDir = [relX / outLen, 0, relZ / outLen];
 
-          this.audio.updateSlideFriction(0, 0, 0, 0, 0);
+          this.framePeakSeamCrossingIntensity = 0;
+          this.audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
           if (!unassistedPull) {
             this.phantomAirClinkCount++;
             this.audio.playGlassImpact(
@@ -3238,22 +3679,20 @@ export class MujocoPhysicsEngine {
   }
 
   private snapshotPreStepVelocities(): number {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) return 0;
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const qfrcApplied = d.qfrc_applied;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
-    const bodyMass = m.body_mass;
+    if (!this.ensureCachedViews()) return 0;
+    const qpos = this.vcQpos;
+    const qvel = this.vcQvel;
+    const qfrcApplied = this.vcQfrcApplied;
+    const bodyTreeId = this.vcBodyTreeId;
+    const treeAsleep = this.vcTreeAsleep;
+    const bodyMass = this.vcBodyMass;
 
     let maxBoundReal = 0;
     for (let i = 0; i < this.blocks.length; i++) {
       const b = this.blocks[i];
       this.ensureBlockRegistered(b);
       if (b.shattered) continue;
-      const info = this.worldCompat.getMapping(b.bodyHandle);
+      const info = this.getMappingFast(b.bodyHandle);
       if (!info || !info.enabled) continue;
       const adr = info.qposAdr;
       b.prePos[0] = qpos[adr + 0] * DM_PER_M;
@@ -3264,36 +3703,26 @@ export class MujocoPhysicsEngine {
       b.preQuat[2] = qpos[adr + 6];
       b.preQuat[3] = qpos[adr + 3];
 
+      const dof = info.dofAdr;
       if (b.id < this.blockPreSubstepLinSpeedSi.length) {
-        const dofPre = info.dofAdr;
         if (info.settledAsleep) {
           this.blockPreSubstepLinSpeedSi[b.id] = 0;
           this.blockPreSubstepAngSpeedSi[b.id] = 0;
         } else {
           this.blockPreSubstepLinSpeedSi[b.id] = Math.hypot(
-            qvel[dofPre + 0],
-            qvel[dofPre + 1],
-            qvel[dofPre + 2]
+            qvel[dof + 0],
+            qvel[dof + 1],
+            qvel[dof + 2]
           );
           this.blockPreSubstepAngSpeedSi[b.id] = Math.hypot(
-            qvel[dofPre + 3],
-            qvel[dofPre + 4],
-            qvel[dofPre + 5]
+            qvel[dof + 3],
+            qvel[dof + 4],
+            qvel[dof + 5]
           );
         }
       }
 
-      const dof = info.dofAdr;
-      const blkSpeedSq =
-        qvel[dof + 0] * qvel[dof + 0] +
-        qvel[dof + 1] * qvel[dof + 1] +
-        qvel[dof + 2] * qvel[dof + 2] +
-        qvel[dof + 3] * qvel[dof + 3] +
-        qvel[dof + 4] * qvel[dof + 4] +
-        qvel[dof + 5] * qvel[dof + 5];
-      const blkHasPendingWake = qfrcApplied[dof + 1] !== 0 || blkSpeedSq > 1e-12;
-      const treeId = bodyTreeId[b.bodyHandle];
-      if (info.settledAsleep || (treeId >= 0 && treeAsleep[treeId] >= 0 && !blkHasPendingWake)) {
+      if (info.settledAsleep) {
         b.linVel[0] = 0; b.linVel[1] = 0; b.linVel[2] = 0;
         b.angVel[0] = 0; b.angVel[1] = 0; b.angVel[2] = 0;
         if (b.id < this.blockCoherentArcSubsteps.length) {
@@ -3303,25 +3732,54 @@ export class MujocoPhysicsEngine {
         }
         continue;
       }
+      const treeId = bodyTreeId[b.bodyHandle];
+      if (treeId >= 0 && treeAsleep[treeId] >= 0 && qfrcApplied[dof + 1] === 0) {
+        const blkSpeedSq =
+          qvel[dof + 0] * qvel[dof + 0] +
+          qvel[dof + 1] * qvel[dof + 1] +
+          qvel[dof + 2] * qvel[dof + 2] +
+          qvel[dof + 3] * qvel[dof + 3] +
+          qvel[dof + 4] * qvel[dof + 4] +
+          qvel[dof + 5] * qvel[dof + 5];
+        if (blkSpeedSq <= 1e-12) {
+          b.linVel[0] = 0; b.linVel[1] = 0; b.linVel[2] = 0;
+          b.angVel[0] = 0; b.angVel[1] = 0; b.angVel[2] = 0;
+          if (b.id < this.blockCoherentArcSubsteps.length) {
+            this.blockCoherentArcSubsteps[b.id] = 0;
+            this.blockPrevHorizOmegaX[b.id] = 0;
+            this.blockPrevHorizOmegaZ[b.id] = 0;
+          }
+          continue;
+        }
+      }
       const lvx = qvel[dof + 0] * FROUDE_VEL_SCALE;
       const lvy = qvel[dof + 1] * FROUDE_VEL_SCALE;
       const lvz = qvel[dof + 2] * FROUDE_VEL_SCALE;
-      const wWorldSi = quatRotateVec3(b.preQuat, [qvel[dof + 3], qvel[dof + 4], qvel[dof + 5]]);
-      const avx = wWorldSi[0] * INV_FROUDE_VEL_SCALE;
-      const avy = wWorldSi[1] * INV_FROUDE_VEL_SCALE;
-      const avz = wWorldSi[2] * INV_FROUDE_VEL_SCALE;
+      const wLocX = qvel[dof + 3];
+      const wLocY = qvel[dof + 4];
+      const wLocZ = qvel[dof + 5];
+      const bqx = b.preQuat[0], bqy = b.preQuat[1], bqz = b.preQuat[2], bqw = b.preQuat[3];
+      const btx = 2 * (bqy * wLocZ - bqz * wLocY);
+      const bty = 2 * (bqz * wLocX - bqx * wLocZ);
+      const btz = 2 * (bqx * wLocY - bqy * wLocX);
+      const wWorldX = wLocX + bqw * btx + (bqy * btz - bqz * bty);
+      const wWorldY = wLocY + bqw * bty + (bqz * btx - bqx * btz);
+      const wWorldZ = wLocZ + bqw * btz + (bqx * bty - bqy * btx);
+      const avx = wWorldX * INV_FROUDE_VEL_SCALE;
+      const avy = wWorldY * INV_FROUDE_VEL_SCALE;
+      const avz = wWorldZ * INV_FROUDE_VEL_SCALE;
       b.linVel[0] = lvx; b.linVel[1] = lvy; b.linVel[2] = lvz;
       b.angVel[0] = avx; b.angVel[1] = avy; b.angVel[2] = avz;
 
       if (b.id < this.blockCoherentArcSubsteps.length) {
-        const whSi = Math.hypot(wWorldSi[0], wWorldSi[2]);
+        const whSi = Math.hypot(wWorldX, wWorldZ);
         if (whSi >= 0.14) {
           const prevWx = this.blockPrevHorizOmegaX[b.id];
           const prevWz = this.blockPrevHorizOmegaZ[b.id];
           const prevWh = Math.hypot(prevWx, prevWz);
           if (
             prevWh >= 0.10 &&
-            wWorldSi[0] * prevWx + wWorldSi[2] * prevWz >= 0.45 * whSi * prevWh
+            wWorldX * prevWx + wWorldZ * prevWz >= 0.45 * whSi * prevWh
           ) {
             this.blockCoherentArcSubsteps[b.id] = Math.min(
               65535,
@@ -3330,8 +3788,8 @@ export class MujocoPhysicsEngine {
           } else {
             this.blockCoherentArcSubsteps[b.id] = 1;
           }
-          this.blockPrevHorizOmegaX[b.id] = wWorldSi[0];
-          this.blockPrevHorizOmegaZ[b.id] = wWorldSi[2];
+          this.blockPrevHorizOmegaX[b.id] = wWorldX;
+          this.blockPrevHorizOmegaZ[b.id] = wWorldZ;
         } else if (whSi < 0.05) {
           this.blockCoherentArcSubsteps[b.id] = 0;
           this.blockPrevHorizOmegaX[b.id] = 0;
@@ -3345,41 +3803,45 @@ export class MujocoPhysicsEngine {
       }
     }
 
-    const bodyInertia = m.body_inertia;
+    const bodyInertia = this.vcBodyInertia;
     const yDatumM = -0.35;
+    const shardQposAdr = this.map.shardQposAdr;
+    const shardDofAdr = this.map.shardDofAdr;
     for (let i = 0; i < this.shards.length; i++) {
       const s = this.shards[i];
-      const info = this.worldCompat.getMapping(s.bodyHandle);
-      const treeId = bodyTreeId[s.bodyHandle];
-      const dof = this.map.shardDofAdr[s.slotIndex];
-      const shdSpeedSq =
-        info && info.enabled
-          ? qvel[dof + 0] * qvel[dof + 0] +
+      const info = this.getMappingFast(s.bodyHandle);
+      const slot = s.slotIndex;
+      const dof = shardDofAdr[slot];
+      let asleep = !info || !info.enabled || info.settledAsleep;
+      if (!asleep) {
+        const treeId = bodyTreeId[s.bodyHandle];
+        if (treeId >= 0 && treeAsleep[treeId] >= 0 && qfrcApplied[dof + 1] === 0) {
+          const shdSpeedSq =
+            qvel[dof + 0] * qvel[dof + 0] +
             qvel[dof + 1] * qvel[dof + 1] +
             qvel[dof + 2] * qvel[dof + 2] +
             qvel[dof + 3] * qvel[dof + 3] +
             qvel[dof + 4] * qvel[dof + 4] +
-            qvel[dof + 5] * qvel[dof + 5]
-          : 0;
-      const shdHasPendingWake = Boolean(
-        info && info.enabled && (qfrcApplied[dof + 1] !== 0 || shdSpeedSq > 1e-12)
-      );
-      const asleep =
-        !info ||
-        !info.enabled ||
-        info.settledAsleep ||
-        (treeId >= 0 && treeAsleep[treeId] >= 0 && !shdHasPendingWake);
+            qvel[dof + 5] * qvel[dof + 5];
+          if (shdSpeedSq <= 1e-12) asleep = true;
+        }
+      }
       if (!asleep) {
-        const adr = this.map.shardQposAdr[s.slotIndex];
+        const adr = shardQposAdr[slot];
         const mShd = bodyMass[s.bodyHandle];
-        const pePreJ = mShd > 0 ? mShd * 9.81 * (Math.max(yDatumM, qpos[adr + 1]) - yDatumM) : 0;
+        const yM = qpos[adr + 1];
+        const pePreJ = mShd > 0 ? mShd * 9.81 * (Math.max(yDatumM, yM) - yDatumM) : 0;
         s.prePos[0] = qpos[adr + 0] * DM_PER_M;
-        s.prePos[1] = qpos[adr + 1] * DM_PER_M;
+        s.prePos[1] = yM * DM_PER_M;
         s.prePos[2] = qpos[adr + 2] * DM_PER_M;
-        s.preQuat[0] = qpos[adr + 4];
-        s.preQuat[1] = qpos[adr + 5];
-        s.preQuat[2] = qpos[adr + 6];
-        s.preQuat[3] = qpos[adr + 3];
+        const sqx = qpos[adr + 4];
+        const sqy = qpos[adr + 5];
+        const sqz = qpos[adr + 6];
+        const sqw = qpos[adr + 3];
+        s.preQuat[0] = sqx;
+        s.preQuat[1] = sqy;
+        s.preQuat[2] = sqz;
+        s.preQuat[3] = sqw;
         const vxSi = qvel[dof + 0];
         const vySi = qvel[dof + 1];
         const vzSi = qvel[dof + 2];
@@ -3396,27 +3858,29 @@ export class MujocoPhysicsEngine {
                   bodyInertia[ib + 2] * wzSi * wzSi)
             : 0;
         const ePreTotalJ = pePreJ + kePreJ;
-        this.shardPreSubstepTotalEnergyJ[s.slotIndex] = ePreTotalJ;
+        this.shardPreSubstepTotalEnergyJ[slot] = ePreTotalJ;
         if (
-          this.shardInContactPrevSubstep[s.slotIndex] === 0 ||
-          this.shardEntryTotalEnergyJ[s.slotIndex] <= 0
+          this.shardInContactPrevSubstep[slot] === 0 ||
+          this.shardEntryTotalEnergyJ[slot] <= 0
         ) {
-          this.shardEntryTotalEnergyJ[s.slotIndex] = ePreTotalJ;
+          this.shardEntryTotalEnergyJ[slot] = ePreTotalJ;
         }
         const lvx = vxSi * FROUDE_VEL_SCALE;
         const lvy = vySi * FROUDE_VEL_SCALE;
         const lvz = vzSi * FROUDE_VEL_SCALE;
-        const wWorldSi = quatRotateVec3(s.preQuat, [wxSi, wySi, wzSi]);
-        const avx = wWorldSi[0] * INV_FROUDE_VEL_SCALE;
-        const avy = wWorldSi[1] * INV_FROUDE_VEL_SCALE;
-        const avz = wWorldSi[2] * INV_FROUDE_VEL_SCALE;
+        const stx = 2 * (sqy * wzSi - sqz * wySi);
+        const sty = 2 * (sqz * wxSi - sqx * wzSi);
+        const stz = 2 * (sqx * wySi - sqy * wxSi);
+        const avx = (wxSi + sqw * stx + (sqy * stz - sqz * sty)) * INV_FROUDE_VEL_SCALE;
+        const avy = (wySi + sqw * sty + (sqz * stx - sqx * stz)) * INV_FROUDE_VEL_SCALE;
+        const avz = (wzSi + sqw * stz + (sqx * sty - sqy * stx)) * INV_FROUDE_VEL_SCALE;
         s.preLinVel[0] = lvx; s.preLinVel[1] = lvy; s.preLinVel[2] = lvz;
         s.preAngVel[0] = avx; s.preAngVel[1] = avy; s.preAngVel[2] = avz;
         s.preVy = lvy;
         const sb = (Math.hypot(lvx, lvy, lvz) + Math.hypot(avx, avy, avz) * 0.25) * SIM_TIME_SCALE;
         if (sb > maxBoundReal) maxBoundReal = sb;
       } else {
-        this.shardInContactPrevSubstep[s.slotIndex] = 0;
+        this.shardInContactPrevSubstep[slot] = 0;
         s.prePos[0] = s.position[0]; s.prePos[1] = s.position[1]; s.prePos[2] = s.position[2];
         s.preQuat[0] = s.rotation[0]; s.preQuat[1] = s.rotation[1]; s.preQuat[2] = s.rotation[2]; s.preQuat[3] = s.rotation[3];
         s.preLinVel[0] = 0; s.preLinVel[1] = 0; s.preLinVel[2] = 0;
@@ -3426,82 +3890,91 @@ export class MujocoPhysicsEngine {
     }
 
     this.extraPreStep.clear();
-    for (const extraBid of this.worldCompat.getActiveExtraBodyIds()) {
-      if (this.bodyToBlock.has(extraBid)) continue;
-      const info = this.worldCompat.getMapping(extraBid);
-      if (!info) continue;
-      const adr = info.qposAdr;
-      const dof = info.dofAdr;
-      const px = qpos[adr + 0] * DM_PER_M;
-      const py = qpos[adr + 1] * DM_PER_M;
-      const pz = qpos[adr + 2] * DM_PER_M;
-      const lvx = qvel[dof + 0] * FROUDE_VEL_SCALE;
-      const lvy = qvel[dof + 1] * FROUDE_VEL_SCALE;
-      const lvz = qvel[dof + 2] * FROUDE_VEL_SCALE;
-      const eq: Quat = [qpos[adr + 4], qpos[adr + 5], qpos[adr + 6], qpos[adr + 3]];
-      const wWorldSi = quatRotateVec3(eq, [qvel[dof + 3], qvel[dof + 4], qvel[dof + 5]]);
-      const avx = wWorldSi[0] * INV_FROUDE_VEL_SCALE;
-      const avy = wWorldSi[1] * INV_FROUDE_VEL_SCALE;
-      const avz = wWorldSi[2] * INV_FROUDE_VEL_SCALE;
-      this.extraPreStep.set(extraBid, {
-        posDm: [px, py, pz],
-        linVelSim: [lvx, lvy, lvz],
-        angVelSim: [avx, avy, avz],
-        massKg: bodyMass[extraBid],
-      });
-      const eb = (Math.hypot(lvx, lvy, lvz) + Math.hypot(avx, avy, avz) * 0.3) * SIM_TIME_SCALE;
-      if (eb > maxBoundReal) maxBoundReal = eb;
+    if (this.map.extraBodyIds.length > 0) {
+      for (const extraBid of this.worldCompat.getActiveExtraBodyIds()) {
+        if (extraBid < this.bodyIdToBlock.length && this.bodyIdToBlock[extraBid] !== undefined) continue;
+        const info = this.getMappingFast(extraBid);
+        if (!info) continue;
+        const adr = info.qposAdr;
+        const dof = info.dofAdr;
+        const px = qpos[adr + 0] * DM_PER_M;
+        const py = qpos[adr + 1] * DM_PER_M;
+        const pz = qpos[adr + 2] * DM_PER_M;
+        const lvx = qvel[dof + 0] * FROUDE_VEL_SCALE;
+        const lvy = qvel[dof + 1] * FROUDE_VEL_SCALE;
+        const lvz = qvel[dof + 2] * FROUDE_VEL_SCALE;
+        const eq: Quat = [qpos[adr + 4], qpos[adr + 5], qpos[adr + 6], qpos[adr + 3]];
+        const wWorldSi = quatRotateVec3(eq, [qvel[dof + 3], qvel[dof + 4], qvel[dof + 5]]);
+        const avx = wWorldSi[0] * INV_FROUDE_VEL_SCALE;
+        const avy = wWorldSi[1] * INV_FROUDE_VEL_SCALE;
+        const avz = wWorldSi[2] * INV_FROUDE_VEL_SCALE;
+        this.extraPreStep.set(extraBid, {
+          posDm: [px, py, pz],
+          linVelSim: [lvx, lvy, lvz],
+          angVelSim: [avx, avy, avz],
+          massKg: bodyMass[extraBid],
+        });
+        const eb = (Math.hypot(lvx, lvy, lvz) + Math.hypot(avx, avy, avz) * 0.3) * SIM_TIME_SCALE;
+        if (eb > maxBoundReal) maxBoundReal = eb;
+      }
     }
 
     return maxBoundReal;
   }
 
-  private getPreStepPointVelSim(bodyId: number, worldPtDm: Vec3): Vec3 {
-    if (bodyId < 2) return [0, 0, 0]; // World / oak table / mocap
-    const blk = this.bodyToBlock.get(bodyId);
+  private getPreStepPointVelSim(bodyId: number, worldPtDm: Vec3, out: Vec3): Vec3 {
+    if (bodyId < 2) {
+      out[0] = 0; out[1] = 0; out[2] = 0;
+      return out; // World / oak table / mocap
+    }
+    const blk = bodyId < this.bodyIdToBlock.length ? this.bodyIdToBlock[bodyId] : undefined;
     if (blk) {
       const rx = worldPtDm[0] - blk.prePos[0];
       const ry = worldPtDm[1] - blk.prePos[1];
       const rz = worldPtDm[2] - blk.prePos[2];
-      return [
-        blk.linVel[0] + (blk.angVel[1] * rz - blk.angVel[2] * ry),
-        blk.linVel[1] + (blk.angVel[2] * rx - blk.angVel[0] * rz),
-        blk.linVel[2] + (blk.angVel[0] * ry - blk.angVel[1] * rx),
-      ];
+      out[0] = blk.linVel[0] + (blk.angVel[1] * rz - blk.angVel[2] * ry);
+      out[1] = blk.linVel[1] + (blk.angVel[2] * rx - blk.angVel[0] * rz);
+      out[2] = blk.linVel[2] + (blk.angVel[0] * ry - blk.angVel[1] * rx);
+      return out;
     }
-    const shd = this.bodyToShard.get(bodyId);
+    const shd =
+      this.shards.length > 0 && bodyId < this.bodyIdToShard.length
+        ? this.bodyIdToShard[bodyId]
+        : undefined;
     if (shd) {
       const rx = worldPtDm[0] - shd.prePos[0];
       const ry = worldPtDm[1] - shd.prePos[1];
       const rz = worldPtDm[2] - shd.prePos[2];
-      return [
-        shd.preLinVel[0] + (shd.preAngVel[1] * rz - shd.preAngVel[2] * ry),
-        shd.preLinVel[1] + (shd.preAngVel[2] * rx - shd.preAngVel[0] * rz),
-        shd.preLinVel[2] + (shd.preAngVel[0] * ry - shd.preAngVel[1] * rx),
-      ];
+      out[0] = shd.preLinVel[0] + (shd.preAngVel[1] * rz - shd.preAngVel[2] * ry);
+      out[1] = shd.preLinVel[1] + (shd.preAngVel[2] * rx - shd.preAngVel[0] * rz);
+      out[2] = shd.preLinVel[2] + (shd.preAngVel[0] * ry - shd.preAngVel[1] * rx);
+      return out;
     }
     const ext = this.extraPreStep.get(bodyId);
     if (ext) {
       const rx = worldPtDm[0] - ext.posDm[0];
       const ry = worldPtDm[1] - ext.posDm[1];
       const rz = worldPtDm[2] - ext.posDm[2];
-      return [
-        ext.linVelSim[0] + (ext.angVelSim[1] * rz - ext.angVelSim[2] * ry),
-        ext.linVelSim[1] + (ext.angVelSim[2] * rx - ext.angVelSim[0] * rz),
-        ext.linVelSim[2] + (ext.angVelSim[0] * ry - ext.angVelSim[1] * rx),
-      ];
+      out[0] = ext.linVelSim[0] + (ext.angVelSim[1] * rz - ext.angVelSim[2] * ry);
+      out[1] = ext.linVelSim[1] + (ext.angVelSim[2] * rx - ext.angVelSim[0] * rz);
+      out[2] = ext.linVelSim[2] + (ext.angVelSim[0] * ry - ext.angVelSim[1] * rx);
+      return out;
     }
-    return [0, 0, 0];
+    out[0] = 0; out[1] = 0; out[2] = 0;
+    return out;
   }
 
   /**
    * Evaluates 6D contact wrenches (`efc_force`), reduced-mass impact strain energy, opposing-wrench anvil crush,
    * three-point flexural bending stress, Housner beveled-prism rocking transfers, and secondary 3D shard bounces!
    */
-  private processWrenchCollisionsAndFractures(subDtSec: number): void {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) return;
+  private processWrenchCollisionsAndFractures(
+    subDtSec: number,
+    skipContactScan = false
+  ): void {
+    if (!this.ensureCachedViews()) return;
+    const m = this.model!;
+    const d = this.data!;
 
     let didAnyFractureSyncNeeded = false;
     const isCollapseFractureBurst =
@@ -3529,7 +4002,7 @@ export class MujocoPhysicsEngine {
             {
               closingSpeedReal: effClosingReal,
               isAnvilCrush: def.isAnvilCrush,
-              skipSyncKinematics: true,
+              skipSyncKinematics: false,
             }
           );
           didAnyFractureSyncNeeded = true;
@@ -3538,11 +4011,18 @@ export class MujocoPhysicsEngine {
       }
     }
 
+    if (skipContactScan) {
+      if (didAnyFractureSyncNeeded) {
+        this.worldCompat.syncKinematics();
+      }
+      return;
+    }
+
     const ncon = d.ncon;
     if (ncon === 0) {
       if (this.shards.length > 0) {
-        const bodyTreeId = m.body_treeid;
-        const treeAsleep = d.tree_asleep;
+        const bodyTreeId = this.vcBodyTreeId;
+        const treeAsleep = this.vcTreeAsleep;
         for (let i = 0; i < this.shards.length; i++) {
           const s = this.shards[i];
           const treeId = bodyTreeId[s.bodyHandle];
@@ -3560,17 +4040,26 @@ export class MujocoPhysicsEngine {
       return;
     }
 
-    const blockImpacts = this.scratchBlockImpacts;
-    blockImpacts.clear();
+    const activeImpactIds = this.scratchActiveImpactIds;
+    const impactById = this.scratchBlockImpactById;
+    for (let ii = 0; ii < activeImpactIds.length; ii++) {
+      impactById[activeImpactIds[ii]] = undefined;
+    }
+    activeImpactIds.length = 0;
+    let impactPoolUsed = 0;
+    let contactEntryPoolUsed = 0;
 
     const contacts = d.contact;
     const efc = d.efc_force;
-    const bodyMass = m.body_mass;
-    const geomBodyId = m.geom_bodyid;
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
+    const bodyMass = this.vcBodyMass;
+    const geomBodyId = this.vcGeomBodyId;
+    const qpos = this.vcQpos;
+    const qvel = this.vcQvel;
+    const bodyTreeId = this.vcBodyTreeId;
+    const treeAsleep = this.vcTreeAsleep;
+    const geomAabb = this.vcGeomAabb;
+    const geomXpos = this.vcGeomXpos;
+    const geomXmat = this.vcGeomXmat;
     const dtSim = subDtSec * SIM_TIME_SCALE;
     const minShardGid = this.minShardGeomId;
     const maxShardGid = this.maxShardGeomId;
@@ -3591,11 +4080,30 @@ export class MujocoPhysicsEngine {
       fnN: number,
       jnSim: number,
       pairSeparated: boolean,
-      pairSeparatedRaw: boolean
+      pairSeparatedRaw: boolean,
+      otherBlk?: GlassBlockState
     ) => {
       if (blkA.shattered || blkA.extracted) return;
-      const vPtA = this.getPreStepPointVelSim(blkA.bodyHandle, worldPtDm);
-      const vPtB = this.getPreStepPointVelSim(otherBodyId, worldPtDm);
+      const vPtA = this.scratchPreVelA;
+      {
+        const rx = worldPtDm[0] - blkA.prePos[0];
+        const ry = worldPtDm[1] - blkA.prePos[1];
+        const rz = worldPtDm[2] - blkA.prePos[2];
+        vPtA[0] = blkA.linVel[0] + (blkA.angVel[1] * rz - blkA.angVel[2] * ry);
+        vPtA[1] = blkA.linVel[1] + (blkA.angVel[2] * rx - blkA.angVel[0] * rz);
+        vPtA[2] = blkA.linVel[2] + (blkA.angVel[0] * ry - blkA.angVel[1] * rx);
+      }
+      const vPtB = this.scratchPreVelB;
+      if (otherBlk) {
+        const rx = worldPtDm[0] - otherBlk.prePos[0];
+        const ry = worldPtDm[1] - otherBlk.prePos[1];
+        const rz = worldPtDm[2] - otherBlk.prePos[2];
+        vPtB[0] = otherBlk.linVel[0] + (otherBlk.angVel[1] * rz - otherBlk.angVel[2] * ry);
+        vPtB[1] = otherBlk.linVel[1] + (otherBlk.angVel[2] * rx - otherBlk.angVel[0] * rz);
+        vPtB[2] = otherBlk.linVel[2] + (otherBlk.angVel[0] * ry - otherBlk.angVel[1] * rx);
+      } else {
+        this.getPreStepPointVelSim(otherBodyId, worldPtDm, vPtB);
+      }
       const relAlongN =
         (vPtB[0] - vPtA[0]) * nAtoB[0] +
         (vPtB[1] - vPtA[1]) * nAtoB[1] +
@@ -3623,28 +4131,29 @@ export class MujocoPhysicsEngine {
         nAtoB[1] < -0.55 &&
         fnN > 6.5
       ) {
-        const shdAnvil = this.bodyToShard.get(otherBodyId);
+        const shdAnvil =
+          otherBodyId < this.bodyIdToShard.length ? this.bodyIdToShard[otherBodyId] : undefined;
         if (shdAnvil && shdAnvil.massKg >= 0.0008) {
           const shdQposAdr = this.map.shardQposAdr[shdAnvil.slotIndex];
           const shdYM = qpos[shdQposAdr + 1];
           if (shdYM > -0.006 && shdYM < 0.022) {
             let groundedOnOak = shdYM < 0.0105;
-            if (!groundedOnOak && m.geom_aabb && d.geom_xpos && d.geom_xmat) {
+            if (!groundedOnOak && geomAabb && geomXpos && geomXmat) {
               const gid = shdAnvil.colliderHandle;
               const aabbBase = gid * 6;
               const xmBase = gid * 9;
-              const r10 = d.geom_xmat[xmBase + 3];
-              const r11 = d.geom_xmat[xmBase + 4];
-              const r12 = d.geom_xmat[xmBase + 5];
+              const r10 = geomXmat[xmBase + 3];
+              const r11 = geomXmat[xmBase + 4];
+              const r12 = geomXmat[xmBase + 5];
               const wCyM =
-                d.geom_xpos[gid * 3 + 1] +
-                r10 * m.geom_aabb[aabbBase + 0] +
-                r11 * m.geom_aabb[aabbBase + 1] +
-                r12 * m.geom_aabb[aabbBase + 2];
+                geomXpos[gid * 3 + 1] +
+                r10 * geomAabb[aabbBase + 0] +
+                r11 * geomAabb[aabbBase + 1] +
+                r12 * geomAabb[aabbBase + 2];
               const halfYM =
-                Math.abs(r10) * m.geom_aabb[aabbBase + 3] +
-                Math.abs(r11) * m.geom_aabb[aabbBase + 4] +
-                Math.abs(r12) * m.geom_aabb[aabbBase + 5];
+                Math.abs(r10) * geomAabb[aabbBase + 3] +
+                Math.abs(r11) * geomAabb[aabbBase + 4] +
+                Math.abs(r12) * geomAabb[aabbBase + 5];
               groundedOnOak = wCyM - halfYM <= 0.0045;
             }
             isTableBackedShardAnvil = groundedOnOak;
@@ -3671,47 +4180,75 @@ export class MujocoPhysicsEngine {
       const clampedJnSim =
         vEffectiveCloseReal > 1.5 ? Math.min(jnSim, jMaxPhysicalSim) : jnSim;
 
-      const relWorldDm: Vec3 = [
+      quatInverseRotateVec3InPlace(
+        blkA.preQuat,
         worldPtDm[0] - blkA.prePos[0],
         worldPtDm[1] - blkA.prePos[1],
         worldPtDm[2] - blkA.prePos[2],
-      ];
-      const rawLocal = quatInverseRotateVec3(blkA.preQuat, relWorldDm);
-      const localHitDm: Vec3 = [
-        Math.max(-BLOCK_HALF_X, Math.min(BLOCK_HALF_X, rawLocal[0])),
-        Math.max(-BLOCK_HALF_Y, Math.min(BLOCK_HALF_Y, rawLocal[1])),
-        Math.max(-BLOCK_HALF_Z, Math.min(BLOCK_HALF_Z, rawLocal[2])),
-      ];
+        scratchCameHitDm
+      );
+      const lxDm = Math.max(-BLOCK_HALF_X, Math.min(BLOCK_HALF_X, scratchCameHitDm[0]));
+      const lyDm = Math.max(-BLOCK_HALF_Y, Math.min(BLOCK_HALF_Y, scratchCameHitDm[1]));
+      const lzDm = Math.max(-BLOCK_HALF_Z, Math.min(BLOCK_HALF_Z, scratchCameHitDm[2]));
       const hitTable = otherGeomId === tableGid || otherGeomId === shardTableGid;
       const normOtherBodyId = hitTable ? 0 : otherBodyId;
 
-      let acc = blockImpacts.get(blkA.id);
+      let acc = blkA.id < impactById.length ? impactById[blkA.id] : undefined;
       if (!acc) {
-        acc = {
-          blk: blkA,
-          dynamicImpulseSim: 0,
-          peakDynamicImpulseSim: -1,
-          maxVCloseReal: 0,
-          bestLocalHitDm: localHitDm,
-          bestNormalAtoB: nAtoB,
-          bestHitTable: hitTable,
-          bestHitShardAnvil: isTableBackedShardAnvil,
-          maxRawVCloseReal: 0,
-          bestRawLocalHitDm: localHitDm,
-          bestRawNormalAtoB: nAtoB,
-          bestRawHitTable: hitTable,
-          bestRawWorldPtDm: worldPtDm,
-          bestRawOtherBodyId: normOtherBodyId,
-          hasRawSeparatedOnset: false,
-          upwardSupportFn: 0,
-          downwardTopFn: 0,
-          rockHitTable: hitTable,
-          rockWorldPtDm: worldPtDm,
-          distinctContactBodies: 0,
-          hasOnsetContact: false,
-          contacts: [],
-        };
-        blockImpacts.set(blkA.id, acc);
+        if (impactPoolUsed < this.scratchImpactPool.length) {
+          acc = this.scratchImpactPool[impactPoolUsed++];
+          acc.blk = blkA;
+          acc.dynamicImpulseSim = 0;
+          acc.peakDynamicImpulseSim = -1;
+          acc.maxVCloseReal = 0;
+          acc.bestLocalHitDm[0] = lxDm; acc.bestLocalHitDm[1] = lyDm; acc.bestLocalHitDm[2] = lzDm;
+          acc.bestNormalAtoB[0] = nAtoB[0]; acc.bestNormalAtoB[1] = nAtoB[1]; acc.bestNormalAtoB[2] = nAtoB[2];
+          acc.bestHitTable = hitTable;
+          acc.bestHitShardAnvil = isTableBackedShardAnvil;
+          acc.maxRawVCloseReal = 0;
+          acc.bestRawLocalHitDm[0] = lxDm; acc.bestRawLocalHitDm[1] = lyDm; acc.bestRawLocalHitDm[2] = lzDm;
+          acc.bestRawNormalAtoB[0] = nAtoB[0]; acc.bestRawNormalAtoB[1] = nAtoB[1]; acc.bestRawNormalAtoB[2] = nAtoB[2];
+          acc.bestRawHitTable = hitTable;
+          acc.bestRawWorldPtDm[0] = worldPtDm[0]; acc.bestRawWorldPtDm[1] = worldPtDm[1]; acc.bestRawWorldPtDm[2] = worldPtDm[2];
+          acc.bestRawOtherBodyId = normOtherBodyId;
+          acc.hasRawSeparatedOnset = false;
+          acc.upwardSupportFn = 0;
+          acc.downwardTopFn = 0;
+          acc.rockHitTable = hitTable;
+          acc.rockWorldPtDm[0] = worldPtDm[0]; acc.rockWorldPtDm[1] = worldPtDm[1]; acc.rockWorldPtDm[2] = worldPtDm[2];
+          acc.distinctContactBodies = 0;
+          acc.hasOnsetContact = false;
+          acc.contacts.length = 0;
+        } else {
+          acc = {
+            blk: blkA,
+            dynamicImpulseSim: 0,
+            peakDynamicImpulseSim: -1,
+            maxVCloseReal: 0,
+            bestLocalHitDm: [lxDm, lyDm, lzDm],
+            bestNormalAtoB: [nAtoB[0], nAtoB[1], nAtoB[2]],
+            bestHitTable: hitTable,
+            bestHitShardAnvil: isTableBackedShardAnvil,
+            maxRawVCloseReal: 0,
+            bestRawLocalHitDm: [lxDm, lyDm, lzDm],
+            bestRawNormalAtoB: [nAtoB[0], nAtoB[1], nAtoB[2]],
+            bestRawHitTable: hitTable,
+            bestRawWorldPtDm: [worldPtDm[0], worldPtDm[1], worldPtDm[2]],
+            bestRawOtherBodyId: normOtherBodyId,
+            hasRawSeparatedOnset: false,
+            upwardSupportFn: 0,
+            downwardTopFn: 0,
+            rockHitTable: hitTable,
+            rockWorldPtDm: [worldPtDm[0], worldPtDm[1], worldPtDm[2]],
+            distinctContactBodies: 0,
+            hasOnsetContact: false,
+            contacts: [],
+          };
+          this.scratchImpactPool.push(acc);
+          impactPoolUsed++;
+        }
+        impactById[blkA.id] = acc;
+        activeImpactIds.push(blkA.id);
       }
 
       let seenOtherBody = false;
@@ -3728,7 +4265,7 @@ export class MujocoPhysicsEngine {
       if (nAtoB[1] < -0.75) {
         acc.upwardSupportFn += fnN;
         if (hitTable) acc.rockHitTable = true;
-        acc.rockWorldPtDm = worldPtDm;
+        acc.rockWorldPtDm[0] = worldPtDm[0]; acc.rockWorldPtDm[1] = worldPtDm[1]; acc.rockWorldPtDm[2] = worldPtDm[2];
       } else if (nAtoB[1] > 0.75) {
         acc.downwardTopFn += fnN;
       }
@@ -3752,23 +4289,40 @@ export class MujocoPhysicsEngine {
         acc.hasOnsetContact = true;
       }
 
-      acc.contacts.push({
-        jnSim: clampedJnSim,
-        fnN,
-        localHitDm,
-        nAtoB,
-        vCloseReal: vCloseForBlock,
-        otherBodyId: normOtherBodyId,
-        otherIsShard: isShardContact && !isTableBackedShardAnvil,
-        hitTable,
-        worldPtDm,
-      });
+      let ce: ScratchBlockContactEntry;
+      if (contactEntryPoolUsed < this.scratchContactEntryPool.length) {
+        ce = this.scratchContactEntryPool[contactEntryPoolUsed++];
+        ce.jnSim = clampedJnSim;
+        ce.fnN = fnN;
+        ce.localHitDm[0] = lxDm; ce.localHitDm[1] = lyDm; ce.localHitDm[2] = lzDm;
+        ce.nAtoB[0] = nAtoB[0]; ce.nAtoB[1] = nAtoB[1]; ce.nAtoB[2] = nAtoB[2];
+        ce.vCloseReal = vCloseForBlock;
+        ce.otherBodyId = normOtherBodyId;
+        ce.otherIsShard = isShardContact && !isTableBackedShardAnvil;
+        ce.hitTable = hitTable;
+        ce.worldPtDm[0] = worldPtDm[0]; ce.worldPtDm[1] = worldPtDm[1]; ce.worldPtDm[2] = worldPtDm[2];
+      } else {
+        ce = {
+          jnSim: clampedJnSim,
+          fnN,
+          localHitDm: [lxDm, lyDm, lzDm],
+          nAtoB: [nAtoB[0], nAtoB[1], nAtoB[2]],
+          vCloseReal: vCloseForBlock,
+          otherBodyId: normOtherBodyId,
+          otherIsShard: isShardContact && !isTableBackedShardAnvil,
+          hitTable,
+          worldPtDm: [worldPtDm[0], worldPtDm[1], worldPtDm[2]],
+        };
+        this.scratchContactEntryPool.push(ce);
+        contactEntryPoolUsed++;
+      }
+      acc.contacts.push(ce);
       if (vCloseForBlock > acc.maxRawVCloseReal) {
         acc.maxRawVCloseReal = vCloseForBlock;
-        acc.bestRawLocalHitDm = localHitDm;
-        acc.bestRawNormalAtoB = nAtoB;
+        acc.bestRawLocalHitDm[0] = lxDm; acc.bestRawLocalHitDm[1] = lyDm; acc.bestRawLocalHitDm[2] = lzDm;
+        acc.bestRawNormalAtoB[0] = nAtoB[0]; acc.bestRawNormalAtoB[1] = nAtoB[1]; acc.bestRawNormalAtoB[2] = nAtoB[2];
         acc.bestRawHitTable = hitTable;
-        acc.bestRawWorldPtDm = worldPtDm;
+        acc.bestRawWorldPtDm[0] = worldPtDm[0]; acc.bestRawWorldPtDm[1] = worldPtDm[1]; acc.bestRawWorldPtDm[2] = worldPtDm[2];
         acc.bestRawOtherBodyId = normOtherBodyId;
       }
       if ((!isShardContact || isTableBackedShardAnvil) && vCloseForBlock > 1.5) {
@@ -3776,8 +4330,8 @@ export class MujocoPhysicsEngine {
         if (vCloseForBlock > acc.maxVCloseReal) acc.maxVCloseReal = vCloseForBlock;
         if (clampedJnSim > acc.peakDynamicImpulseSim) {
           acc.peakDynamicImpulseSim = clampedJnSim;
-          acc.bestLocalHitDm = localHitDm;
-          acc.bestNormalAtoB = nAtoB;
+          acc.bestLocalHitDm[0] = lxDm; acc.bestLocalHitDm[1] = lyDm; acc.bestLocalHitDm[2] = lzDm;
+          acc.bestNormalAtoB[0] = nAtoB[0]; acc.bestNormalAtoB[1] = nAtoB[1]; acc.bestNormalAtoB[2] = nAtoB[2];
           acc.bestHitTable = hitTable;
           acc.bestHitShardAnvil = isTableBackedShardAnvil;
         }
@@ -3785,9 +4339,17 @@ export class MujocoPhysicsEngine {
     };
 
     // First coalesce multi-point contacts (`multiccd` generates 2-4 vertices per geom pair) by `(g1, g2)` pair
-    // using a zero-GC pooled map and single Embind view reads per contact!
-    const pairMap = this.scratchPairMap;
-    pairMap.clear();
+    // using a zero-GC open-addressed flat hash table and pooled records!
+    let epoch = (this.scratchPairHashEpoch + 1) >>> 0;
+    if (epoch === 0) {
+      this.scratchPairHashStamp.fill(0);
+      epoch = 1;
+    }
+    this.scratchPairHashEpoch = epoch;
+    const hKey = this.scratchPairHashKey;
+    const hStamp = this.scratchPairHashStamp;
+    const hIdx = this.scratchPairHashIdx;
+    const hMask = hKey.length - 1;
     let poolUsed = 0;
 
     for (let i = 0; i < ncon; i++) {
@@ -3826,8 +4388,17 @@ export class MujocoPhysicsEngine {
 
             if (shouldRecordPair) {
               const key = g1 * 4096 + g2;
-              let pm = pairMap.get(key);
+              let slot = (Math.imul(key, 0x9e3779b1) >>> 19) & hMask;
+              let pm: ScratchGeomPairContact | undefined;
+              while (hStamp[slot] === epoch) {
+                if (hKey[slot] === key) {
+                  pm = this.scratchPairPool[hIdx[slot]];
+                  break;
+                }
+                slot = (slot + 1) & hMask;
+              }
               if (!pm) {
+                const newPoolIdx = poolUsed;
                 if (poolUsed < this.scratchPairPool.length) {
                   pm = this.scratchPairPool[poolUsed++];
                   pm.g1 = g1;
@@ -3858,7 +4429,9 @@ export class MujocoPhysicsEngine {
                   this.scratchPairPool.push(pm);
                   poolUsed++;
                 }
-                pairMap.set(key, pm);
+                hStamp[slot] = epoch;
+                hKey[slot] = key;
+                hIdx[slot] = newPoolIdx;
               }
               const cPos = c.pos;
               const cFrame = c.frame;
@@ -3882,34 +4455,61 @@ export class MujocoPhysicsEngine {
     // total collision impulse J_total relates to peak force F_peak via tau_impact ≈ 1.08 * solref[0].
     const tauImpactSim = Math.max(dtSim, this.cfg.contactSolref[0] * 1.08 * SIM_TIME_SCALE);
 
-    for (const pm of pairMap.values()) {
+    const worldPtDm = this.scratchWorldPtDm;
+    const n1to2 = this.scratchN1to2;
+    const n2to1 = this.scratchN2to1;
+    const pairLastArr = this.blockPairLastContactArr;
+    for (let pi = 0; pi < poolUsed; pi++) {
+      const pm = this.scratchPairPool[pi];
       const fnN = pm.fnSum;
       if (fnN <= 0.005) continue;
       const invFn = 1.0 / fnN;
-      const worldPtDm: Vec3 = [pm.wx * invFn, pm.wy * invFn, pm.wz * invFn];
+      worldPtDm[0] = pm.wx * invFn;
+      worldPtDm[1] = pm.wy * invFn;
+      worldPtDm[2] = pm.wz * invFn;
       const nLen = Math.hypot(pm.nx, pm.ny, pm.nz) || 1.0;
-      const n1to2: Vec3 = [pm.nx / nLen, pm.ny / nLen, pm.nz / nLen];
-      const n2to1: Vec3 = [-n1to2[0], -n1to2[1], -n1to2[2]];
+      const nx = pm.nx / nLen;
+      const ny = pm.ny / nLen;
+      const nz = pm.nz / nLen;
+      n1to2[0] = nx; n1to2[1] = ny; n1to2[2] = nz;
+      n2to1[0] = -nx; n2to1[1] = -ny; n2to1[2] = -nz;
       const jnSim = fnN * tauImpactSim;
 
       const { g1, g2, b1, b2 } = pm;
-      const blk1 = b1 >= 2 ? this.bodyToBlock.get(b1) : undefined;
-      const blk2 = b2 >= 2 ? this.bodyToBlock.get(b2) : undefined;
+      const blk1 =
+        b1 >= 2 && b1 < this.bodyIdToBlock.length ? this.bodyIdToBlock[b1] : undefined;
+      const blk2 =
+        b2 >= 2 && b2 < this.bodyIdToBlock.length ? this.bodyIdToBlock[b2] : undefined;
       let blockPairSeparated = false;
       if (fnN > 0.025 && (blk1 || blk2)) {
-        const pairKey = g1 < g2 ? g1 * 4096 + g2 : g2 * 4096 + g1;
-        const prevPairT = this.blockPairLastContactSimTime.get(pairKey) ?? -10.0;
+        const loG = g1 < g2 ? g1 : g2;
+        const hiG = g1 < g2 ? g2 : g1;
+        let prevPairT: number;
+        if (hiG < 128) {
+          const arrIdx = (loG << 7) | hiG;
+          prevPairT = pairLastArr[arrIdx];
+          pairLastArr[arrIdx] = this.simTime;
+        } else {
+          const pairKey = loG * 4096 + hiG;
+          prevPairT = this.blockPairLastContactSimTime.get(pairKey) ?? -10.0;
+          this.blockPairLastContactSimTime.set(pairKey, this.simTime);
+        }
         const pairGap = this.simTime - prevPairT;
         const pairSeparated = pairGap >= 0.015;
         const pairSeparatedRaw = pairGap >= 0.010;
         blockPairSeparated = pairGap >= 0.018;
-        this.blockPairLastContactSimTime.set(pairKey, this.simTime);
-        if (blk1) recordForBlock(blk1, b2, g2, worldPtDm, n1to2, fnN, jnSim, pairSeparated, pairSeparatedRaw);
-        if (blk2) recordForBlock(blk2, b1, g1, worldPtDm, n2to1, fnN, jnSim, pairSeparated, pairSeparatedRaw);
+        if (blk1) recordForBlock(blk1, b2, g2, worldPtDm, n1to2, fnN, jnSim, pairSeparated, pairSeparatedRaw, blk2);
+        if (blk2) recordForBlock(blk2, b1, g1, worldPtDm, n2to1, fnN, jnSim, pairSeparated, pairSeparatedRaw, blk1);
       }
 
-      const shd1 = b1 >= 2 ? this.bodyToShard.get(b1) : undefined;
-      const shd2 = b2 >= 2 ? this.bodyToShard.get(b2) : undefined;
+      const shd1 =
+        this.shards.length > 0 && b1 >= 2 && b1 < this.bodyIdToShard.length
+          ? this.bodyIdToShard[b1]
+          : undefined;
+      const shd2 =
+        this.shards.length > 0 && b2 >= 2 && b2 < this.bodyIdToShard.length
+          ? this.bodyIdToShard[b2]
+          : undefined;
       if (shd1 || shd2) {
         const hitTablePair =
           g1 === tableGid ||
@@ -3947,8 +4547,8 @@ export class MujocoPhysicsEngine {
 
         // Ignore initial 22 ms fracture sibling-separation window for both audio & secondary bounce telemetry!
         if (ageSec >= 0.022) {
-          const v1 = this.getPreStepPointVelSim(b1, worldPtDm);
-          const v2 = this.getPreStepPointVelSim(b2, worldPtDm);
+          const v1 = this.getPreStepPointVelSim(b1, worldPtDm, this.scratchPreVelA);
+          const v2 = this.getPreStepPointVelSim(b2, worldPtDm, this.scratchPreVelB);
           const relAlongN =
             (v2[0] - v1[0]) * n1to2[0] +
             (v2[1] - v1[1]) * n1to2[1] +
@@ -4006,24 +4606,18 @@ export class MujocoPhysicsEngine {
       }
     }
 
-    if (blockImpacts.size === 0) {
+    if (activeImpactIds.length === 0) {
       if (didAnyFractureSyncNeeded) {
         this.worldCompat.syncKinematics();
       }
       return;
     }
 
-    const blocksToShatter: Array<{
-      blk: GlassBlockState;
-      localHit: Vec3;
-      impactSpeed: number;
-      worldNormal: Vec3;
-      hitTable: boolean;
-      closingSpeedReal: number;
-      isAnvilCrush: boolean;
-    }> = [];
+    const blocksToShatter = this.scratchBlocksToShatter;
+    blocksToShatter.length = 0;
 
-    for (const acc of blockImpacts.values()) {
+    for (let accIdx = 0; accIdx < activeImpactIds.length; accIdx++) {
+      const acc = impactById[activeImpactIds[accIdx]]!;
       const blk = acc.blk;
       let didEmitWobbleForBlock = false;
       let isFreeRockingBodyForBlock = false;
@@ -4038,9 +4632,10 @@ export class MujocoPhysicsEngine {
         acc.upwardSupportFn > 0.06 &&
         !blk.shattered &&
         !blk.extracted &&
-        blk.id !== this.activeBlockId
+        blk.id !== this.activeBlockId &&
+        (!this.sandboxCollapseActive || (acc.downwardTopFn < 0.35 && acc.distinctContactBodies <= 2))
       ) {
-        const info = this.worldCompat.getMapping(blk.bodyHandle);
+        const info = this.getMappingFast(blk.bodyHandle);
         if (info && info.enabled) {
           const preWxSi = blk.angVel[0] * FROUDE_VEL_SCALE;
           const preWzSi = blk.angVel[2] * FROUDE_VEL_SCALE;
@@ -4051,20 +4646,29 @@ export class MujocoPhysicsEngine {
           if (preWhSi >= 0.30 && preWhSi <= 22.0 && Math.abs(preVyMps) < 0.55 && preVhMps < 0.45) {
             const adr = info.qposAdr;
             const dof = info.dofAdr;
-            const postQuat: Quat = [qpos[adr + 4], qpos[adr + 5], qpos[adr + 6], qpos[adr + 3]];
-            const postWWorldSi = quatRotateVec3(postQuat, [
+            const postQuat = this.scratchWobbleQuat;
+            postQuat[0] = qpos[adr + 4];
+            postQuat[1] = qpos[adr + 5];
+            postQuat[2] = qpos[adr + 6];
+            postQuat[3] = qpos[adr + 3];
+            const postWWorldSi = this.scratchWobbleVecA;
+            quatRotateVec3InPlace(
+              postQuat,
               qvel[dof + 3],
               qvel[dof + 4],
               qvel[dof + 5],
-            ]);
+              postWWorldSi
+            );
             const dotAlongPre =
               (preWxSi * postWWorldSi[0] + preWzSi * postWWorldSi[2]) / preWhSi;
             const clampLoadN =
               blk.id < this.cachedClampingLoadN.length ? this.cachedClampingLoadN[blk.id] : 0;
 
-            const upVec = quatRotateVec3(postQuat, [0, 1, 0]);
+            const upVec = this.scratchWobbleVecB;
+            quatRotateVec3InPlace(postQuat, 0, 1, 0, upVec);
             const absUpY = Math.abs(upVec[1]);
-            const preUpVec = quatRotateVec3(blk.preQuat, [0, 1, 0]);
+            const preUpVec = scratchRotTmpA;
+            quatRotateVec3InPlace(blk.preQuat, 0, 1, 0, preUpVec);
             const tiltRad = Math.acos(
               Math.max(-1, Math.min(1, Math.min(absUpY, Math.abs(preUpVec[1]))))
             );
@@ -4145,9 +4749,14 @@ export class MujocoPhysicsEngine {
               (isFreeRockingBody &&
                 dotAlongPre < 0.62 * preWhSi &&
                 acc.maxVCloseReal < CRAZE_IMPACT_SPEED * 0.68);
-            const lastWobble = this.blockLastWobbleTime.get(blk.id) ?? -10.0;
+            const lastWobble =
+              blk.id < this.blockLastWobbleArr.length
+                ? this.blockLastWobbleArr[blk.id]
+                : -10.0;
             if (isSlapImpulse && this.simTime - lastWobble >= 0.024) {
-              this.blockLastWobbleTime.set(blk.id, this.simTime);
+              if (blk.id < this.blockLastWobbleArr.length) {
+                this.blockLastWobbleArr[blk.id] = this.simTime;
+              }
               if (blk.id < this.blockCoherentArcSubsteps.length) {
                 this.blockCoherentArcSubsteps[blk.id] = 0;
               }
@@ -4189,7 +4798,16 @@ export class MujocoPhysicsEngine {
       const maxElasticBounceSpeed =
         CRAZE_IMPACT_SPEED * 0.85 * (1.0 - 0.36 * Math.min(0.95, blk.damage));
       let hasOverheadBlock = false;
-      if (!blk.shattered && !blk.extracted && acc.upwardSupportFn > 0.02 && clampLoadN < 0.45) {
+      const mayBeUnloadedCandidate =
+        !blk.shattered &&
+        !blk.extracted &&
+        blk.id !== this.activeBlockId &&
+        !inRockingGuard &&
+        acc.upwardSupportFn > 0.02 &&
+        clampLoadN < 0.45 &&
+        acc.downwardTopFn < 0.28 &&
+        acc.distinctContactBodies <= 3;
+      if (mayBeUnloadedCandidate) {
         const bx = blk.position[0];
         const by = blk.position[1];
         const bz = blk.position[2];
@@ -4209,16 +4827,7 @@ export class MujocoPhysicsEngine {
           }
         }
       }
-      const isUnloadedCandidate =
-        !blk.shattered &&
-        !blk.extracted &&
-        blk.id !== this.activeBlockId &&
-        !hasOverheadBlock &&
-        !inRockingGuard &&
-        acc.upwardSupportFn > 0.02 &&
-        clampLoadN < 0.45 &&
-        acc.downwardTopFn < 0.28 &&
-        acc.distinctContactBodies <= 3;
+      const isUnloadedCandidate = mayBeUnloadedCandidate && !hasOverheadBlock;
 
       if (this.fidelity.elasticUnloadedGlassBounce && isUnloadedCandidate) {
         const vCloseReal = acc.maxRawVCloseReal;
@@ -4391,8 +5000,8 @@ export class MujocoPhysicsEngine {
 
             if (inInitialTowerSpawnSettle) {
               handledUnloadedBounceAudio = true;
-            } else if (this.simTime - (this.blockLastImpactAudioTime.get(blk.id) ?? -10.0) >= 0.012) {
-              this.blockLastImpactAudioTime.set(blk.id, this.simTime);
+            } else if (this.simTime - this.blockLastImpactAudioArr[blk.id] >= 0.012) {
+              this.blockLastImpactAudioArr[blk.id] = this.simTime;
               handledUnloadedBounceAudio = true;
               if (copHitTable && this.fidelity.trueAcousticCoupling) {
                 this.emitBlockTableThud(Math.max(0.025, effVCloseMps), copWorldDm, blk.damage);
@@ -4425,9 +5034,9 @@ export class MujocoPhysicsEngine {
         !(inPostRebuildCreepWindow && acc.maxRawVCloseReal < 0.65) &&
         acc.hasRawSeparatedOnset &&
         !didEmitWobbleForBlock &&
-        this.simTime - (this.blockLastImpactAudioTime.get(blk.id) ?? -10.0) >= 0.030
+        this.simTime - this.blockLastImpactAudioArr[blk.id] >= 0.030
       ) {
-        this.blockLastImpactAudioTime.set(blk.id, this.simTime);
+        this.blockLastImpactAudioArr[blk.id] = this.simTime;
         handledUnloadedBounceAudio = true;
         if (acc.bestRawHitTable) {
           this.emitBlockTableThud(
@@ -4453,9 +5062,16 @@ export class MujocoPhysicsEngine {
       }
 
       if (acc.maxVCloseReal <= 1.5 || acc.dynamicImpulseSim <= 0) continue;
-      const massKg = Math.max(0.01, m.body_mass[blk.bodyHandle]);
+      const massKg = Math.max(0.01, bodyMass[blk.bodyHandle]);
       const lh = acc.bestLocalHitDm;
-      const nLocal = quatInverseRotateVec3(blk.preQuat, acc.bestNormalAtoB);
+      const nLocal = scratchRotTmpA;
+      quatInverseRotateVec3InPlace(
+        blk.preQuat,
+        acc.bestNormalAtoB[0],
+        acc.bestNormalAtoB[1],
+        acc.bestNormalAtoB[2],
+        nLocal
+      );
 
       const rcx = lh[1] * nLocal[2] - lh[2] * nLocal[1];
       const rcy = lh[2] * nLocal[0] - lh[0] * nLocal[2];
@@ -4470,12 +5086,20 @@ export class MujocoPhysicsEngine {
       let topMidForceN = 0;
       let bottomOuterSupportN = 0;
       const dynN = acc.bestNormalAtoB;
-      for (const c of acc.contacts) {
+      const cNLocal = scratchRotTmpB;
+      for (let ci = 0; ci < acc.contacts.length; ci++) {
+        const c = acc.contacts[ci];
         const dotOpp = c.nAtoB[0] * dynN[0] + c.nAtoB[1] * dynN[1] + c.nAtoB[2] * dynN[2];
         if (dotOpp < -0.5 && !c.otherIsShard) opposingJn += c.jnSim;
 
         if (!c.otherIsShard) {
-          const cNLocal = quatInverseRotateVec3(blk.preQuat, c.nAtoB);
+          quatInverseRotateVec3InPlace(
+            blk.preQuat,
+            c.nAtoB[0],
+            c.nAtoB[1],
+            c.nAtoB[2],
+            cNLocal
+          );
           if (cNLocal[1] > 0.6 && Math.abs(c.localHitDm[0]) < BLOCK_HALF_X * 0.45) {
             topMidForceN += c.fnN;
           } else if (cNLocal[1] < -0.6 && Math.abs(c.localHitDm[0]) > BLOCK_HALF_X * 0.45) {
@@ -4484,7 +5108,7 @@ export class MujocoPhysicsEngine {
         }
       }
 
-      const lastCrazeSec = this.blockLastCrazeTime.get(blk.id) ?? -10.0;
+      const lastCrazeSec = this.blockLastCrazeArr[blk.id];
       const dtSinceCraze = this.simTime - lastCrazeSec;
       const inSameSlapWindow = dtSinceCraze < 0.24;
       const cascadeGraceWeight =
@@ -4506,10 +5130,10 @@ export class MujocoPhysicsEngine {
       // 1B: Gate `isAnvilCrush` OFF and bound `vComJ` (`jRef`) during nearly upright multi-course axial column settles
       // (`|up_y| > 0.88`, `|dynN[1]| > 0.86`, horizontal speed `< 0.45 m/s`, `maxVCloseReal < 11.5 dm/s` = `1.15 m/s`)
       // so 8 upper courses dropping 15 mm onto a stump never divide N*m*dv by 1 block's mass!
-      const preUpVec = quatRotateVec3(blk.preQuat, [0, 1, 0]);
+      const preUpY = quatRotateVec3(blk.preQuat, [0, 1, 0])[1];
       const horizBlkSpeedMps = Math.hypot(blk.linVel[0], blk.linVel[2]) * INV_FROUDE_VEL_SCALE;
       const isAxialColumnSettle =
-        Math.abs(preUpVec[1]) > 0.88 &&
+        Math.abs(preUpY) > 0.88 &&
         Math.abs(dynN[1]) > 0.86 &&
         horizBlkSpeedMps < 0.45 &&
         acc.maxVCloseReal < 11.5;
@@ -4565,7 +5189,7 @@ export class MujocoPhysicsEngine {
       const isHighVelOrObliqueCrush =
         acc.maxVCloseReal >= 14.5 ||
         Math.abs(dynN[1]) <= 0.86 ||
-        Math.abs(preUpVec[1]) <= 0.88 ||
+        Math.abs(preUpY) <= 0.88 ||
         horizBlkSpeedMps >= 0.45;
       const rawJRef =
         isAnvilCrush && !isLowRubbleCreepBlk
@@ -4599,23 +5223,53 @@ export class MujocoPhysicsEngine {
         (isLowRubbleCreepBlk ? 0.55 : 1.0);
 
       const worldNormal: Vec3 = [-dynN[0], -dynN[1], -dynN[2]];
-      const rWorld = quatRotateVec3(blk.preQuat, lh);
+      const rWorld = scratchRotTmpA;
+      quatRotateVec3InPlace(blk.preQuat, lh[0], lh[1], lh[2], rWorld);
       const hitWorld: Vec3 = [
         blk.prePos[0] + rWorld[0],
         blk.prePos[1] + rWorld[1],
         blk.prePos[2] + rWorld[2],
       ];
 
+      const inSameContactSlap = dtSinceCraze < 0.025;
+      const isCleaved = blk.damage >= 0.78;
+      const priorDamageForTear = inSameContactSlap
+        ? 0.0
+        : isCleaved
+          ? blk.damage
+          : clampedPriorDamage;
+
+      const isUserRubbleManipulation =
+        this.gameMode === 'sandbox' &&
+        (this.activeBlockId !== null ||
+          (this.lastUserImpulsedBlockId >= 0 &&
+            this.simTime - this.lastUserImpulsedSimTime < 1.8));
+      const isRubbleDragProtected =
+        isUserRubbleManipulation && !this.lastReleaseWasWhipFlick;
+
       const effCrazeSpeed = CRAZE_IMPACT_SPEED * 0.72 * (1.0 - 0.12 * clampedPriorDamage);
       const freshShatterSpeed =
         isAnvilCrush && !isLowRubbleCreepBlk
           ? SHATTER_IMPACT_SPEED
-          : this.turnPhase === 'COLLAPSED'
-            ? 15.8
+          : this.turnPhase === 'COLLAPSED' || isUserRubbleManipulation
+            ? 14.8
             : this.sandboxCollapseActive
-              ? 13.4
+              ? 13.2
               : 14.3;
-      const shatterThreshold = freshShatterSpeed * griffithWeakening;
+      const vCleave =
+        freshShatterSpeed * (this.sandboxCollapseActive ? 0.76 : 0.74) * griffithWeakening;
+      const vTearFresh = freshShatterSpeed * griffithWeakening;
+      const vTearCleaved =
+        freshShatterSpeed *
+        (this.sandboxCollapseActive &&
+        !isUserRubbleManipulation &&
+        this.turnPhase !== 'COLLAPSED'
+          ? Math.max(0.42, 0.80 - 0.42 * priorDamageForTear)
+          : Math.max(0.62, 0.96 - 0.36 * priorDamageForTear));
+      const baseShatterThreshold = isCleaved ? vTearCleaved : vTearFresh;
+      const shatterThreshold = isRubbleDragProtected
+        ? Math.max(baseShatterThreshold, 14.8)
+        : baseShatterThreshold;
 
       const inRockingSequence =
         didEmitWobbleForBlock ||
@@ -4629,9 +5283,9 @@ export class MujocoPhysicsEngine {
         acc.maxVCloseReal >= 0.85 &&
         (acc.hasOnsetContact || (!this.fidelity.elasticUnloadedGlassBounce && vImpact >= effCrazeSpeed)) &&
         (!inRockingSequence || vImpact >= effCrazeSpeed) &&
-        this.simTime - (this.blockLastImpactAudioTime.get(blk.id) ?? -10.0) >= 0.030
+        this.simTime - this.blockLastImpactAudioArr[blk.id] >= 0.030
       ) {
-        this.blockLastImpactAudioTime.set(blk.id, this.simTime);
+        this.blockLastImpactAudioArr[blk.id] = this.simTime;
         if (this.fidelity.trueAcousticCoupling && acc.bestHitTable) {
           this.emitBlockTableThud(
             Math.max(0.03, acc.maxVCloseReal * M_PER_DM),
@@ -4670,7 +5324,7 @@ export class MujocoPhysicsEngine {
       if (!isLowRubbleCreepBlk && vImpact >= shatterThreshold) {
         blocksToShatter.push({
           blk,
-          localHit: lh,
+          localHit: [lh[0], lh[1], lh[2]],
           impactSpeed: vImpact,
           worldNormal,
           hitTable: acc.bestHitTable,
@@ -4680,28 +5334,64 @@ export class MujocoPhysicsEngine {
       } else {
         if (!isLowRubbleCreepBlk && vImpact >= effCrazeSpeed && !isUprightStaticSettle) {
           const prevDamage = blk.damage;
-          const addedDamage =
-            0.33 +
-            ((vImpact - effCrazeSpeed) / Math.max(2.0, SHATTER_IMPACT_SPEED - effCrazeSpeed)) * 0.48;
-          if (inSameSlapWindow) {
-            blk.damage = Math.min(0.92, Math.max(prevDamage, addedDamage));
-          } else {
-            this.blockLastCrazeTime.set(blk.id, this.simTime);
-            blk.damage = Math.min(0.92, prevDamage + addedDamage * (1.0 - prevDamage * 0.45));
-          }
-          if (prevDamage < 0.05 || addedDamage > 0.52) {
-            blk.crackLocalOrigin = [...lh];
-          }
-          if (!inSameSlapWindow) {
-            const rb = this.worldCompat.getRigidBody(blk.bodyHandle);
-            const post = rb ? rb.linvel() : { x: 0, y: 0, z: 0 };
-            this.spawnGlassCulletChips(hitWorld, post, worldNormal, blk.swatchId, 5, 0.55);
-            this.audio.playGlassCrack(
-              Math.min(1.0, blk.damage),
-              hitWorld,
-              this.listenerCamPos,
-              this.listenerCamRight
+          if (!isCleaved && vImpact >= vCleave) {
+            // Ductile copper-foil perimeter cleavage: structural damage enters [0.78, 0.96]
+            // while copper perimeter cames hold the fractured glass prism intact until a secondary strike.
+            const cleaveProgress = Math.max(
+              0.0,
+              Math.min(1.0, (vImpact - vCleave) / Math.max(0.5, vTearFresh - vCleave))
             );
+            const targetCleaved = Math.min(
+              0.96,
+              Math.max(0.78, Math.max(prevDamage + 0.35, 0.78 + 0.16 * cleaveProgress))
+            );
+            if (inSameSlapWindow) {
+              blk.damage = Math.min(0.96, Math.max(prevDamage, targetCleaved));
+            } else {
+              this.blockLastCrazeArr[blk.id] = this.simTime;
+              blk.damage = targetCleaved;
+            }
+            blk.crackLocalOrigin = [...lh];
+            if (!inSameSlapWindow) {
+              const rb = this.worldCompat.getRigidBody(blk.bodyHandle);
+              const post = rb ? rb.linvel() : { x: 0, y: 0, z: 0 };
+              this.spawnGlassCulletChips(hitWorld, post, worldNormal, blk.swatchId, 8, 0.75);
+              this.audio.playGlassCrack(
+                Math.min(1.0, blk.damage),
+                hitWorld,
+                this.listenerCamPos,
+                this.listenerCamRight
+              );
+            }
+          } else {
+            // Sub-cleavage internal crazing stays strictly < 0.78, or bounded [0.78, 0.96] creep
+            const addedDamage =
+              0.33 +
+              ((vImpact - effCrazeSpeed) / Math.max(2.0, SHATTER_IMPACT_SPEED - effCrazeSpeed)) * 0.40;
+            const dmgCap = isCleaved ? 0.96 : 0.76;
+            if (inSameSlapWindow) {
+              blk.damage = Math.min(dmgCap, Math.max(prevDamage, addedDamage));
+            } else {
+              this.blockLastCrazeArr[blk.id] = this.simTime;
+              const nextDmg = isCleaved
+                ? prevDamage + 0.03
+                : prevDamage + addedDamage * (1.0 - prevDamage * 0.45);
+              blk.damage = Math.min(dmgCap, nextDmg);
+            }
+            if (prevDamage < 0.05 || addedDamage > 0.52) {
+              blk.crackLocalOrigin = [...lh];
+            }
+            if (!inSameSlapWindow) {
+              const rb = this.worldCompat.getRigidBody(blk.bodyHandle);
+              const post = rb ? rb.linvel() : { x: 0, y: 0, z: 0 };
+              this.spawnGlassCulletChips(hitWorld, post, worldNormal, blk.swatchId, 5, 0.55);
+              this.audio.playGlassCrack(
+                Math.min(1.0, blk.damage),
+                hitWorld,
+                this.listenerCamPos,
+                this.listenerCamRight
+              );
+            }
           }
         }
 
@@ -4853,7 +5543,7 @@ export class MujocoPhysicsEngine {
             {
               closingSpeedReal: item.closingSpeedReal,
               isAnvilCrush: item.isAnvilCrush,
-              skipSyncKinematics: true,
+              skipSyncKinematics: false,
             }
           );
           didAnyFractureSyncNeeded = true;
@@ -5049,6 +5739,7 @@ export class MujocoPhysicsEngine {
       closingSpeedReal: number;
       isAnvilCrush: boolean;
       skipSyncKinematics?: boolean;
+      isOffRimDiscard?: boolean;
       savedPoseAndVel?: {
         posDm: Vec3;
         quat: Quat;
@@ -5057,9 +5748,10 @@ export class MujocoPhysicsEngine {
       };
     }
   ): void {
-    if (block.shattered || !this.model || !this.data) return;
+    if (block.shattered || !this.ensureCachedViews()) return;
+    const d = this.data!;
     const rb = this.worldCompat.getRigidBody(block.bodyHandle);
-    const blkInfo = this.worldCompat.getMapping(block.bodyHandle);
+    const blkInfo = this.getMappingFast(block.bodyHandle);
     if (!rb || !blkInfo) return;
 
     const saved = collisionRebound?.savedPoseAndVel;
@@ -5123,13 +5815,15 @@ export class MujocoPhysicsEngine {
     ]);
 
     block.shattered = true;
-    this.shatteredCount++;
+    if (!collisionRebound?.isOffRimDiscard) {
+      this.shatteredCount++;
+    }
     if (block.id < this.cachedClampingLoadN.length) {
       this.cachedClampingLoadN[block.id] = 0;
       this.blockPhotoelasticStress01[block.id] = 0;
     }
     if (this.activeBlockId === block.id) {
-      this.data.eq_active[this.map.grabEqualityId] = 0;
+      d.eq_active[this.map.grabEqualityId] = 0;
       this.activeBlockId = null;
       this.isPointerDraggingBlock = false;
     }
@@ -5147,7 +5841,7 @@ export class MujocoPhysicsEngine {
     const bPosY = pos.y;
     const islandMask = this.collectConstraintIslandTrees(block.bodyHandle);
 
-    this.bodyToBlock.delete(block.bodyHandle);
+    this.deleteBodyBlock(block.bodyHandle);
     this.parkBodyOnHiddenShelf(
       block.bodyHandle,
       block.colliderHandle,
@@ -5159,17 +5853,17 @@ export class MujocoPhysicsEngine {
     // MuJoCo 4.0 Native Constraint-Island Wakeup: wake genuinely sleeping blocks & shards in the same
     // constraint island (`d.tree_asleep` circular linked list / contact-supported island) resting ABOVE `bPosY`,
     // without AABB horizontal cutoffs and without resetting `quietTicks` on already-awake lower courses!
-    const bodyTreeId = this.model.body_treeid;
-    const treeAsleep = this.data.tree_asleep;
-    const qfrcApplied = this.data.qfrc_applied;
-    const geomContype = this.model.geom_contype;
+    const bodyTreeId = this.vcBodyTreeId;
+    const treeAsleep = this.vcTreeAsleep;
+    const qfrcApplied = this.vcQfrcApplied;
+    const geomContype = this.vcGeomContype;
     for (let k = 0; k < this.blocks.length; k++) {
       const ob = this.blocks[k];
       if (ob.shattered || ob.extracted || geomContype[ob.colliderHandle] === 0) continue;
       if (ob.position[1] <= bPosY + 0.06) continue;
       const tid = bodyTreeId[ob.bodyHandle];
       if (tid >= 0 && treeAsleep[tid] >= 0 && islandMask[tid]) {
-        const info = this.worldCompat.getMapping(ob.bodyHandle);
+        const info = this.getMappingFast(ob.bodyHandle);
         if (info) {
           info.settledAsleep = false;
           info.quietTicks = 0;
@@ -5186,13 +5880,13 @@ export class MujocoPhysicsEngine {
         os.position[1] > bPosY - 0.08;
       if (!nearHoriz && os.position[1] <= Math.max(0.28, bPosY + 0.05)) continue;
       const tid = bodyTreeId[os.bodyHandle];
-      const info = this.worldCompat.getMapping(os.bodyHandle);
       if ((tid >= 0 && treeAsleep[tid] >= 0 && islandMask[tid]) || nearHoriz) {
         this.shardQuietSubsteps[os.slotIndex] = 0;
         this.shardNoSupportSubsteps[os.slotIndex] = 0;
         if (tid >= 0 && treeAsleep[tid] >= 0) {
           qfrcApplied[this.map.shardDofAdr[os.slotIndex] + 1] += 1e-9;
         }
+        const info = this.getMappingFast(os.bodyHandle);
         if (info) {
           info.settledAsleep = false;
           info.quietTicks = 0;
@@ -5227,14 +5921,16 @@ export class MujocoPhysicsEngine {
     while (this.freeShardSlots.length < shardGeoms.length && this.shards.length > 0) {
       let removeIdx = 0;
       for (let k = 0; k < this.shards.length; k++) {
-        const candRb = this.worldCompat.getRigidBody(this.shards[k].bodyHandle);
-        if (!candRb || candRb.isSleeping()) {
+        const shdK = this.shards[k];
+        const infoK = this.getMappingFast(shdK.bodyHandle);
+        const tidK = bodyTreeId[shdK.bodyHandle];
+        if (!infoK || !infoK.enabled || infoK.settledAsleep || (tidK >= 0 && treeAsleep[tidK] >= 0)) {
           removeIdx = k;
           break;
         }
       }
       const retired = this.shards.splice(removeIdx, 1)[0];
-      this.bodyToShard.delete(retired.bodyHandle);
+      this.deleteBodyShard(retired.bodyHandle);
       this.slotRenderVertices[retired.slotIndex] = null;
       this.shardAirborneSubsteps[retired.slotIndex] = 0;
       this.freeShardSlots.push(retired.slotIndex);
@@ -5271,7 +5967,7 @@ export class MujocoPhysicsEngine {
 
     let activeHeroCount = 0;
     for (let k = 0; k < this.shards.length; k++) {
-      if (this.model.geom_contype[this.shards[k].colliderHandle] === MJ_CONTYPE_HERO_SHARD) {
+      if (geomContype[this.shards[k].colliderHandle] === MJ_CONTYPE_HERO_SHARD) {
         activeHeroCount++;
       }
     }
@@ -5286,6 +5982,7 @@ export class MujocoPhysicsEngine {
       hzDm: number;
       clampedLocal: Vec3;
       isHeroShard: boolean;
+      rawMassKg: number;
     }> = [];
 
     for (const geom of shardGeoms) {
@@ -5339,8 +6036,10 @@ export class MujocoPhysicsEngine {
       ];
       if (isHeroShard) activeHeroCount++;
 
-      preparedShards.push({ geom, slotIndex, hxDm, hyDm, hzDm, clampedLocal, isHeroShard });
+      const rawMassKg = Math.max(0.0002, parentMass * geom.volume * invTotalGeomVol);
+      preparedShards.push({ geom, slotIndex, hxDm, hyDm, hzDm, clampedLocal, isHeroShard, rawMassKg });
     }
+
     let batchHeroCount = 0;
     for (let k = 0; k < preparedShards.length; k++) {
       if (preparedShards[k].isHeroShard) batchHeroCount++;
@@ -5354,25 +6053,55 @@ export class MujocoPhysicsEngine {
       cullet: this.lastCullShardStats.cullet + (preparedShards.length - batchSolidForStats),
     };
 
-    for (const prep of preparedShards) {
-      const { geom, slotIndex, hxDm, hyDm, hzDm, clampedLocal, isHeroShard } = prep;
+    const qposS = this.vcQpos;
+    const qvelS = this.vcQvel;
+    const xposS = this.vcXpos;
+    const xquatS = this.vcXquat;
+    const dofDamping = this.vcDofDamping;
+    const geomType = this.vcGeomType;
+    const geomDataId = this.vcGeomDataId;
+    const geomPos = this.vcGeomPos;
+    const geomQuat = this.vcGeomQuat;
+    const geomSize = this.vcGeomSize;
+    const geomRbound = this.vcGeomRbound;
+    const geomAabb = this.vcGeomAabb;
+    const bodyMass = this.vcBodyMass;
+    const bodyInertia = this.vcBodyInertia;
+    const bodyIquat = this.vcBodyIquat;
+    const qLenS = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+    const nqxS = q[0] / qLenS;
+    const nqyS = q[1] / qLenS;
+    const nqzS = q[2] / qLenS;
+    const nqwS = q[3] / qLenS;
+    const blockHashBase = (block.id + 1) * 127.1;
+
+    for (let pi = 0; pi < preparedShards.length; pi++) {
+      const prep = preparedShards[pi];
+      const { geom, slotIndex, hxDm, hyDm, hzDm, clampedLocal, isHeroShard, rawMassKg } = prep;
       const hxM = hxDm * M_PER_DM;
       const hyM = hyDm * M_PER_DM;
       const hzM = hzDm * M_PER_DM;
-      const worldOffset = quatRotateVec3(q, clampedLocal);
-      const sxDm = pos.x + worldOffset[0];
-      const syDm = pos.y + worldOffset[1];
-      const szDm = pos.z + worldOffset[2];
+      const clX = clampedLocal[0], clY = clampedLocal[1], clZ = clampedLocal[2];
+      const wqx = q[0], wqy = q[1], wqz = q[2], wqw = q[3];
+      const wtx = 2 * (wqy * clZ - wqz * clY);
+      const wty = 2 * (wqz * clX - wqx * clZ);
+      const wtz = 2 * (wqx * clY - wqy * clX);
+      const wo0 = clX + wqw * wtx + (wqy * wtz - wqz * wty);
+      const wo1 = clY + wqw * wty + (wqz * wtx - wqx * wtz);
+      const wo2 = clZ + wqw * wtz + (wqx * wty - wqy * wtx);
+      const sxDm = pos.x + wo0;
+      const syDm = pos.y + wo1;
+      const szDm = pos.z + wo2;
       const safeSyDm =
         pos.y < 0.11 && Math.hypot(sxDm, szDm) <= TABLE_RADIUS + 0.05 && syDm < hyDm + 0.0008
           ? Math.min(syDm + 0.006, hyDm + 0.0008)
           : syDm;
-      const shardExactMass = Math.max(0.0002, parentMass * geom.volume * invTotalGeomVol);
+      const shardExactMass = rawMassKg;
 
       const bodyId = this.map.shardBodyIds[slotIndex];
       const geomId = this.map.shardGeomIds[slotIndex];
       const dofAdr = this.map.shardDofAdr[slotIndex];
-      for (let k = 0; k < 6; k++) this.model.dof_damping[dofAdr + k] = 0;
+      for (let k = 0; k < 6; k++) dofDamping[dofAdr + k] = 0;
 
       // Match best-fitting convex Voronoi polyhedron hull archetype for hero shards, or crisp box for small cullet
       if (isHeroShard) {
@@ -5401,66 +6130,66 @@ export class MujocoPhysicsEngine {
         const fitFound = bestErr < Infinity;
         if (fitFound) {
           const asp = this.map.voronoiArchetypeAspect[bestArch];
-          this.model.geom_type[geomId] = 7; // mjGEOM_MESH
-          this.model.geom_dataid[geomId] = this.map.voronoiMeshIds[bestArch];
-          this.model.geom_pos[geomId * 3 + 0] = this.archGeomPos[bestArch * 3 + 0];
-          this.model.geom_pos[geomId * 3 + 1] = this.archGeomPos[bestArch * 3 + 1];
-          this.model.geom_pos[geomId * 3 + 2] = this.archGeomPos[bestArch * 3 + 2];
-          this.model.geom_quat[geomId * 4 + 0] = this.archGeomQuat[bestArch * 4 + 0];
-          this.model.geom_quat[geomId * 4 + 1] = this.archGeomQuat[bestArch * 4 + 1];
-          this.model.geom_quat[geomId * 4 + 2] = this.archGeomQuat[bestArch * 4 + 2];
-          this.model.geom_quat[geomId * 4 + 3] = this.archGeomQuat[bestArch * 4 + 3];
-          this.model.geom_rbound[geomId] = Math.hypot(asp[0], asp[1], asp[2]) * 1.12;
+          geomType[geomId] = 7; // mjGEOM_MESH
+          geomDataId[geomId] = this.map.voronoiMeshIds[bestArch];
+          geomPos[geomId * 3 + 0] = this.archGeomPos[bestArch * 3 + 0];
+          geomPos[geomId * 3 + 1] = this.archGeomPos[bestArch * 3 + 1];
+          geomPos[geomId * 3 + 2] = this.archGeomPos[bestArch * 3 + 2];
+          geomQuat[geomId * 4 + 0] = this.archGeomQuat[bestArch * 4 + 0];
+          geomQuat[geomId * 4 + 1] = this.archGeomQuat[bestArch * 4 + 1];
+          geomQuat[geomId * 4 + 2] = this.archGeomQuat[bestArch * 4 + 2];
+          geomQuat[geomId * 4 + 3] = this.archGeomQuat[bestArch * 4 + 3];
+          geomRbound[geomId] = Math.hypot(asp[0], asp[1], asp[2]) * 1.12;
           const aabbBase = geomId * 6;
-          this.model.geom_aabb[aabbBase + 0] = 0;
-          this.model.geom_aabb[aabbBase + 1] = 0;
-          this.model.geom_aabb[aabbBase + 2] = 0;
-          this.model.geom_aabb[aabbBase + 3] = asp[0] * 1.05;
-          this.model.geom_aabb[aabbBase + 4] = asp[1] * 1.05;
-          this.model.geom_aabb[aabbBase + 5] = asp[2] * 1.05;
+          geomAabb[aabbBase + 0] = 0;
+          geomAabb[aabbBase + 1] = 0;
+          geomAabb[aabbBase + 2] = 0;
+          geomAabb[aabbBase + 3] = asp[0] * 1.05;
+          geomAabb[aabbBase + 4] = asp[1] * 1.05;
+          geomAabb[aabbBase + 5] = asp[2] * 1.05;
         } else {
-          this.model.geom_type[geomId] = 6; // mjGEOM_BOX fallback when cell is narrower than canonical hulls
-          this.model.geom_dataid[geomId] = -1;
-          this.model.geom_pos[geomId * 3 + 0] = 0;
-          this.model.geom_pos[geomId * 3 + 1] = 0;
-          this.model.geom_pos[geomId * 3 + 2] = 0;
-          this.model.geom_quat[geomId * 4 + 0] = 1;
-          this.model.geom_quat[geomId * 4 + 1] = 0;
-          this.model.geom_quat[geomId * 4 + 2] = 0;
-          this.model.geom_quat[geomId * 4 + 3] = 0;
-          this.model.geom_size[geomId * 3 + 0] = hxM;
-          this.model.geom_size[geomId * 3 + 1] = hyM;
-          this.model.geom_size[geomId * 3 + 2] = hzM;
-          this.model.geom_rbound[geomId] = Math.hypot(hxM, hyM, hzM);
+          geomType[geomId] = 6; // mjGEOM_BOX fallback when cell is narrower than canonical hulls
+          geomDataId[geomId] = -1;
+          geomPos[geomId * 3 + 0] = 0;
+          geomPos[geomId * 3 + 1] = 0;
+          geomPos[geomId * 3 + 2] = 0;
+          geomQuat[geomId * 4 + 0] = 1;
+          geomQuat[geomId * 4 + 1] = 0;
+          geomQuat[geomId * 4 + 2] = 0;
+          geomQuat[geomId * 4 + 3] = 0;
+          geomSize[geomId * 3 + 0] = hxM;
+          geomSize[geomId * 3 + 1] = hyM;
+          geomSize[geomId * 3 + 2] = hzM;
+          geomRbound[geomId] = Math.hypot(hxM, hyM, hzM);
           const aabbBase = geomId * 6;
-          this.model.geom_aabb[aabbBase + 0] = 0;
-          this.model.geom_aabb[aabbBase + 1] = 0;
-          this.model.geom_aabb[aabbBase + 2] = 0;
-          this.model.geom_aabb[aabbBase + 3] = hxM;
-          this.model.geom_aabb[aabbBase + 4] = hyM;
-          this.model.geom_aabb[aabbBase + 5] = hzM;
+          geomAabb[aabbBase + 0] = 0;
+          geomAabb[aabbBase + 1] = 0;
+          geomAabb[aabbBase + 2] = 0;
+          geomAabb[aabbBase + 3] = hxM;
+          geomAabb[aabbBase + 4] = hyM;
+          geomAabb[aabbBase + 5] = hzM;
         }
       } else {
-        this.model.geom_type[geomId] = 6; // mjGEOM_BOX
-        this.model.geom_dataid[geomId] = -1;
-        this.model.geom_pos[geomId * 3 + 0] = 0;
-        this.model.geom_pos[geomId * 3 + 1] = 0;
-        this.model.geom_pos[geomId * 3 + 2] = 0;
-        this.model.geom_quat[geomId * 4 + 0] = 1;
-        this.model.geom_quat[geomId * 4 + 1] = 0;
-        this.model.geom_quat[geomId * 4 + 2] = 0;
-        this.model.geom_quat[geomId * 4 + 3] = 0;
-        this.model.geom_size[geomId * 3 + 0] = hxM;
-        this.model.geom_size[geomId * 3 + 1] = hyM;
-        this.model.geom_size[geomId * 3 + 2] = hzM;
-        this.model.geom_rbound[geomId] = Math.hypot(hxM, hyM, hzM);
+        geomType[geomId] = 6; // mjGEOM_BOX
+        geomDataId[geomId] = -1;
+        geomPos[geomId * 3 + 0] = 0;
+        geomPos[geomId * 3 + 1] = 0;
+        geomPos[geomId * 3 + 2] = 0;
+        geomQuat[geomId * 4 + 0] = 1;
+        geomQuat[geomId * 4 + 1] = 0;
+        geomQuat[geomId * 4 + 2] = 0;
+        geomQuat[geomId * 4 + 3] = 0;
+        geomSize[geomId * 3 + 0] = hxM;
+        geomSize[geomId * 3 + 1] = hyM;
+        geomSize[geomId * 3 + 2] = hzM;
+        geomRbound[geomId] = Math.hypot(hxM, hyM, hzM);
         const aabbBase = geomId * 6;
-        this.model.geom_aabb[aabbBase + 0] = 0;
-        this.model.geom_aabb[aabbBase + 1] = 0;
-        this.model.geom_aabb[aabbBase + 2] = 0;
-        this.model.geom_aabb[aabbBase + 3] = hxM;
-        this.model.geom_aabb[aabbBase + 4] = hyM;
-        this.model.geom_aabb[aabbBase + 5] = hzM;
+        geomAabb[aabbBase + 0] = 0;
+        geomAabb[aabbBase + 1] = 0;
+        geomAabb[aabbBase + 2] = 0;
+        geomAabb[aabbBase + 3] = hxM;
+        geomAabb[aabbBase + 4] = hyM;
+        geomAabb[aabbBase + 5] = hzM;
       }
 
       const isAbyssSpawn = pos.y < -0.45;
@@ -5473,15 +6202,23 @@ export class MujocoPhysicsEngine {
             ? MJ_CONAFFINITY_HERO_SHARD_OFF_RIM
             : MJ_CONAFFINITY_HERO_SHARD_ON_TABLE
           : this.getCulletConaffinity(isOffRimSpawn);
-      setBodyGeomCollisionMask(this.model, bodyId, geomId, contype, conaff);
-      this.worldCompat.markShardActive(bodyId, true, contype, conaff);
+      this.setBodyGeomCollisionMaskCached(bodyId, geomId, contype, conaff);
+      const sMap = this.getMappingFast(bodyId);
+      if (sMap) {
+        sMap.enabled = true;
+        sMap.settledAsleep = false;
+        sMap.quietTicks = 0;
+        sMap.savedContype = contype;
+        sMap.savedConaffinity = conaff;
+      } else {
+        this.worldCompat.markShardActive(bodyId, true, contype, conaff);
+      }
 
       const lxM = 2 * hxM, lyM = 2 * hyM, lzM = 2 * hzM;
       const ixSi = (shardExactMass / 12.0) * (lyM * lyM + lzM * lzM);
       const iySi = (shardExactMass / 12.0) * (lxM * lxM + lzM * lzM);
       const izSi = (shardExactMass / 12.0) * (lxM * lxM + lyM * lyM);
-      updateFreeBodyMassAndInertiaO1(
-        this.model,
+      this.updateFreeBodyMassAndInertiaCached(
         bodyId,
         dofAdr,
         shardExactMass,
@@ -5491,20 +6228,35 @@ export class MujocoPhysicsEngine {
         rotDampRate
       );
 
-      const shardRb = this.worldCompat.getRigidBody(bodyId)!;
       this.shardQuietSubsteps[slotIndex] = 0;
       this.shardPinchSubsteps[slotIndex] = 0;
+      this.shardLastPinchSimTime[slotIndex] = -10;
       if (this.shardWedgeCooldownUntilSim[slotIndex] > -5) {
         this.shardWedgeCooldownUntilSim[slotIndex] = -10;
         this.activeWedgeEscapeCount = Math.max(0, this.activeWedgeEscapeCount - 1);
       }
-      shardRb.setTranslation({ x: sxDm, y: safeSyDm, z: szDm }, true);
-      shardRb.setRotation({ x: q[0], y: q[1], z: q[2], w: q[3] }, true);
+      const qAdr = this.map.shardQposAdr[slotIndex];
+      const sxM = sxDm * M_PER_DM;
+      const syM = safeSyDm * M_PER_DM;
+      const szM = szDm * M_PER_DM;
+      qposS[qAdr + 0] = sxM;
+      qposS[qAdr + 1] = syM;
+      qposS[qAdr + 2] = szM;
+      const bid3S = bodyId * 3;
+      xposS[bid3S + 0] = sxM;
+      xposS[bid3S + 1] = syM;
+      xposS[bid3S + 2] = szM;
+      qposS[qAdr + 3] = nqwS;
+      qposS[qAdr + 4] = nqxS;
+      qposS[qAdr + 5] = nqyS;
+      qposS[qAdr + 6] = nqzS;
+      const bid4S = bodyId * 4;
+      xquatS[bid4S + 0] = nqwS;
+      xquatS[bid4S + 1] = nqxS;
+      xquatS[bid4S + 2] = nqyS;
+      xquatS[bid4S + 3] = nqzS;
 
-      const hash01 = (salt: number): number => {
-        const h = Math.sin((block.id + 1) * 127.1 + (slotIndex + 1) * 311.7 + salt * 74.7) * 43758.5453;
-        return h - Math.floor(h);
-      };
+      const slotHashBase = blockHashBase + (slotIndex + 1) * 311.7;
 
       const rx = sxDm - impactWorldPos[0];
       const ry = syDm - impactWorldPos[1];
@@ -5517,15 +6269,18 @@ export class MujocoPhysicsEngine {
       if (tLen > 1e-4) {
         tx /= tLen; ty /= tLen; tz /= tLen;
       } else {
-        const randAng = hash01(1.0) * Math.PI * 2;
+        const h1 = Math.sin(slotHashBase + 74.7) * 43758.5453;
+        const randAng = (h1 - Math.floor(h1)) * Math.PI * 2;
         tx = Math.cos(randAng); ty = 0; tz = Math.sin(randAng);
       }
 
       const proximity = Math.exp(-geom.impactDist / 0.22);
       const outerSandboxScale =
         this.sandboxCollapseActive && Math.hypot(sxDm, szDm) > 2.2 ? 0.68 : 1.0;
+      const h2 = Math.sin(slotHashBase + 149.4) * 43758.5453;
+      const u2 = h2 - Math.floor(h2);
       const splaySpeedSim =
-        (((0.24 + impactEnergy01 * 1.15) * (0.28 + 0.72 * proximity) * (0.75 + hash01(2.0) * 0.5)) *
+        (((0.24 + impactEnergy01 * 1.15) * (0.28 + 0.72 * proximity) * (0.75 + u2 * 0.5)) *
           outerSandboxScale) /
         SIM_TIME_SCALE;
       // 3D Hertzian cone-crack & oblique cleavage wedge dispersion: adjacent shards wedge each other out-of-plane
@@ -5540,15 +6295,20 @@ export class MujocoPhysicsEngine {
         const nLen = Math.hypot(outNx, outNy, outNz) || 1.0;
         outNx /= nLen; outNy /= nLen; outNz /= nLen;
       }
+      const h6 = Math.sin(slotHashBase + 448.2) * 43758.5453;
+      const u6 = h6 - Math.floor(h6);
       const normalReboundSim =
         (((0.22 + impactEnergy01 * 0.65) * proximity +
-          (hash01(6.0) - 0.44) * (2.65 + impactEnergy01 * 2.5) * (0.45 + 0.55 * proximity)) /
+          (u6 - 0.44) * (2.65 + impactEnergy01 * 2.5) * (0.45 + 0.55 * proximity)) /
           SIM_TIME_SCALE);
 
-      const rigidVx = targetLv[0] + (av.y * worldOffset[2] - av.z * worldOffset[1]);
-      const rigidVy = targetLv[1] + (av.z * worldOffset[0] - av.x * worldOffset[2]);
-      const rigidVz = targetLv[2] + (av.x * worldOffset[1] - av.y * worldOffset[0]);
+      const rigidVx = targetLv[0] + (av.y * wo2 - av.z * wo1);
+      const rigidVy = targetLv[1] + (av.z * wo0 - av.x * wo2);
+      const rigidVz = targetLv[2] + (av.x * wo1 - av.y * wo0);
       const spinScale = 1.4 + proximity * (3.0 + impactEnergy01 * 3.4);
+      const h3 = Math.sin(slotHashBase + 224.1) * 43758.5453;
+      const h4 = Math.sin(slotHashBase + 298.8) * 43758.5453;
+      const h5 = Math.sin(slotHashBase + 373.5) * 43758.5453;
 
       spawned.push({
         geom,
@@ -5562,9 +6322,9 @@ export class MujocoPhysicsEngine {
           rigidVz + tz * splaySpeedSim + outNz * normalReboundSim,
         ],
         rawSpinSim: [
-          av.x + (hash01(3.0) - 0.5) * spinScale,
-          av.y + (hash01(4.0) - 0.5) * spinScale,
-          av.z + (hash01(5.0) - 0.5) * spinScale,
+          av.x + (h3 - Math.floor(h3) - 0.5) * spinScale,
+          av.y + (h4 - Math.floor(h4) - 0.5) * spinScale,
+          av.z + (h5 - Math.floor(h5) - 0.5) * spinScale,
         ],
         massKg: shardExactMass,
       });
@@ -5572,20 +6332,20 @@ export class MujocoPhysicsEngine {
 
     if (spawned.length > 0) {
       let rawSumMass = 0;
-      for (const s of spawned) rawSumMass += s.massKg;
+      for (let si = 0; si < spawned.length; si++) rawSumMass += spawned[si].massKg;
       if (rawSumMass > 1e-6 && Math.abs(rawSumMass - parentMass) > 1e-6) {
         const massScale = parentMass / rawSumMass;
-        for (const s of spawned) {
+        for (let si = 0; si < spawned.length; si++) {
+          const s = spawned[si];
           s.massKg *= massScale;
           const bid3 = s.bodyId * 3;
-          updateFreeBodyMassAndInertiaO1(
-            this.model,
+          this.updateFreeBodyMassAndInertiaCached(
             s.bodyId,
             this.map.shardDofAdr[s.slotIndex],
             s.massKg,
-            this.model.body_inertia[bid3 + 0] * massScale,
-            this.model.body_inertia[bid3 + 1] * massScale,
-            this.model.body_inertia[bid3 + 2] * massScale,
+            bodyInertia[bid3 + 0] * massScale,
+            bodyInertia[bid3 + 1] * massScale,
+            bodyInertia[bid3 + 2] * massScale,
             rotDampRate
           );
         }
@@ -5594,7 +6354,8 @@ export class MujocoPhysicsEngine {
       let sumMass = 0;
       let comX = 0, comY = 0, comZ = 0;
       let pxSum = 0, pySum = 0, pzSum = 0;
-      for (const s of spawned) {
+      for (let si = 0; si < spawned.length; si++) {
+        const s = spawned[si];
         sumMass += s.massKg;
         comX += s.massKg * s.worldPosDm[0];
         comY += s.massKg * s.worldPosDm[1];
@@ -5608,7 +6369,8 @@ export class MujocoPhysicsEngine {
       const dvCorrX = targetLv[0] - pxSum * invM;
       const dvCorrY = targetLv[1] - pySum * invM;
       const dvCorrZ = targetLv[2] - pzSum * invM;
-      for (const s of spawned) {
+      for (let si = 0; si < spawned.length; si++) {
+        const s = spawned[si];
         s.rawVelSim[0] += dvCorrX;
         s.rawVelSim[1] += dvCorrY;
         s.rawVelSim[2] += dvCorrZ;
@@ -5624,7 +6386,9 @@ export class MujocoPhysicsEngine {
       let lSumY = sumMass * (dComZ * targetLv[0] - dComX * targetLv[2]);
       let lSumZ = sumMass * (dComX * targetLv[1] - dComY * targetLv[0]);
       const iTot = [0, 0, 0, 0, 0, 0, 0, 0, 0];
-      for (const s of spawned) {
+      const qx0 = q[0], qy0 = q[1], qz0 = q[2], qw0 = q[3];
+      for (let si = 0; si < spawned.length; si++) {
+        const s = spawned[si];
         const rx = s.worldPosDm[0] - comX;
         const ry = s.worldPosDm[1] - comY;
         const rz = s.worldPosDm[2] - comZ;
@@ -5645,36 +6409,64 @@ export class MujocoPhysicsEngine {
         iTot[7] -= mS * rz * ry;
         iTot[8] += mS * (r2 - rz * rz);
 
-        const rbS = this.worldCompat.getRigidBody(s.bodyId)!;
-        const spI = rbS.principalInertia();
-        const spF = rbS.principalInertiaLocalFrame();
-        const qS = MujocoPhysicsEngine.quatMul(q, [spF.x, spF.y, spF.z, spF.w]);
-        const ex = quatRotateVec3(qS, [1, 0, 0]);
-        const ey = quatRotateVec3(qS, [0, 1, 0]);
-        const ez = quatRotateVec3(qS, [0, 0, 1]);
-        for (let rIdx = 0; rIdx < 3; rIdx++) {
-          for (let cIdx = 0; cIdx < 3; cIdx++) {
-            iTot[rIdx * 3 + cIdx] +=
-              spI.x * ex[rIdx] * ex[cIdx] +
-              spI.y * ey[rIdx] * ey[cIdx] +
-              spI.z * ez[rIdx] * ez[cIdx];
-          }
-        }
-        const wPrinS = quatInverseRotateVec3(qS, s.rawSpinSim);
-        const lSpin = quatRotateVec3(qS, [
-          spI.x * wPrinS[0],
-          spI.y * wPrinS[1],
-          spI.z * wPrinS[2],
-        ]);
-        lSumX += lSpin[0];
-        lSumY += lSpin[1];
-        lSumZ += lSpin[2];
+        const bid3 = s.bodyId * 3;
+        const bid4 = s.bodyId * 4;
+        const spIx = bodyInertia[bid3 + 0] * 100.0;
+        const spIy = bodyInertia[bid3 + 1] * 100.0;
+        const spIz = bodyInertia[bid3 + 2] * 100.0;
+        const qw1 = bodyIquat[bid4 + 0];
+        const qx1 = bodyIquat[bid4 + 1];
+        const qy1 = bodyIquat[bid4 + 2];
+        const qz1 = bodyIquat[bid4 + 3];
+        // Exact bit-for-bit `quatMul(q, [spF.x, spF.y, spF.z, spF.w])`
+        const sqx = qw0 * qx1 + qx0 * qw1 + qy0 * qz1 - qz0 * qy1;
+        const sqy = qw0 * qy1 - qx0 * qz1 + qy0 * qw1 + qz0 * qx1;
+        const sqz = qw0 * qz1 + qx0 * qy1 - qy0 * qx1 + qz0 * qw1;
+        const sqw = qw0 * qw1 - qx0 * qx1 - qy0 * qy1 - qz0 * qz1;
+        // Exact bit-for-bit `quatRotateVec3(qS, [1,0,0] / [0,1,0] / [0,0,1])`
+        const exTy = 2 * sqz, exTz = -2 * sqy;
+        const ex0 = 1 + (sqy * exTz - sqz * exTy);
+        const ex1 = sqw * exTy - sqx * exTz;
+        const ex2 = sqw * exTz + sqx * exTy;
+        const eyTx = -2 * sqz, eyTz = 2 * sqx;
+        const ey0 = sqw * eyTx + sqy * eyTz;
+        const ey1 = 1 + (sqz * eyTx - sqx * eyTz);
+        const ey2 = sqw * eyTz - sqy * eyTx;
+        const ezTx = 2 * sqy, ezTy = -2 * sqx;
+        const ez0 = sqw * ezTx - sqz * ezTy;
+        const ez1 = sqw * ezTy + sqz * ezTx;
+        const ez2 = 1 + (sqx * ezTy - sqy * ezTx);
+        iTot[0] += spIx * ex0 * ex0 + spIy * ey0 * ey0 + spIz * ez0 * ez0;
+        iTot[1] += spIx * ex0 * ex1 + spIy * ey0 * ey1 + spIz * ez0 * ez1;
+        iTot[2] += spIx * ex0 * ex2 + spIy * ey0 * ey2 + spIz * ez0 * ez2;
+        iTot[3] += spIx * ex1 * ex0 + spIy * ey1 * ey0 + spIz * ez1 * ez0;
+        iTot[4] += spIx * ex1 * ex1 + spIy * ey1 * ey1 + spIz * ez1 * ez1;
+        iTot[5] += spIx * ex1 * ex2 + spIy * ey1 * ey2 + spIz * ez1 * ez2;
+        iTot[6] += spIx * ex2 * ex0 + spIy * ey2 * ey0 + spIz * ez2 * ez0;
+        iTot[7] += spIx * ex2 * ex1 + spIy * ey2 * ey1 + spIz * ez2 * ez1;
+        iTot[8] += spIx * ex2 * ex2 + spIy * ey2 * ey2 + spIz * ez2 * ez2;
+        // Exact bit-for-bit `quatRotateVec3(qS, [spI * quatInverseRotateVec3(qS, rawSpinSim)])`
+        const w0 = s.rawSpinSim[0], w1 = s.rawSpinSim[1], w2 = s.rawSpinSim[2];
+        const itx = 2 * (-sqy * w2 - -sqz * w1);
+        const ity = 2 * (-sqz * w0 - -sqx * w2);
+        const itz = 2 * (-sqx * w1 - -sqy * w0);
+        const pwx = spIx * (w0 + sqw * itx + (-sqy * itz - -sqz * ity));
+        const pwy = spIy * (w1 + sqw * ity + (-sqz * itx - -sqx * itz));
+        const pwz = spIz * (w2 + sqw * itz + (-sqx * ity - -sqy * itx));
+        const ltx = 2 * (sqy * pwz - sqz * pwy);
+        const lty = 2 * (sqz * pwx - sqx * pwz);
+        const ltz = 2 * (sqx * pwy - sqy * pwx);
+        lSumX += pwx + sqw * ltx + (sqy * ltz - sqz * lty);
+        lSumY += pwy + sqw * lty + (sqz * ltx - sqx * ltz);
+        lSumZ += pwz + sqw * ltz + (sqx * lty - sqy * ltx);
       }
 
       const lErr: Vec3 = [lSumX - parentL0[0], lSumY - parentL0[1], lSumZ - parentL0[2]];
       const dOmega = MujocoPhysicsEngine.solve3x3(iTot, lErr);
 
-      for (const s of spawned) {
+      const yDatumM = -0.35;
+      for (let si = 0; si < spawned.length; si++) {
+        const s = spawned[si];
         const rx = s.worldPosDm[0] - comX;
         const ry = s.worldPosDm[1] - comY;
         const rz = s.worldPosDm[2] - comZ;
@@ -5710,20 +6502,56 @@ export class MujocoPhysicsEngine {
           }
         }
 
-        const rbS = this.worldCompat.getRigidBody(s.bodyId)!;
-        rbS.setLinvel({ x: vx, y: vy, z: vz }, true);
-        rbS.setAngvel({ x: wx, y: wy, z: wz }, true);
+        const sQposAdr = this.map.shardQposAdr[s.slotIndex];
+        const sDofAdr = this.map.shardDofAdr[s.slotIndex];
+        const vxSi = vx * INV_FROUDE_VEL_SCALE;
+        const vySi = vy * INV_FROUDE_VEL_SCALE;
+        const vzSi = vz * INV_FROUDE_VEL_SCALE;
+        qvelS[sDofAdr + 0] = vxSi;
+        qvelS[sDofAdr + 1] = vySi;
+        qvelS[sDofAdr + 2] = vzSi;
+        const bqx = -qposS[sQposAdr + 4];
+        const bqy = -qposS[sQposAdr + 5];
+        const bqz = -qposS[sQposAdr + 6];
+        const bqw = qposS[sQposAdr + 3];
+        const wwx = wx * FROUDE_VEL_SCALE;
+        const wwy = wy * FROUDE_VEL_SCALE;
+        const wwz = wz * FROUDE_VEL_SCALE;
+        const atx = 2 * (bqy * wwz - bqz * wwy);
+        const aty = 2 * (bqz * wwx - bqx * wwz);
+        const atz = 2 * (bqx * wwy - bqy * wwx);
+        const wLocX = wwx + bqw * atx + (bqy * atz - bqz * aty);
+        const wLocY = wwy + bqw * aty + (bqz * atx - bqx * atz);
+        const wLocZ = wwz + bqw * atz + (bqx * aty - bqy * atx);
+        qvelS[sDofAdr + 3] = wLocX;
+        qvelS[sDofAdr + 4] = wLocY;
+        qvelS[sDofAdr + 5] = wLocZ;
+        const sInfo = this.getMappingFast(s.bodyId);
+        if (sInfo) {
+          sInfo.settledAsleep = false;
+          sInfo.quietTicks = 0;
+        }
+        const sTid = bodyTreeId[s.bodyId];
+        if (sTid >= 0 && treeAsleep[sTid] >= 0) {
+          qfrcApplied[sDofAdr + 1] += 4e-9;
+        }
 
         const firstVertex = s.slotIndex * SHARD_SLOT_STRIDE_VERTS;
         this.pendingSlotUploads.set(s.slotIndex, s.geom.renderVertices);
         this.slotRenderVertices[s.slotIndex] = s.geom.renderVertices;
         this.shardAirborneSubsteps[s.slotIndex] = 0;
         this.shardInContactPrevSubstep[s.slotIndex] = 0;
-        const initShardE = this.computeSingleShardTotalEnergyJ(
-          s.bodyId,
-          this.map.shardQposAdr[s.slotIndex],
-          this.map.shardDofAdr[s.slotIndex]
-        );
+        const mShdE = bodyMass[s.bodyId];
+        const ibE = s.bodyId * 3;
+        const initShardE =
+          mShdE > 0
+            ? mShdE * 9.81 * (Math.max(yDatumM, qposS[sQposAdr + 1]) - yDatumM) +
+              0.5 * mShdE * (vxSi * vxSi + vySi * vySi + vzSi * vzSi) +
+              0.5 *
+                (bodyInertia[ibE + 0] * wLocX * wLocX +
+                  bodyInertia[ibE + 1] * wLocY * wLocY +
+                  bodyInertia[ibE + 2] * wLocZ * wLocZ)
+            : 0;
         this.shardPreSubstepTotalEnergyJ[s.slotIndex] = initShardE;
         this.shardEntryTotalEnergyJ[s.slotIndex] = initShardE;
         this.shardLastImpactSimTime[s.slotIndex] = this.simTime;
@@ -5737,16 +6565,16 @@ export class MujocoPhysicsEngine {
           swatchId: block.swatchId,
           motif: block.motif,
           rippleSeed: block.rippleSeed,
-          position: [...s.worldPosDm],
-          rotation: [...q],
-          prePos: [...s.worldPosDm],
-          preQuat: [...q],
+          position: [s.worldPosDm[0], s.worldPosDm[1], s.worldPosDm[2]],
+          rotation: [q[0], q[1], q[2], q[3]],
+          prePos: [s.worldPosDm[0], s.worldPosDm[1], s.worldPosDm[2]],
+          preQuat: [q[0], q[1], q[2], q[3]],
           preLinVel: [vx, vy, vz],
           preAngVel: [wx, wy, wz],
           volume: s.geom.volume,
           massKg: s.massKg,
           preVy: vy,
-          impactLocalPos: [...effectiveOrigin],
+          impactLocalPos: [effectiveOrigin[0], effectiveOrigin[1], effectiveOrigin[2]],
           planes: s.geom.planes,
           planeCount: s.geom.planeCount,
           firstVertex,
@@ -5755,7 +6583,7 @@ export class MujocoPhysicsEngine {
           spawnSimTime: this.simTime,
         };
         this.shards.push(shardState);
-        this.bodyToShard.set(s.bodyId, shardState);
+        this.setBodyShard(shardState);
       }
       if (!collisionRebound?.skipSyncKinematics) {
         this.worldCompat.syncKinematics();
@@ -5970,6 +6798,7 @@ export class MujocoPhysicsEngine {
       if (geomContype[s.colliderHandle] !== MJ_CONTYPE_CULLET_SHARD) {
         this.shardWedgeCooldownUntilSim[slot] = -10;
         this.shardPinchSubsteps[slot] = 0;
+        this.shardLastPinchSimTime[slot] = -10;
         continue;
       }
 
@@ -5984,6 +6813,7 @@ export class MujocoPhysicsEngine {
         this.worldCompat.markShardActive(s.bodyHandle, true, MJ_CONTYPE_CULLET_SHARD, caff);
         this.shardWedgeCooldownUntilSim[slot] = -10;
         this.shardPinchSubsteps[slot] = 0;
+        this.shardLastPinchSimTime[slot] = -10;
         continue;
       }
 
@@ -6003,37 +6833,69 @@ export class MujocoPhysicsEngine {
         0.032
       );
 
-      if (!forceAllSettled) {
-        if (this.simTime >= untilSim && hit === null) {
-          const caff = this.getCulletConaffinity(false);
-          setBodyGeomCollisionMask(
-            m,
-            s.bodyHandle,
-            s.colliderHandle,
-            MJ_CONTYPE_CULLET_SHARD,
-            caff
-          );
-          this.worldCompat.markShardActive(s.bodyHandle, true, MJ_CONTYPE_CULLET_SHARD, caff);
-          this.shardWedgeCooldownUntilSim[slot] = -10;
-          this.shardPinchSubsteps[slot] = 0;
-        } else {
-          remaining++;
+      let restoreNow = forceAllSettled;
+      if (!restoreNow) {
+        if (this.activeBlockId === null) {
+          if (hit !== null) {
+            const hbDof = this.map.blockDofAdr[hit.block.id];
+            const hbSpeedSi =
+              hbDof !== undefined
+                ? Math.hypot(qvel[hbDof + 0], qvel[hbDof + 1], qvel[hbDof + 2])
+                : 0;
+            if (hbSpeedSi < 0.025 || this.simTime >= untilSim) {
+              restoreNow = true;
+            }
+          } else if (this.simTime >= untilSim) {
+            restoreNow = true;
+          } else if (!this.sandboxCollapseActive && !this.lastReleaseWasWhipFlick) {
+            let localMoving = false;
+            for (let bi = 0; bi < this.blocks.length; bi++) {
+              const ob = this.blocks[bi];
+              if (ob.shattered || ob.extracted) continue;
+              const obQAdr = this.map.blockQposAdr[ob.id];
+              const obDof = this.map.blockDofAdr[ob.id];
+              if (obQAdr === undefined || obDof === undefined) continue;
+              if (
+                Math.abs(xM - qpos[obQAdr + 0]) < 0.12 &&
+                Math.abs(zM - qpos[obQAdr + 2]) < 0.12 &&
+                Math.abs(yM - qpos[obQAdr + 1]) < 0.12
+              ) {
+                const sp = Math.hypot(qvel[obDof + 0], qvel[obDof + 1], qvel[obDof + 2]);
+                if (sp >= 0.025) {
+                  localMoving = true;
+                  break;
+                }
+              }
+            }
+            if (!localMoving) {
+              restoreNow = true;
+            }
+          }
+        } else if (this.simTime >= untilSim && hit === null) {
+          restoreNow = true;
         }
+      }
+
+      if (!restoreNow) {
+        remaining++;
       } else {
         if (hit !== null) {
           // Slide resting grain horizontally at constant `yM` (`dPE = 0.000 J`) to the nearest
           // multi-block-clear tabletop spot (`+3.2 mm` OBB gap from ALL intact blocks) so restoring
           // `0x22` on settled rubble has 0% ghost shards and 0 Baumgarte overlap pop!
           const limXDm = BLOCK_HALF_X + rShardDm + 0.036;
+          const limYDm = BLOCK_HALF_Y + rShardDm + 0.036;
           const limZDm = BLOCK_HALF_Z + rShardDm + 0.036;
           const faceLocs: Vec3[] = [
             [limXDm, hit.loc[1], hit.loc[2]],
             [-limXDm, hit.loc[1], hit.loc[2]],
+            [hit.loc[0], limYDm, hit.loc[2]],
+            [hit.loc[0], -limYDm, hit.loc[2]],
             [hit.loc[0], hit.loc[1], limZDm],
             [hit.loc[0], hit.loc[1], -limZDm],
           ];
           const candidates: Array<{ cx: number; cz: number; d2: number }> = [];
-          for (let fi = 0; fi < 4; fi++) {
+          for (let fi = 0; fi < faceLocs.length; fi++) {
             const wOffDm = quatRotateVec3(hit.quat, faceLocs[fi]);
             const cx = hit.posM[0] + wOffDm[0] * M_PER_DM - gOffM[0];
             const cz = hit.posM[2] + wOffDm[2] * M_PER_DM - gOffM[2];
@@ -6111,6 +6973,7 @@ export class MujocoPhysicsEngine {
         this.worldCompat.markShardActive(s.bodyHandle, true, MJ_CONTYPE_CULLET_SHARD, caff);
         this.shardWedgeCooldownUntilSim[slot] = -10;
         this.shardPinchSubsteps[slot] = 0;
+        this.shardLastPinchSimTime[slot] = -10;
       }
     }
 
@@ -6127,7 +6990,11 @@ export class MujocoPhysicsEngine {
    * `solidCulletAndTrueShardHulls`, brick-top shards (`yM >= 2.2 cm`) stay 100% untouched and demoted floor
    * splinters remain solid (`0x22`) against intact blocks and the oak table while skipping shard-vs-shard wedging.
    */
-  private demotePinchedHeroShardIfWedged(shd: GlassShardState | undefined, forceN: number = 99): void {
+  private demotePinchedHeroShardIfWedged(
+    shd: GlassShardState | undefined,
+    forceN: number = 99,
+    allowUnderbellyAnyOrient: boolean = false
+  ): void {
     const m = this.model;
     const d = this.data;
     if (!shd || !m || !d) return;
@@ -6160,15 +7027,34 @@ export class MujocoPhysicsEngine {
           qpos[obAdr + 3],
         ];
         const localPt = quatInverseRotateVec3(obQuat, [dxDm, dyDm, dzDm]);
-        // Preserve hero shards resting peacefully on the top deck (`localPt[1] >= BLOCK_HALF_Y - 0.012`)
-        // for Tablecloth Pull while demoting any shard pinched underneath or against the side/bevel!
-        if (
-          Math.abs(localPt[0]) < BLOCK_HALF_X + 0.14 &&
-          Math.abs(localPt[2]) < BLOCK_HALF_Z + 0.14 &&
-          localPt[1] < BLOCK_HALF_Y - 0.012
-        ) {
-          hasPinchingBlock = true;
-          break;
+        if (allowUnderbellyAnyOrient) {
+          const obDownX = 2 * (obQuat[3] * obQuat[2] - -obQuat[0] * -obQuat[1]);
+          const obDownY = -1 + 2 * (obQuat[0] * obQuat[0] + obQuat[2] * obQuat[2]);
+          const obDownZ = -2 * (obQuat[3] * -obQuat[0] + -obQuat[1] * obQuat[2]);
+          const blkHalfYDm =
+            Math.abs(obDownX) * BLOCK_HALF_X +
+            Math.abs(obDownY) * BLOCK_HALF_Y +
+            Math.abs(obDownZ) * BLOCK_HALF_Z;
+          if (
+            Math.abs(localPt[0]) < BLOCK_HALF_X + 0.14 &&
+            Math.abs(localPt[1]) < BLOCK_HALF_Y + 0.14 &&
+            Math.abs(localPt[2]) < BLOCK_HALF_Z + 0.14 &&
+            dyDm < blkHalfYDm - 0.012
+          ) {
+            hasPinchingBlock = true;
+            break;
+          }
+        } else {
+          // Preserve hero shards resting peacefully on the top deck (`localPt[1] >= BLOCK_HALF_Y - 0.012`)
+          // for Tablecloth Pull while demoting any shard pinched underneath or against the side/bevel!
+          if (
+            Math.abs(localPt[0]) < BLOCK_HALF_X + 0.14 &&
+            Math.abs(localPt[2]) < BLOCK_HALF_Z + 0.14 &&
+            localPt[1] < BLOCK_HALF_Y - 0.012
+          ) {
+            hasPinchingBlock = true;
+            break;
+          }
         }
       }
       if (!hasPinchingBlock) return;
@@ -6221,6 +7107,7 @@ export class MujocoPhysicsEngine {
     this.stepShardCandidates.length = 0;
     this.stepWobbleCandidates.length = 0;
     this.frameShatterCount = 0;
+    this.framePeakSeamCrossingIntensity = 0;
 
     // 3B: Decay `grabFlickVelXZ` when no fresh `updateGrabTarget` velocity sample arrived this step
     // so stationary cursors never retain stale flick vectors!
@@ -6249,10 +7136,10 @@ export class MujocoPhysicsEngine {
       this.activeTimestepHz = Math.round(1.0 / this.cfg.timestepSec);
       this.activeSolverIterations = this.cfg.solverIterations;
       this.activeLsIterations = this.cfg.lsIterations;
-      this.sandboxCollapseActive = false;
-      if (this.shatteredCount > 0 || this.turnPhase === 'COLLAPSED') {
+      if (this.shatteredCount > 0 || this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) {
         this.hadFullSleepAfterCollapse = true;
       }
+      this.sandboxCollapseActive = false;
       if (this.activeBlockId === null) {
         this.restoreWedgeEscapedCulletShards(true);
         this.accumulatorSec = 0;
@@ -6296,10 +7183,10 @@ export class MujocoPhysicsEngine {
       activeFallingBlocks,
     } = this.measureVisibleCascadeKinematics();
     if (visibleAwakeTrees === 0 && !anyPendingWake && this.deferredFractures.length === 0) {
-      this.sandboxCollapseActive = false;
-      if (this.shatteredCount > 0 || this.turnPhase === 'COLLAPSED') {
+      if (this.shatteredCount > 0 || this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) {
         this.hadFullSleepAfterCollapse = true;
       }
+      this.sandboxCollapseActive = false;
       if (this.activeBlockId === null) {
         this.restoreWedgeEscapedCulletShards(true);
       }
@@ -6379,31 +7266,56 @@ export class MujocoPhysicsEngine {
     // exceed single-frame 60 FPS budget even with WASM pthreads (72-90 bricks in 1 dense island); keep <= 20L
     // (`18L` M6 invariant) strictly at >= 500 Hz / >= 14 iterations!
     const isTallSuperTowerOverload =
+      this.activeBlockId === null &&
       this.sandboxCollapseActive &&
       this.blocks.length > 60 &&
       !this.hadFullSleepAfterCollapse &&
       !isPostCrashRubbleSettle;
-    const isSingleThread18LCoherentTip =
+    const isSingleThreadEarlyShatterCruise =
+      this.activeBlockId === null &&
       !isMt &&
       this.sandboxCollapseActive &&
       !this.hadFullSleepAfterCollapse &&
       this.blocks.length >= 50 &&
+      this.shards.length < 260 &&
+      !isPostCrashRubbleSettle &&
+      (this.blocks.length <= 60 || this.solverLeanAngleDeg < 42.0 || this.shards.length > 0);
+    const isSingleThread18LCoherentTip =
+      isSingleThreadEarlyShatterCruise &&
       this.shards.length === 0 &&
-      this.solverLeanAngleDeg < 42.0 &&
-      !isPostCrashRubbleSettle;
+      this.solverLeanAngleDeg < 42.0;
+    const isSingleThread18LPreImpactTip =
+      isSingleThread18LCoherentTip &&
+      this.blocks.length <= 60 &&
+      this.solverLeanAngleDeg < 32.0;
+    const isSingleThread18LImpactOnset =
+      isSingleThreadEarlyShatterCruise &&
+      this.blocks.length <= 60 &&
+      this.shards.length === 0 &&
+      this.solverLeanAngleDeg >= 42.0;
+    const isSingleThreadPeakCascade =
+      this.activeBlockId === null &&
+      !isMt &&
+      this.sandboxCollapseActive &&
+      !this.hadFullSleepAfterCollapse &&
+      visibleAwakeTrees > (isPostCrashRubbleSettle ? 32 : 24) &&
+      this.shards.length >= 260;
     const isSingleThreadSandboxOverload =
-      isTallSuperTowerOverload ||
-      isSingleThread18LCoherentTip ||
-      (!isMt &&
-        this.sandboxCollapseActive &&
-        !this.hadFullSleepAfterCollapse &&
-        this.shards.length >= 190 &&
-        (!isPostCrashRubbleSettle || visibleAwakeTrees > 6));
+      this.activeBlockId === null &&
+      (isTallSuperTowerOverload ||
+        isSingleThreadEarlyShatterCruise ||
+        (!isMt &&
+          this.sandboxCollapseActive &&
+          !this.hadFullSleepAfterCollapse &&
+          this.shards.length >= 190 &&
+          visibleAwakeTrees > 18));
     const subDt =
       this.fidelity.fullRateCollapseSolver && !isSingleThreadSandboxOverload
         ? Math.min(rawSubDt, 1.0 / 500.0)
         : isSingleThreadSandboxOverload
-          ? 1.0 / 240.0
+          ? isSingleThread18LPreImpactTip
+            ? 1.0 / 180.0
+            : 1.0 / 240.0
           : rawSubDt;
     this.model.opt.timestep = subDt;
     // Keep `multiccd` invariantly enabled across all states: disabling `mjDSBL_MULTICCD` on 24-vertex
@@ -6415,19 +7327,27 @@ export class MujocoPhysicsEngine {
       this.fidelity.fullRateCollapseSolver && !isSingleThreadSandboxOverload
         ? Math.max(rawIterations, 14)
         : isSingleThreadSandboxOverload
-          ? isTallSuperTowerOverload
-            ? 3
-            : isSingleThread18LCoherentTip
-              ? 4
-              : Math.min(rawIterations, 4)
+          ? isSingleThreadPeakCascade
+            ? 2
+            : isSingleThread18LImpactOnset
+              ? 14
+              : isSingleThread18LCoherentTip || isSingleThreadEarlyShatterCruise
+                ? 4
+                : isTallSuperTowerOverload
+                  ? 3
+                  : Math.min(rawIterations, 4)
           : rawIterations;
     this.model.opt.ls_iterations =
       this.fidelity.fullRateCollapseSolver && !isSingleThreadSandboxOverload
         ? Math.max(rawLsIterations, 4)
         : isSingleThreadSandboxOverload
-          ? isTallSuperTowerOverload || isSingleThread18LCoherentTip
+          ? isSingleThreadPeakCascade ||
+            isTallSuperTowerOverload ||
+            isSingleThread18LPreImpactTip
             ? 1
-            : Math.min(rawLsIterations, 2)
+            : isSingleThread18LImpactOnset
+              ? 4
+              : Math.min(rawLsIterations, 2)
           : rawLsIterations;
 
     this.activeTimestepHz = Math.round(1.0 / subDt);
@@ -6439,18 +7359,20 @@ export class MujocoPhysicsEngine {
     const maxSubsteps = Math.max(isCollapseCascade ? 36 : 52, Math.ceil(0.088 / subDt));
     this.accumulatorSec = Math.min(maxSubsteps * subDt, this.accumulatorSec + clampedDt);
 
-    const qfrcApplied = this.data.qfrc_applied;
-    const xfrcApplied = this.data.xfrc_applied;
+    const qfrcApplied = this.ensureCachedViews() ? this.vcQfrcApplied : this.data.qfrc_applied;
+    const xfrcApplied = this.vcXfrcApplied ?? this.data.xfrc_applied;
     let hasExternalAppliedForce = false;
     for (let qi = 0; qi < qfrcApplied.length; qi++) {
-      if (Math.abs(qfrcApplied[qi]) > 1e-7) {
+      const v = qfrcApplied[qi];
+      if (v > 1e-7 || v < -1e-7) {
         hasExternalAppliedForce = true;
         break;
       }
     }
     if (!hasExternalAppliedForce) {
       for (let xi = 0; xi < xfrcApplied.length; xi++) {
-        if (Math.abs(xfrcApplied[xi]) > 1e-7) {
+        const v = xfrcApplied[xi];
+        if (v > 1e-7 || v < -1e-7) {
           hasExternalAppliedForce = true;
           break;
         }
@@ -6526,8 +7448,10 @@ export class MujocoPhysicsEngine {
         for (let wIdx = 1; wIdx < 8; wIdx++) {
           if (this.passivityWindowJ[wIdx] > winMaxJ) winMaxJ = this.passivityWindowJ[wIdx];
         }
-        ePreFramePassivityJ = Math.min(this.passivityRunBaselineJ, winMaxJ);
-        this.passivityRunBaselineJ = ePreFramePassivityJ;
+        const envMinJ = Math.min(this.passivityRunBaselineJ, winMaxJ);
+        this.passivityRunBaselineJ = envMinJ;
+        ePreFramePassivityJ =
+          this.shards.length > 0 ? Math.min(envMinJ, eInstPreJ + 0.0006) : envMinJ;
       }
     } else {
       this.lastStepWasUnforced = false;
@@ -6597,6 +7521,8 @@ export class MujocoPhysicsEngine {
 
       const throttleWrenchToLastSubstep =
         isSandboxPeakShardCascade ||
+        (!isPostCrashRubbleSettle && isSingleThreadPeakCascade) ||
+        (isSingleThread18LCoherentTip && this.solverLeanAngleDeg < 32.0) ||
         (isSandboxInitialShear && this.solverLeanAngleDeg < 22.0) ||
         (this.fidelity.fullRateCollapseSolver &&
           isCollapseCascade &&
@@ -6649,13 +7575,11 @@ export class MujocoPhysicsEngine {
       this.refreshClampingLoadsAndPhotoelasticStress(false);
     }
 
-    if (
-      this.activeWedgeEscapeCount > 0 &&
-      this.activeBlockId === null &&
-      (this.data.ntree_awake === 0 ||
-        (maxVisibleBlockSpeedSi < 0.025 && activeFallingBlocks === 0))
-    ) {
-      this.restoreWedgeEscapedCulletShards(true);
+    if (this.activeWedgeEscapeCount > 0 && this.activeBlockId === null) {
+      const allBlocksSettled =
+        this.data.ntree_awake === 0 ||
+        (maxVisibleBlockSpeedSi < 0.025 && activeFallingBlocks === 0);
+      this.restoreWedgeEscapedCulletShards(allBlocksSettled);
     }
 
     this.updateMicroSplinters(clampedDt);
@@ -6733,7 +7657,7 @@ export class MujocoPhysicsEngine {
   private clearAllSettledSleepLatches(): void {
     this.hadSettledLatchSinceSleep = false;
     for (let i = 0; i < this.blocks.length; i++) {
-      const info = this.worldCompat.getMapping(this.blocks[i].bodyHandle);
+      const info = this.getMappingFast(this.blocks[i].bodyHandle);
       if (info) {
         info.settledAsleep = false;
         info.quietTicks = 0;
@@ -6743,7 +7667,7 @@ export class MujocoPhysicsEngine {
       const s = this.shards[i];
       this.shardQuietSubsteps[s.slotIndex] = 0;
       this.shardInContactPrevSubstep[s.slotIndex] = 0;
-      const info = this.worldCompat.getMapping(s.bodyHandle);
+      const info = this.getMappingFast(s.bodyHandle);
       if (info) {
         info.settledAsleep = false;
         info.quietTicks = 0;
@@ -6752,27 +7676,29 @@ export class MujocoPhysicsEngine {
   }
 
   private refreshAwakeMovingBlocksScratch(wakeNearbySleepingShards: boolean): number {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) {
+    if (!this.ensureCachedViews()) {
       this.awakeMovingBlockCount = 0;
       return 0;
     }
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
+    const qpos = this.vcQpos;
+    const qvel = this.vcQvel;
+    const qfrcApplied = this.vcQfrcApplied;
+    const bodyTreeId = this.vcBodyTreeId;
+    const treeAsleep = this.vcTreeAsleep;
     let count = 0;
     let maxAwakeBlockVSi = 0;
 
     const onTableRimM = (TABLE_RADIUS + 0.058) * M_PER_DM;
     const onTableRimM2 = onTableRimM * onTableRimM;
+    let minXM = Infinity, maxXM = -Infinity;
+    let minYM = Infinity, maxYM = -Infinity;
+    let minZM = Infinity, maxZM = -Infinity;
 
     for (let i = 0; i < this.blocks.length; i++) {
       const b = this.blocks[i];
       if (b.shattered || b.extracted) continue;
       const isGrabbed = b.id === this.activeBlockId && this.isPointerDraggingBlock;
-      const info = this.worldCompat.getMapping(b.bodyHandle);
+      const info = this.getMappingFast(b.bodyHandle);
       if (!info || !info.enabled) continue;
       const dof = info.dofAdr;
       const treeId = bodyTreeId[b.bodyHandle];
@@ -6780,7 +7706,7 @@ export class MujocoPhysicsEngine {
         !isGrabbed &&
         treeId >= 0 &&
         treeAsleep[treeId] >= 0 &&
-        d.qfrc_applied[dof + 1] === 0 &&
+        qfrcApplied[dof + 1] === 0 &&
         qvel[dof + 0] * qvel[dof + 0] +
           qvel[dof + 1] * qvel[dof + 1] +
           qvel[dof + 2] * qvel[dof + 2] <=
@@ -6899,36 +7825,47 @@ export class MujocoPhysicsEngine {
         this.awakeMovingBlockVzSi[count] = bvzSi;
         this.awakeMovingBlockWySi[count] = wy;
         this.awakeMovingBlockVTipSi[count] = vPusherSi;
+        if (bxM < minXM) minXM = bxM;
+        if (bxM > maxXM) maxXM = bxM;
+        if (byM < minYM) minYM = byM;
+        if (byM > maxYM) maxYM = byM;
+        if (bzM < minZM) minZM = bzM;
+        if (bzM > maxZM) maxZM = bzM;
         count++;
-        if (wakeNearbySleepingShards && (vPusherSi >= 0.020 || wakeNearGrabbed) && this.shards.length > 0) {
-          const halfXM = BLOCK_HALF_X * M_PER_DM + 0.095;
-          const halfZM = BLOCK_HALF_Z * M_PER_DM + 0.095;
-          for (let j = 0; j < this.shards.length; j++) {
-            const s = this.shards[j];
-            const sInfo = this.worldCompat.getMapping(s.bodyHandle);
-            if (!sInfo || !sInfo.settledAsleep) continue;
-            const sAdr = this.map.shardQposAdr[s.slotIndex];
-            const sxM = qpos[sAdr + 0];
-            const syM = qpos[sAdr + 1];
-            const szM = qpos[sAdr + 2];
-            const dxM = sxM - bxM;
-            const dzM = szM - bzM;
-            if (
-              Math.abs(dxM * uXx + dzM * uXz) < halfXM &&
-              Math.abs(dxM * uZx + dzM * uZz) < halfZM &&
-              syM - byM > -0.045 &&
-              syM - byM < 0.048
-            ) {
-              this.shardQuietSubsteps[s.slotIndex] = 0;
-              this.shardNoSupportSubsteps[s.slotIndex] = 0;
-              sInfo.settledAsleep = false;
-              sInfo.quietTicks = 0;
-            }
-          }
-        }
       }
     }
     this.awakeMovingBlockCount = count;
+    this.movingBlkMinXM = minXM;
+    this.movingBlkMaxXM = maxXM;
+    this.movingBlkMinYM = minYM;
+    this.movingBlkMaxYM = maxYM;
+    this.movingBlkMinZM = minZM;
+    this.movingBlkMaxZM = maxZM;
+    if (
+      wakeNearbySleepingShards &&
+      this.hadSettledLatchSinceSleep &&
+      count > 0 &&
+      this.shards.length > 0
+    ) {
+      for (let j = 0; j < this.shards.length; j++) {
+        const s = this.shards[j];
+        const sInfo = this.getMappingFast(s.bodyHandle);
+        if (!sInfo || !sInfo.settledAsleep) continue;
+        const sAdr = this.map.shardQposAdr[s.slotIndex];
+        if (
+          this.getContactingMovingBlockSpeedSi(
+            qpos[sAdr + 0],
+            qpos[sAdr + 1],
+            qpos[sAdr + 2]
+          ) >= 0.012
+        ) {
+          this.shardQuietSubsteps[s.slotIndex] = 0;
+          this.shardNoSupportSubsteps[s.slotIndex] = 0;
+          sInfo.settledAsleep = false;
+          sInfo.quietTicks = 0;
+        }
+      }
+    }
     return maxAwakeBlockVSi;
   }
 
@@ -6945,9 +7882,20 @@ export class MujocoPhysicsEngine {
   ): number {
     let bestVSi = 0;
     const n = this.awakeMovingBlockCount;
+    if (n === 0) return 0;
     const halfXM = BLOCK_HALF_X * M_PER_DM + 0.095;
     const halfZM = BLOCK_HALF_Z * M_PER_DM + 0.095;
     const halfYM = BLOCK_HEIGHT * M_PER_DM + 0.032;
+    if (
+      xM < this.movingBlkMinXM - 0.14 ||
+      xM > this.movingBlkMaxXM + 0.14 ||
+      zM < this.movingBlkMinZM - 0.14 ||
+      zM > this.movingBlkMaxZM + 0.14 ||
+      yM < this.movingBlkMinYM - halfYM ||
+      yM > this.movingBlkMaxYM + halfYM
+    ) {
+      return 0;
+    }
     for (let k = 0; k < n; k++) {
       if (this.awakeMovingBlockId[k] === ignoreBlockId) continue;
       const dyM = yM - this.awakeMovingBlockYM[k];
@@ -6979,13 +7927,13 @@ export class MujocoPhysicsEngine {
    * and NEVER brakes elevated/falling blocks in the tower (`y >= 2.8 cm`), preserving exact 1.00g free-fall!
    */
   private dampGroundedMicroJitterShardsSubstep(): void {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) return;
+    if (!this.ensureCachedViews()) return;
+    const m = this.model!;
+    const d = this.data!;
 
-    const qvel = d.qvel;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
+    const qvel = this.vcQvel;
+    const bodyTreeId = this.vcBodyTreeId;
+    const treeAsleep = this.vcTreeAsleep;
 
     // Explicit-Euler gyroscopic guard on 9:1-aspect-ratio (`Iy / Ix ~ 9`) intact glass bricks + local moving-block index:
     const maxAwakeBlockVSi = this.refreshAwakeMovingBlocksScratch(true);
@@ -6999,11 +7947,11 @@ export class MujocoPhysicsEngine {
       (this.activeBlockId !== null ||
         (this.lastEndGrabSimTime >= 0 && this.simTime - this.lastEndGrabSimTime <= 0.25))
     ) {
-      const qposGuard = d.qpos;
+      const qposGuard = this.vcQpos;
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
         if (b.shattered || b.extracted || b.id === this.activeBlockId) continue;
-        const bInfo = this.worldCompat.getMapping(b.bodyHandle);
+        const bInfo = this.getMappingFast(b.bodyHandle);
         if (!bInfo || !bInfo.enabled) continue;
         if (qposGuard[bInfo.qposAdr + 1] > 0.025 && qvel[bInfo.dofAdr + 1] > 1.10) {
           qvel[bInfo.dofAdr + 1] = 1.10;
@@ -7020,20 +7968,70 @@ export class MujocoPhysicsEngine {
       return;
     }
 
+    const hasDragOrPostReleaseForWedge =
+      this.shards.length > 0 &&
+      (this.activeBlockId !== null ||
+        (this.lastUserImpulsedBlockId >= 0 && this.simTime - this.lastUserImpulsedSimTime < 1.8));
+    if (hasDragOrPostReleaseForWedge) {
+      this.shardBlockNormalN.fill(0);
+      this.shardTableNormalN.fill(0);
+    }
+    if (hasDragOrPostReleaseForWedge && d.ncon > 0) {
+      const contacts = d.contact;
+      const efc = d.efc_force;
+      const ncon = d.ncon;
+      const minShardGid = this.minShardGeomId;
+      const maxShardGid = this.maxShardGeomId;
+      const tableGid = this.map.tableGeomId;
+      const shardTableGid = this.map.shardTableGeomId;
+      const geomBodyId = this.vcGeomBodyId;
+      for (let ci = 0; ci < ncon; ci++) {
+        const c = contacts.get(ci);
+        if (!c) continue;
+        const adr = c.efc_address;
+        if (adr >= 0) {
+          const fn = efc[adr];
+          if (fn > 0) {
+            const cGeom = c.geom;
+            const g1 = cGeom[0];
+            const g2 = cGeom[1];
+            const isShard1 = g1 >= minShardGid && g1 <= maxShardGid;
+            const isShard2 = g2 >= minShardGid && g2 <= maxShardGid;
+            if (isShard1 !== isShard2) {
+              const shardSlot = (isShard1 ? g1 : g2) - minShardGid;
+              if (shardSlot >= 0 && shardSlot < MAX_ACTIVE_SHARDS) {
+                const otherGid = isShard1 ? g2 : g1;
+                if (otherGid === shardTableGid || otherGid === tableGid) {
+                  this.shardTableNormalN[shardSlot] += fn;
+                } else {
+                  const otherBid = geomBodyId[otherGid];
+                  if (otherBid < this.bodyIdToBlock.length && this.bodyIdToBlock[otherBid] !== undefined) {
+                    this.shardBlockNormalN[shardSlot] += fn;
+                  }
+                }
+              }
+            }
+          }
+        }
+        c.delete();
+      }
+      contacts.delete();
+    }
+
     if (this.activeWedgeEscapeCount > 0) {
       this.restoreWedgeEscapedCulletShards(false);
     }
 
-    const qpos = d.qpos;
-    const qacc = d.qacc;
-    const qaccWarm = d.qacc_warmstart;
-    const qfrcConstraint = d.qfrc_constraint;
-    const bodyMass = m.body_mass;
-    const geomContype = m.geom_contype;
-    const geomConaffinity = m.geom_conaffinity;
-    const geomAabb = this.shards.length > 0 ? m.geom_aabb : null;
-    const geomXpos = this.shards.length > 0 ? d.geom_xpos : null;
-    const geomXmat = this.shards.length > 0 ? d.geom_xmat : null;
+    const qpos = this.vcQpos;
+    const qacc = this.vcQacc;
+    const qaccWarm = this.vcQaccWarm;
+    const qfrcConstraint = this.vcQfrcConstraint;
+    const bodyMass = this.vcBodyMass;
+    const geomContype = this.vcGeomContype;
+    const geomConaffinity = this.vcGeomConaffinity;
+    const geomAabb = this.shards.length > 0 ? this.vcGeomAabb : null;
+    const geomXpos = this.shards.length > 0 ? this.vcGeomXpos : null;
+    const geomXmat = this.shards.length > 0 ? this.vcGeomXmat : null;
 
     const blockRimM = (TABLE_RADIUS + 0.058) * M_PER_DM;
     const blockRimM2 = blockRimM * blockRimM;
@@ -7042,16 +8040,22 @@ export class MujocoPhysicsEngine {
     const tickInc = this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive ? 2 : 1;
     const isPostCollapse =
       this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive || this.shatteredCount > 0;
-    if (isPostCollapse) {
+    const isPreImpactCoherentTip =
+      this.sandboxCollapseActive &&
+      this.blocks.length < 50 &&
+      this.shards.length === 0 &&
+      this.shatteredCount === 0 &&
+      this.solverLeanAngleDeg < 35.0;
+    if (isPostCollapse && !isPreImpactCoherentTip) {
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
         if (b.shattered || b.extracted) continue;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
-        if (!info || !info.enabled) continue;
         const treeId = bodyTreeId[b.bodyHandle];
         if (treeId >= 0 && treeAsleep[treeId] >= 0) {
           continue;
         }
+        const info = this.getMappingFast(b.bodyHandle);
+        if (!info || !info.enabled) continue;
         const xM = qpos[info.qposAdr + 0];
         const yM = qpos[info.qposAdr + 1];
         const zM = qpos[info.qposAdr + 2];
@@ -7207,8 +8211,12 @@ export class MujocoPhysicsEngine {
       }
     }
 
-    const bodyInertia = m.body_inertia;
+    const bodyInertia = this.vcBodyInertia;
     let lowIntactBlkCount = 0;
+    let lowBlkMinXM = Infinity;
+    let lowBlkMaxXM = -Infinity;
+    let lowBlkMinZM = Infinity;
+    let lowBlkMaxZM = -Infinity;
     if (this.shards.length > 0 && this.activeBlockId === null && maxAwakeBlockVSi < 0.45) {
       for (let bi = 0; bi < this.blocks.length; bi++) {
         const ob = this.blocks[bi];
@@ -7217,23 +8225,147 @@ export class MujocoPhysicsEngine {
         if (obAdr === undefined) continue;
         const obY = qpos[obAdr + 1];
         if (obY > -0.002 && obY < 0.105 && lowIntactBlkCount < this.lowIntactBlkXM.length) {
-          this.lowIntactBlkXM[lowIntactBlkCount] = qpos[obAdr + 0];
+          const obX = qpos[obAdr + 0];
+          const obZ = qpos[obAdr + 2];
+          this.lowIntactBlkXM[lowIntactBlkCount] = obX;
           this.lowIntactBlkYM[lowIntactBlkCount] = obY;
-          this.lowIntactBlkZM[lowIntactBlkCount] = qpos[obAdr + 2];
+          this.lowIntactBlkZM[lowIntactBlkCount] = obZ;
+          if (obX < lowBlkMinXM) lowBlkMinXM = obX;
+          if (obX > lowBlkMaxXM) lowBlkMaxXM = obX;
+          if (obZ < lowBlkMinZM) lowBlkMinZM = obZ;
+          if (obZ > lowBlkMaxZM) lowBlkMaxZM = obZ;
           lowIntactBlkCount++;
         }
       }
+      if (lowIntactBlkCount > 0 && lowIntactBlkCount <= 64) {
+        this.lowBlkCellLo.fill(0);
+        this.lowBlkCellHi.fill(0);
+        for (let bi = 0; bi < lowIntactBlkCount; bi++) {
+          const obX = this.lowIntactBlkXM[bi];
+          const obZ = this.lowIntactBlkZM[bi];
+          const minCx = Math.max(0, Math.min(15, ((obX - 0.052 + 0.50) * 16.0) | 0));
+          const maxCx = Math.max(0, Math.min(15, ((obX + 0.052 + 0.50) * 16.0) | 0));
+          const minCz = Math.max(0, Math.min(15, ((obZ - 0.052 + 0.50) * 16.0) | 0));
+          const maxCz = Math.max(0, Math.min(15, ((obZ + 0.052 + 0.50) * 16.0) | 0));
+          if (bi < 32) {
+            const bit = 1 << bi;
+            for (let cz = minCz; cz <= maxCz; cz++) {
+              const row = cz << 4;
+              for (let cx = minCx; cx <= maxCx; cx++) {
+                this.lowBlkCellLo[row | cx] |= bit;
+              }
+            }
+          } else {
+            const bit = 1 << (bi - 32);
+            for (let cz = minCz; cz <= maxCz; cz++) {
+              const row = cz << 4;
+              for (let cx = minCx; cx <= maxCx; cx++) {
+                this.lowBlkCellHi[row | cx] |= bit;
+              }
+            }
+          }
+        }
+      }
     }
+    const isMultiBlockCollapseShd =
+      this.sandboxCollapseActive ||
+      this.turnPhase === 'COLLAPSED' ||
+      this.shatteredCount >= 3;
+    const isDirectNudgedShard = this.simTime - this.lastShardNudgeSimTime < 0.35;
+    const hasRecentUserImpulsedBlk =
+      this.lastUserImpulsedBlockId >= 0 &&
+      this.simTime - this.lastUserImpulsedSimTime < 1.8;
+    const isActiveCollapseShd =
+      !this.hadFullSleepAfterCollapse &&
+      this.activeBlockId === null &&
+      !hasRecentUserImpulsedBlk &&
+      (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED');
+    let hoistedHasActiveBlk = false;
+    let hoistedAbX = 0;
+    let hoistedAbY = 0;
+    let hoistedAbZ = 0;
+    let hoistedActiveDriveVSi = 0;
+    let hoistedHasPostRelBlk = false;
+    let hoistedRbX = 0;
+    let hoistedRbY = 0;
+    let hoistedRbZ = 0;
+    let hoistedPostRelDriveVSi = 0;
+    let hoistedSessionDriveVSi = 0;
+    let hoistedInGentleDragOrSettleWindow = false;
+    if (this.activeBlockId !== null) {
+      const ab = this.blocks[this.activeBlockId];
+      const abInfo = ab && !ab.shattered ? this.getMappingFast(ab.bodyHandle) : null;
+      if (abInfo) {
+        const abHorizSi = Math.hypot(qvel[abInfo.dofAdr + 0], qvel[abInfo.dofAdr + 2]);
+        hoistedSessionDriveVSi = this.isPointerDraggingBlock
+          ? this.grabSmoothedPointerSpeedMps
+          : Math.min(0.30, abHorizSi);
+        hoistedInGentleDragOrSettleWindow = hoistedSessionDriveVSi < 0.95;
+        const abQposAdr = this.map.blockQposAdr[ab!.id];
+        hoistedHasActiveBlk = true;
+        hoistedAbX = qpos[abQposAdr + 0];
+        hoistedAbY = qpos[abQposAdr + 1];
+        hoistedAbZ = qpos[abQposAdr + 2];
+        hoistedActiveDriveVSi = this.isPointerDraggingBlock
+          ? Math.min(0.95, Math.max(0.035, this.grabSmoothedPointerSpeedMps * 1.04 + 0.02))
+          : Math.min(0.45, abHorizSi * 1.15);
+      }
+    } else if (hasRecentUserImpulsedBlk) {
+      const rb = this.blocks[this.lastUserImpulsedBlockId];
+      const rbInfo = rb && !rb.shattered ? this.getMappingFast(rb.bodyHandle) : null;
+      if (rbInfo) {
+        const rbHorizSi = Math.hypot(qvel[rbInfo.dofAdr + 0], qvel[rbInfo.dofAdr + 2]);
+        const dtRel =
+          this.lastEndGrabSimTime >= 0 ? this.simTime - this.lastEndGrabSimTime : 9.0;
+        hoistedSessionDriveVSi =
+          !this.lastReleaseWasWhipFlick && dtRel < 0.18
+            ? Math.min(
+                rbHorizSi,
+                this.grabAtReleasePointerSpeedMps * (1.0 - dtRel / 0.18) +
+                  rbHorizSi * (dtRel / 0.18)
+              )
+            : rbHorizSi;
+        hoistedInGentleDragOrSettleWindow =
+          !this.lastReleaseWasWhipFlick && hoistedSessionDriveVSi < 0.95;
+        const rbQposAdr = this.map.blockQposAdr[rb!.id];
+        hoistedHasPostRelBlk = true;
+        hoistedRbX = qpos[rbQposAdr + 0];
+        hoistedRbY = qpos[rbQposAdr + 1];
+        hoistedRbZ = qpos[rbQposAdr + 2];
+        if (!this.lastReleaseWasWhipFlick && dtRel >= 0 && dtRel < 0.18) {
+          const uRel = dtRel / 0.18;
+          const postTargetCap = Math.min(0.95, rbHorizSi * 1.12 + 0.025);
+          hoistedPostRelDriveVSi = Math.min(
+            this.grabAtReleaseCapSi * (1.0 - uRel) + postTargetCap * uRel,
+            Math.max(0.04, this.grabAtReleaseCapSi)
+          );
+        } else {
+          hoistedPostRelDriveVSi = Math.min(1.35, rbHorizSi * 1.15);
+        }
+      }
+    }
+    const shardQposAdr = this.map.shardQposAdr;
+    const shardDofAdr = this.map.shardDofAdr;
+    const isActiveGeyserCollapse =
+      !this.hadFullSleepAfterCollapse &&
+      this.activeBlockId === null &&
+      !hasRecentUserImpulsedBlk &&
+      (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED');
+    const isApronCollapse =
+      this.activeBlockId === null &&
+      this.lastUserImpulsedBlockId < 0 &&
+      (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED');
+    const isPointerDraggingNow = this.activeBlockId !== null && this.isPointerDraggingBlock;
     for (let i = 0; i < this.shards.length; i++) {
       const s = this.shards[i];
-      const info = this.worldCompat.getMapping(s.bodyHandle);
       const treeId = bodyTreeId[s.bodyHandle];
       if (treeId >= 0 && treeAsleep[treeId] >= 0) {
         this.shardInContactPrevSubstep[s.slotIndex] = 0;
         continue;
       }
-      const qposAdr = this.map.shardQposAdr[s.slotIndex];
-      const dofAdr = this.map.shardDofAdr[s.slotIndex];
+      const info = this.getMappingFast(s.bodyHandle);
+      const qposAdr = shardQposAdr[s.slotIndex];
+      const dofAdr = shardDofAdr[s.slotIndex];
       const xM = qpos[qposAdr + 0];
       const yM = qpos[qposAdr + 1];
       const zM = qpos[qposAdr + 2];
@@ -7248,9 +8380,10 @@ export class MujocoPhysicsEngine {
       const collidesWithBlocks =
         geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD ||
         (geomConaffinity[s.colliderHandle] & MJ_CONTYPE_BLOCK) !== 0;
-      const contactBlockVSi = collidesWithBlocks
-        ? this.getContactingMovingBlockSpeedSi(xM, yM, zM)
-        : 0;
+      const contactBlockVSi =
+        collidesWithBlocks && this.awakeMovingBlockCount > 0
+          ? this.getContactingMovingBlockSpeedSi(xM, yM, zM)
+          : 0;
 
       // Guard first 20 substeps after Voronoi spawn against stiff inter-shard / rubble overlap-pop ejections
       if (s.quietSubsteps <= 20) {
@@ -7258,11 +8391,7 @@ export class MujocoPhysicsEngine {
           vy = 0.95;
           qvel[dofAdr + 1] = vy;
         }
-        const isMultiBlockCollapse =
-          this.sandboxCollapseActive ||
-          this.turnPhase === 'COLLAPSED' ||
-          this.shatteredCount >= 3;
-        if (isMultiBlockCollapse) {
+        if (isMultiBlockCollapseShd) {
           const vHoriz = Math.hypot(vx, vz);
           if (vHoriz > 1.15) {
             const kh = 1.15 / vHoriz;
@@ -7301,70 +8430,28 @@ export class MujocoPhysicsEngine {
         qfrcConstraint[dofAdr + 1],
         qfrcConstraint[dofAdr + 2]
       );
-      const isDirectNudgedShard = this.simTime - this.lastShardNudgeSimTime < 0.35;
       let activeDragBlockVSi = 0;
       let isNearActiveDragBlock = false;
       let isNearPostReleaseBlock = false;
-      let inGentleDragOrSettleWindow = false;
-      let sessionDriveVSi = 0;
-      if (this.activeBlockId !== null) {
-        const ab = this.blocks[this.activeBlockId];
-        const abInfo = ab && !ab.shattered ? this.worldCompat.getMapping(ab.bodyHandle) : null;
-        if (abInfo) {
-          const abHorizSi = Math.hypot(qvel[abInfo.dofAdr + 0], qvel[abInfo.dofAdr + 2]);
-          sessionDriveVSi = this.isPointerDraggingBlock
-            ? this.grabSmoothedPointerSpeedMps
-            : Math.min(0.30, abHorizSi);
-          inGentleDragOrSettleWindow = sessionDriveVSi < 0.95;
-          const abQposAdr = this.map.blockQposAdr[ab!.id];
-          if (
-            Math.abs(xM - qpos[abQposAdr + 0]) < 0.34 &&
-            Math.abs(zM - qpos[abQposAdr + 2]) < 0.34 &&
-            Math.abs(yM - qpos[abQposAdr + 1]) < 0.135
-          ) {
-            isNearActiveDragBlock = true;
-            activeDragBlockVSi = this.isPointerDraggingBlock
-              ? Math.min(0.95, Math.max(0.035, this.grabSmoothedPointerSpeedMps * 1.04 + 0.02))
-              : Math.min(0.45, abHorizSi * 1.15);
-          }
+      const inGentleDragOrSettleWindow = hoistedInGentleDragOrSettleWindow;
+      const sessionDriveVSi = hoistedSessionDriveVSi;
+      if (hoistedHasActiveBlk) {
+        if (
+          Math.abs(xM - hoistedAbX) < 0.34 &&
+          Math.abs(zM - hoistedAbZ) < 0.34 &&
+          Math.abs(yM - hoistedAbY) < 0.135
+        ) {
+          isNearActiveDragBlock = true;
+          activeDragBlockVSi = hoistedActiveDriveVSi;
         }
-      } else if (
-        this.lastUserImpulsedBlockId >= 0 &&
-        this.simTime - this.lastUserImpulsedSimTime < 1.8
-      ) {
-        const rb = this.blocks[this.lastUserImpulsedBlockId];
-        const rbInfo = rb && !rb.shattered ? this.worldCompat.getMapping(rb.bodyHandle) : null;
-        if (rbInfo) {
-          const rbHorizSi = Math.hypot(qvel[rbInfo.dofAdr + 0], qvel[rbInfo.dofAdr + 2]);
-          const dtRel =
-            this.lastEndGrabSimTime >= 0 ? this.simTime - this.lastEndGrabSimTime : 9.0;
-          sessionDriveVSi =
-            !this.lastReleaseWasWhipFlick && dtRel < 0.18
-              ? Math.min(
-                  rbHorizSi,
-                  this.grabAtReleasePointerSpeedMps * (1.0 - dtRel / 0.18) +
-                    rbHorizSi * (dtRel / 0.18)
-                )
-              : rbHorizSi;
-          inGentleDragOrSettleWindow = !this.lastReleaseWasWhipFlick && sessionDriveVSi < 0.95;
-          const rbQposAdr = this.map.blockQposAdr[rb!.id];
-          if (
-            Math.abs(xM - qpos[rbQposAdr + 0]) < 0.30 &&
-            Math.abs(zM - qpos[rbQposAdr + 2]) < 0.30 &&
-            Math.abs(yM - qpos[rbQposAdr + 1]) < 0.125
-          ) {
-            isNearPostReleaseBlock = true;
-            if (!this.lastReleaseWasWhipFlick && dtRel >= 0 && dtRel < 0.18) {
-              const uRel = dtRel / 0.18;
-              const postTargetCap = Math.min(0.95, rbHorizSi * 1.12 + 0.025);
-              activeDragBlockVSi = Math.min(
-                this.grabAtReleaseCapSi * (1.0 - uRel) + postTargetCap * uRel,
-                Math.max(0.04, this.grabAtReleaseCapSi)
-              );
-            } else {
-              activeDragBlockVSi = Math.min(1.35, rbHorizSi * 1.15);
-            }
-          }
+      } else if (hoistedHasPostRelBlk) {
+        if (
+          Math.abs(xM - hoistedRbX) < 0.30 &&
+          Math.abs(zM - hoistedRbZ) < 0.30 &&
+          Math.abs(yM - hoistedRbY) < 0.125
+        ) {
+          isNearPostReleaseBlock = true;
+          activeDragBlockVSi = hoistedPostRelDriveVSi;
         }
       }
 
@@ -7410,25 +8497,18 @@ export class MujocoPhysicsEngine {
         yM > -0.025 &&
         yM < 0.145
       ) {
-        const vxPreSi = s.preLinVel[0] * INV_FROUDE_VEL_SCALE;
-        const vyPreSi = s.preLinVel[1] * INV_FROUDE_VEL_SCALE;
-        const vzPreSi = s.preLinVel[2] * INV_FROUDE_VEL_SCALE;
-        const vPreSi = Math.hypot(vxPreSi, vyPreSi, vzPreSi);
-        const wPreSi =
-          Math.hypot(s.preAngVel[0], s.preAngVel[1], s.preAngVel[2]) * FROUDE_VEL_SCALE;
-        const isActiveCollapse =
-          !this.hadFullSleepAfterCollapse &&
-          this.activeBlockId === null &&
-          !(
-            this.lastUserImpulsedBlockId >= 0 &&
-            this.simTime - this.lastUserImpulsedSimTime < 1.8
-          ) &&
-          (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED');
+        const isActiveCollapse = isActiveCollapseShd;
         const hasBlockPlowContext =
           !isDirectNudgedShard &&
           (isNearActiveDragBlock || isNearPostReleaseBlock || contactBlockVSi > 0.008);
+        const vxPreSi = s.preLinVel[0] * INV_FROUDE_VEL_SCALE;
+        const vyPreSi = s.preLinVel[1] * INV_FROUDE_VEL_SCALE;
+        const vzPreSi = s.preLinVel[2] * INV_FROUDE_VEL_SCALE;
 
         if (!isActiveCollapse && hasBlockPlowContext && vyPreSi >= -0.85) {
+          const vPreSi = Math.hypot(vxPreSi, vyPreSi, vzPreSi);
+          const wPreSi =
+            Math.hypot(s.preAngVel[0], s.preAngVel[1], s.preAngVel[2]) * FROUDE_VEL_SCALE;
           const driveVSi = Math.max(contactBlockVSi, activeDragBlockVSi);
           const vNewtonCapSi = 1.32 * driveVSi + 0.045;
           const maxAllowedSpSi = isNearActiveDragBlock
@@ -7487,84 +8567,218 @@ export class MujocoPhysicsEngine {
 
           // 2A: Temporary Multi-Body Cullet Wedge Escape (`0x22 -> 0x20` for 0.20 s, strictly outside
           // open-field single-block perimeter plows unless trapped under a block's belly or `>= 2` block jaw!)
+          const fBlkNormalN = this.shardBlockNormalN[s.slotIndex];
+          const fTblNormalN = this.shardTableNormalN[s.slotIndex];
+          const fUnderbellyPairN = Math.min(fBlkNormalN, fTblNormalN);
+          const fCompressivePinchN = Math.max(fConMag, fUnderbellyPairN, fBlkNormalN);
+          const decayPinch = (): void => {
+            const dtSincePinch = this.simTime - this.shardLastPinchSimTime[s.slotIndex];
+            if (dtSincePinch <= 0.055) return;
+            if (dtSincePinch > 0.12) {
+              this.shardPinchSubsteps[s.slotIndex] = 0;
+            } else {
+              this.shardPinchSubsteps[s.slotIndex] = Math.max(
+                0,
+                this.shardPinchSubsteps[s.slotIndex] - 1
+              );
+            }
+          };
           if (
-            (isNearActiveDragBlock || isNearPostReleaseBlock) &&
-            (fConMag > 1.2 || spPostSi > maxAllowedSpSi + 0.30)
+            (isNearActiveDragBlock || (isNearPostReleaseBlock && activeDragBlockVSi >= 0.045)) &&
+            (fCompressivePinchN > 1.15 || spPostSi > maxAllowedSpSi + 0.30)
           ) {
             let nearIntactBlocks = 0;
+            let hasUnderbellyWedge = false;
+            const checkUnderbelly = fUnderbellyPairN > 1.15;
+            const gidS = s.colliderHandle;
+            const sxGeomM = geomXpos ? geomXpos[gidS * 3 + 0] : xM;
+            const syGeomM = geomXpos ? geomXpos[gidS * 3 + 1] : yM;
+            const szGeomM = geomXpos ? geomXpos[gidS * 3 + 2] : zM;
+            let shdHalfYDm = 0.02;
+            if (geomAabb && geomXmat) {
+              const ab = gidS * 6;
+              const xm = gidS * 9;
+              shdHalfYDm =
+                (Math.abs(geomXmat[xm + 3]) * geomAabb[ab + 3] +
+                  Math.abs(geomXmat[xm + 4]) * geomAabb[ab + 4] +
+                  Math.abs(geomXmat[xm + 5]) * geomAabb[ab + 5]) *
+                DM_PER_M;
+            }
             for (let bi = 0; bi < this.blocks.length; bi++) {
               const ob = this.blocks[bi];
               if (ob.shattered || ob.extracted) continue;
               const obAdr = this.map.blockQposAdr[ob.id];
               if (obAdr === undefined) continue;
-              const dxM = xM - qpos[obAdr + 0];
-              const dyM = yM - qpos[obAdr + 1];
-              const dzM = zM - qpos[obAdr + 2];
-              if (Math.abs(dxM) > 0.056 || Math.abs(dzM) > 0.056 || Math.abs(dyM) > 0.040) {
+              const dxM = sxGeomM - qpos[obAdr + 0];
+              const dyM = syGeomM - qpos[obAdr + 1];
+              const dzM = szGeomM - qpos[obAdr + 2];
+              if (Math.abs(dxM) > 0.064 || Math.abs(dzM) > 0.064 || Math.abs(dyM) > 0.064) {
                 continue;
               }
-              const bQuat: Quat = [
-                qpos[obAdr + 4],
-                qpos[obAdr + 5],
-                qpos[obAdr + 6],
-                qpos[obAdr + 3],
-              ];
-              const locDm = quatInverseRotateVec3(bQuat, [
-                dxM * DM_PER_M,
-                dyM * DM_PER_M,
-                dzM * DM_PER_M,
-              ]);
+              const qx = -qpos[obAdr + 4];
+              const qy = -qpos[obAdr + 5];
+              const qz = -qpos[obAdr + 6];
+              const qw = qpos[obAdr + 3];
+              const lvx = dxM * DM_PER_M;
+              const lvy = dyM * DM_PER_M;
+              const lvz = dzM * DM_PER_M;
+              const ltx = 2 * (qy * lvz - qz * lvy);
+              const lty = 2 * (qz * lvx - qx * lvz);
+              const ltz = 2 * (qx * lvy - qy * lvx);
+              const locX = lvx + qw * ltx + (qy * ltz - qz * lty);
+              const locY = lvy + qw * lty + (qz * ltx - qx * ltz);
+              const locZ = lvz + qw * ltz + (qx * lty - qy * ltx);
               if (
-                Math.abs(locDm[0]) < BLOCK_HALF_X + 0.15 &&
-                Math.abs(locDm[1]) < BLOCK_HALF_Y + 0.14 &&
-                Math.abs(locDm[2]) < BLOCK_HALF_Z + 0.15
+                Math.abs(locX) < BLOCK_HALF_X + 0.15 &&
+                Math.abs(locY) < BLOCK_HALF_Y + 0.14 &&
+                Math.abs(locZ) < BLOCK_HALF_Z + 0.15
               ) {
                 nearIntactBlocks++;
-                if (nearIntactBlocks >= 2) break;
+                if (!hasUnderbellyWedge && dyM < -0.0005 && checkUnderbelly) {
+                  // Downward world direction [0, -1, 0] in block-local coordinates: R^T * [0, -1, 0]
+                  const downLocalX = 2 * (qw * qz - qx * qy);
+                  const downLocalY = -1 + 2 * (qx * qx + qz * qz);
+                  const downLocalZ = -2 * (qw * qx + qy * qz);
+                  const depthDownDm = -dyM * DM_PER_M;
+                  const blkHalfYDm =
+                    Math.abs(downLocalX) * BLOCK_HALF_X +
+                    Math.abs(downLocalY) * BLOCK_HALF_Y +
+                    Math.abs(downLocalZ) * BLOCK_HALF_Z;
+                  if (depthDownDm + shdHalfYDm > blkHalfYDm * 0.55) {
+                    // Vertical ray-slab intersection from shard geom center straight UP (-downLocal)
+                    // into the block OBB inset by 0.8-1.2 mm perimeter margins: gives 100% SO(3) coverage
+                    // (including tri-axial tilts & 6 mm off-center narrow-face contacts) and handles thick
+                    // shards (`hy = 5-7.2 mm`) compressed toward the block midplane while strictly
+                    // excluding frontal/side plows outside the block footprint.
+                    const limX = BLOCK_HALF_X - 0.012;
+                    const limY = BLOCK_HALF_Y - 0.008;
+                    const limZ = BLOCK_HALF_Z - 0.010;
+                    let tMin = 0.0;
+                    let tMax = 1e6;
+                    let rayHit = true;
+                    if (Math.abs(downLocalX) < 1e-6) {
+                      if (Math.abs(locX) >= limX) rayHit = false;
+                    } else {
+                      const inv = -1.0 / downLocalX;
+                      let t1 = (-limX - locX) * inv;
+                      let t2 = (limX - locX) * inv;
+                      if (t1 > t2) {
+                        const tmp = t1;
+                        t1 = t2;
+                        t2 = tmp;
+                      }
+                      if (t1 > tMin) tMin = t1;
+                      if (t2 < tMax) tMax = t2;
+                      if (tMin > tMax) rayHit = false;
+                    }
+                    if (rayHit) {
+                      if (Math.abs(downLocalY) < 1e-6) {
+                        if (Math.abs(locY) >= limY) rayHit = false;
+                      } else {
+                        const inv = -1.0 / downLocalY;
+                        let t1 = (-limY - locY) * inv;
+                        let t2 = (limY - locY) * inv;
+                        if (t1 > t2) {
+                          const tmp = t1;
+                          t1 = t2;
+                          t2 = tmp;
+                        }
+                        if (t1 > tMin) tMin = t1;
+                        if (t2 < tMax) tMax = t2;
+                        if (tMin > tMax) rayHit = false;
+                      }
+                    }
+                    if (rayHit) {
+                      if (Math.abs(downLocalZ) < 1e-6) {
+                        if (Math.abs(locZ) >= limZ) rayHit = false;
+                      } else {
+                        const inv = -1.0 / downLocalZ;
+                        let t1 = (-limZ - locZ) * inv;
+                        let t2 = (limZ - locZ) * inv;
+                        if (t1 > t2) {
+                          const tmp = t1;
+                          t1 = t2;
+                          t2 = tmp;
+                        }
+                        if (t1 > tMin) tMin = t1;
+                        if (t2 < tMax) tMax = t2;
+                        if (tMin > tMax) rayHit = false;
+                      }
+                    }
+                    if (rayHit && tMax > 0.0) {
+                      hasUnderbellyWedge = true;
+                    }
+                  }
+                }
+                if (nearIntactBlocks >= 2 && hasUnderbellyWedge) break;
               }
             }
+            (s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks = nearIntactBlocks;
+            (s as unknown as { hasUnderbellyWedge?: boolean }).hasUnderbellyWedge = hasUnderbellyWedge;
 
             if (
-              nearIntactBlocks >= 2 &&
+              (nearIntactBlocks >= 2 || (nearIntactBlocks === 1 && hasUnderbellyWedge)) &&
               geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD
             ) {
-              this.demotePinchedHeroShardIfWedged(s, Math.max(fConMag, 2.5));
+              this.demotePinchedHeroShardIfWedged(
+                s,
+                nearIntactBlocks === 1 && hasUnderbellyWedge
+                  ? Math.max(fUnderbellyPairN, mShd * 301.0)
+                  : Math.max(fCompressivePinchN, 2.5),
+                nearIntactBlocks === 1 && hasUnderbellyWedge
+              );
             }
 
             if (
               geomContype[s.colliderHandle] === MJ_CONTYPE_CULLET_SHARD &&
               (geomConaffinity[s.colliderHandle] & MJ_CONTYPE_BLOCK) !== 0
             ) {
-              const minPinchN = Math.max(2.2, mShd * 360.0);
+              const minJawPinchN = Math.min(2.6, Math.max(1.8, mShd * 180.0));
               const isMultiBlockPinch =
-                nearIntactBlocks >= 2 &&
-                (fConMag > minPinchN || spPostSi > maxAllowedSpSi + 0.38);
+                (nearIntactBlocks === 1 && hasUnderbellyWedge) ||
+                (nearIntactBlocks >= 2 &&
+                  (Math.max(fConMag, fBlkNormalN) > minJawPinchN ||
+                    spPostSi > maxAllowedSpSi + 0.38));
               if (isMultiBlockPinch) {
-                const pCount = Math.min(255, this.shardPinchSubsteps[s.slotIndex] + 1);
+                const pinchDriveN =
+                  nearIntactBlocks === 1 && hasUnderbellyWedge
+                    ? fUnderbellyPairN
+                    : Math.max(fConMag, fBlkNormalN);
+                const pinchInc = pinchDriveN > 8.0 ? 2 : 1;
+                const pCount = Math.min(255, this.shardPinchSubsteps[s.slotIndex] + pinchInc);
                 this.shardPinchSubsteps[s.slotIndex] = pCount;
+                this.shardLastPinchSimTime[s.slotIndex] = this.simTime;
                 if (pCount >= 4) {
                   const offRimEsc = Math.hypot(xM, zM) > (TABLE_RADIUS + 0.01) * M_PER_DM;
                   const escCaff = offRimEsc
                     ? MJ_CONAFFINITY_CULLET_OFF_RIM
                     : MJ_CONAFFINITY_CULLET_ON_TABLE;
-                  setBodyGeomCollisionMask(
-                    m,
+                  this.setBodyGeomCollisionMaskCached(
                     s.bodyHandle,
                     s.colliderHandle,
                     MJ_CONTYPE_CULLET_SHARD,
                     escCaff
                   );
-                  this.worldCompat.markShardActive(
-                    s.bodyHandle,
-                    true,
-                    MJ_CONTYPE_CULLET_SHARD,
-                    escCaff
-                  );
+                  if (info) {
+                    info.enabled = true;
+                    info.settledAsleep = false;
+                    info.quietTicks = 0;
+                    info.savedContype = MJ_CONTYPE_CULLET_SHARD;
+                    info.savedConaffinity = escCaff;
+                  } else {
+                    this.worldCompat.markShardActive(
+                      s.bodyHandle,
+                      true,
+                      MJ_CONTYPE_CULLET_SHARD,
+                      escCaff
+                    );
+                  }
                   if (this.shardWedgeCooldownUntilSim[s.slotIndex] <= -5) {
                     this.activeWedgeEscapeCount++;
                   }
                   this.shardWedgeCooldownUntilSim[s.slotIndex] = this.simTime + 0.20;
                   this.shardPinchSubsteps[s.slotIndex] = 0;
+                  this.shardLastPinchSimTime[s.slotIndex] = -10;
 
                   const escSpCap = Math.max(0.02, driveVSi);
                   const curSp = Math.hypot(vx, vy, vz);
@@ -7591,27 +8805,39 @@ export class MujocoPhysicsEngine {
                   qvel[dofAdr + 5] = wz;
                 }
               } else {
-                this.shardPinchSubsteps[s.slotIndex] = 0;
+                decayPinch();
               }
             }
           } else {
-            this.shardPinchSubsteps[s.slotIndex] = 0;
+            if ((s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks !== undefined) {
+              (s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks = 0;
+              (s as unknown as { hasUnderbellyWedge?: boolean }).hasUnderbellyWedge = false;
+            }
+            decayPinch();
           }
         } else if (
           !isActiveCollapse &&
           !isDirectNudgedShard &&
           vyPreSi > -0.26 &&
           fConMag >
-            (this.activeBlockId !== null ||
-            (this.lastUserImpulsedBlockId >= 0 &&
-              this.simTime - this.lastUserImpulsedSimTime < 1.8)
+            (this.activeBlockId !== null || hasRecentUserImpulsedBlk
               ? mShd * 48.0
               : Math.max(1.8, mShd * 320.0))
         ) {
-          this.shardPinchSubsteps[s.slotIndex] = 0;
+          if ((s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks !== undefined) {
+            (s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks = 0;
+            (s as unknown as { hasUnderbellyWedge?: boolean }).hasUnderbellyWedge = false;
+          }
+          if (this.simTime - this.shardLastPinchSimTime[s.slotIndex] > 0.055) {
+            this.shardPinchSubsteps[s.slotIndex] = Math.max(
+              0,
+              this.shardPinchSubsteps[s.slotIndex] - 1
+            );
+          }
           if (fConMag > Math.max(1.6, mShd * 300.0)) {
             this.demotePinchedHeroShardIfWedged(s, fConMag);
           }
+          const vPreSi = Math.hypot(vxPreSi, vyPreSi, vzPreSi);
           const spPostSi = Math.hypot(vx, vy, vz);
           const maxPinchV = Math.max(0.22, vPreSi * 0.96);
           if (spPostSi > maxPinchV + 0.02 && spPostSi > 1e-6) {
@@ -7626,6 +8852,8 @@ export class MujocoPhysicsEngine {
               vy = 0.08;
               qvel[dofAdr + 1] = vy;
             }
+            const wPreSi =
+              Math.hypot(s.preAngVel[0], s.preAngVel[1], s.preAngVel[2]) * FROUDE_VEL_SCALE;
             const wPostSi = Math.hypot(wx, wy, wz);
             const maxPinchW = Math.max(12.0, wPreSi * 0.92);
             if (wPostSi > maxPinchW && wPostSi > 1e-6) {
@@ -7639,11 +8867,22 @@ export class MujocoPhysicsEngine {
             }
           }
         } else if (!isDirectNudgedShard && (isActiveCollapse || contactBlockVSi > 0.008)) {
-          const spPostSi = Math.hypot(vx, vy, vz);
+          if ((s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks !== undefined) {
+            (s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks = 0;
+            (s as unknown as { hasUnderbellyWedge?: boolean }).hasUnderbellyWedge = false;
+          }
+          if (this.simTime - this.shardLastPinchSimTime[s.slotIndex] > 0.055) {
+            this.shardPinchSubsteps[s.slotIndex] = Math.max(
+              0,
+              this.shardPinchSubsteps[s.slotIndex] - 1
+            );
+          }
           const refBlockVSi = Math.max(
             contactBlockVSi,
             Math.min(0.55, maxAwakeBlockVSi * 0.45)
           );
+          const vPreSi = Math.hypot(vxPreSi, vyPreSi, vzPreSi);
+          const spPostSi = Math.hypot(vx, vy, vz);
           const vMaxPhys = Math.max(vPreSi + 0.04, 1.95 * refBlockVSi + 0.16);
           if (spPostSi > vMaxPhys + 0.35) {
             const capSi = Math.max(vPreSi, 1.15 * refBlockVSi);
@@ -7654,6 +8893,8 @@ export class MujocoPhysicsEngine {
             qvel[dofAdr + 0] = vx;
             qvel[dofAdr + 1] = vy;
             qvel[dofAdr + 2] = vz;
+            const wPreSi =
+              Math.hypot(s.preAngVel[0], s.preAngVel[1], s.preAngVel[2]) * FROUDE_VEL_SCALE;
             const wPostSi = Math.hypot(wx, wy, wz);
             if (wPostSi > Math.max(12.0, wPreSi + 4.0)) {
               const kwClamp = Math.max(12.0, wPreSi) / wPostSi;
@@ -7666,6 +8907,17 @@ export class MujocoPhysicsEngine {
             }
             this.demotePinchedHeroShardIfWedged(s, fConMag);
           }
+        } else {
+          if ((s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks !== undefined) {
+            (s as unknown as { nearIntactBlocks?: number }).nearIntactBlocks = 0;
+            (s as unknown as { hasUnderbellyWedge?: boolean }).hasUnderbellyWedge = false;
+          }
+          if (this.simTime - this.shardLastPinchSimTime[s.slotIndex] > 0.055) {
+            this.shardPinchSubsteps[s.slotIndex] = Math.max(
+              0,
+              this.shardPinchSubsteps[s.slotIndex] - 1
+            );
+          }
         }
       }
       if (yM < 0.032 && vy > 0.95) {
@@ -7674,16 +8926,7 @@ export class MujocoPhysicsEngine {
       }
       // 1D: Rimward shard geyser cap during active collapse (`rHorizM > 0.29 && yM > 0.032` -> `vy <= 0.58 m/s`,
       // keeping rim shard apex `< 8.5 cm` while leaving center-table T9 26 cm drop rebound 100% untouched!).
-      if (
-        yM > 0.032 &&
-        !this.hadFullSleepAfterCollapse &&
-        this.activeBlockId === null &&
-        !(
-          this.lastUserImpulsedBlockId >= 0 &&
-          this.simTime - this.lastUserImpulsedSimTime < 1.8
-        ) &&
-        (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED')
-      ) {
+      if (yM > 0.032 && isActiveGeyserCollapse) {
         const rGeyserM = Math.hypot(xM, zM);
         if (rGeyserM > 0.21) {
           const vyRimCap = Math.min(
@@ -7696,13 +8939,7 @@ export class MujocoPhysicsEngine {
           }
         }
       }
-      if (
-        yM > -0.005 &&
-        yM < 0.026 &&
-        this.activeBlockId === null &&
-        this.lastUserImpulsedBlockId < 0 &&
-        (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED')
-      ) {
+      if (yM > -0.005 && yM < 0.026 && isApronCollapse) {
         const rApronM = Math.hypot(xM, zM);
         if (rApronM > 0.29 && rApronM < 0.420) {
           const ux = xM / rApronM;
@@ -7727,12 +8964,7 @@ export class MujocoPhysicsEngine {
         yM > -0.02 &&
         yM < 0.135
       ) {
-        if (
-          this.activeBlockId !== null &&
-          this.isPointerDraggingBlock &&
-          sessionDriveVSi < 0.06 &&
-          yM < 0.095
-        ) {
+        if (isPointerDraggingNow && sessionDriveVSi < 0.06 && yM < 0.095) {
           const uPause = Math.max(0.0, Math.min(1.0, (sessionDriveVSi - 0.015) / 0.045));
           const pauseSpCap = 0.08 + uPause * 0.34;
           const spPause = Math.hypot(vx, vy, vz);
@@ -7776,7 +9008,7 @@ export class MujocoPhysicsEngine {
             }
           }
           const spDragCap = 1.38 * sessionDriveVSi + 0.11;
-          if (this.activeBlockId !== null && this.isPointerDraggingBlock) {
+          if (isPointerDraggingNow) {
             const spCurDrag = Math.hypot(vx, vy, vz);
             if (spCurDrag > Math.max(0.24, spDragCap) && spCurDrag > 1e-6) {
               const kd = Math.max(0.24, spDragCap) / spCurDrag;
@@ -7945,7 +9177,11 @@ export class MujocoPhysicsEngine {
         }
         continue;
       }
-      const hasUpwardSupport = isDirectTableContact || noSup <= 4;
+      const isWedgeEscapedMidAir =
+        !isDirectTableContact &&
+        geomContype[s.colliderHandle] === MJ_CONTYPE_CULLET_SHARD &&
+        (geomConaffinity[s.colliderHandle] & MJ_CONTYPE_BLOCK) === 0;
+      const hasUpwardSupport = isDirectTableContact || (!isWedgeEscapedMidAir && noSup <= 4);
       const onTableRim = xM * xM + zM * zM <= shardRimM2;
       // Bleed high-frequency vertex top-spin strictly during verified upward tabletop/block contact after initial bounce window (`> 180` substeps)
       if (
@@ -7991,10 +9227,10 @@ export class MujocoPhysicsEngine {
         s.quietSubsteps > 220 &&
         geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD
       ) {
-        const offRimClamp = Math.hypot(qpos[qposAdr + 0], qpos[qposAdr + 2]) > (TABLE_RADIUS + 0.01) * M_PER_DM;
+        const offRimClamp =
+          xM * xM + zM * zM > (TABLE_RADIUS + 0.01) * M_PER_DM * ((TABLE_RADIUS + 0.01) * M_PER_DM);
         const caffClamp = this.getCulletConaffinity(offRimClamp);
-        setBodyGeomCollisionMask(
-          m,
+        this.setBodyGeomCollisionMaskCached(
           s.bodyHandle,
           s.colliderHandle,
           MJ_CONTYPE_CULLET_SHARD,
@@ -8003,9 +9239,11 @@ export class MujocoPhysicsEngine {
         this.worldCompat.markShardActive(s.bodyHandle, true, MJ_CONTYPE_CULLET_SHARD, caffClamp);
         const bid3 = s.bodyHandle * 3;
         const iIso =
-          (m.body_inertia[bid3 + 0] + m.body_inertia[bid3 + 1] + m.body_inertia[bid3 + 2]) / 3.0;
-        updateFreeBodyMassAndInertiaO1(
-          m,
+          (this.vcBodyInertia[bid3 + 0] +
+            this.vcBodyInertia[bid3 + 1] +
+            this.vcBodyInertia[bid3 + 2]) /
+          3.0;
+        this.updateFreeBodyMassAndInertiaCached(
           s.bodyHandle,
           dofAdr,
           bodyMass[s.bodyHandle],
@@ -8032,27 +9270,83 @@ export class MujocoPhysicsEngine {
         !info?.settledAsleep &&
         yM > -0.006 &&
         yM < 0.052 &&
-        s.quietSubsteps > 170
+        s.quietSubsteps > 170 &&
+        xM >= lowBlkMinXM - 0.052 &&
+        xM <= lowBlkMaxXM + 0.052 &&
+        zM >= lowBlkMinZM - 0.052 &&
+        zM <= lowBlkMaxZM + 0.052
       ) {
-        for (let bi = 0; bi < lowIntactBlkCount; bi++) {
-          const obY = this.lowIntactBlkYM[bi];
-          if (
-            obY > yM - 0.004 &&
-            obY < yM + 0.055 &&
-            Math.abs(this.lowIntactBlkXM[bi] - xM) < 0.052 &&
-            Math.abs(this.lowIntactBlkZM[bi] - zM) < 0.052
-          ) {
-            sandwichedUnderSettlingBlock = true;
-            if (geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD && s.quietSubsteps > 280) {
-              const offRimSand = Math.hypot(xM, zM) > (TABLE_RADIUS + 0.01) * M_PER_DM;
-              const caffSand = this.getCulletConaffinity(offRimSand);
-              setBodyGeomCollisionMask(
-                m,
-                s.bodyHandle,
-                s.colliderHandle,
-                MJ_CONTYPE_CULLET_SHARD,
-                caffSand
-              );
+        let matchedBi = -1;
+        if (lowIntactBlkCount <= 64) {
+          const qcx = Math.max(0, Math.min(15, ((xM + 0.50) * 16.0) | 0));
+          const qcz = Math.max(0, Math.min(15, ((zM + 0.50) * 16.0) | 0));
+          const cellIdx = (qcz << 4) | qcx;
+          let maskLo = this.lowBlkCellLo[cellIdx];
+          let maskHi = this.lowBlkCellHi[cellIdx];
+          while (maskLo !== 0) {
+            const lsb = maskLo & -maskLo;
+            const bi = 31 - Math.clz32(lsb);
+            maskLo ^= lsb;
+            const obY = this.lowIntactBlkYM[bi];
+            if (
+              obY > yM - 0.004 &&
+              obY < yM + 0.055 &&
+              Math.abs(this.lowIntactBlkXM[bi] - xM) < 0.052 &&
+              Math.abs(this.lowIntactBlkZM[bi] - zM) < 0.052
+            ) {
+              matchedBi = bi;
+              break;
+            }
+          }
+          if (matchedBi < 0) {
+            while (maskHi !== 0) {
+              const lsb = maskHi & -maskHi;
+              const bi = 32 + (31 - Math.clz32(lsb));
+              maskHi ^= lsb;
+              const obY = this.lowIntactBlkYM[bi];
+              if (
+                obY > yM - 0.004 &&
+                obY < yM + 0.055 &&
+                Math.abs(this.lowIntactBlkXM[bi] - xM) < 0.052 &&
+                Math.abs(this.lowIntactBlkZM[bi] - zM) < 0.052
+              ) {
+                matchedBi = bi;
+                break;
+              }
+            }
+          }
+        } else {
+          for (let bi = 0; bi < lowIntactBlkCount; bi++) {
+            const obY = this.lowIntactBlkYM[bi];
+            if (
+              obY > yM - 0.004 &&
+              obY < yM + 0.055 &&
+              Math.abs(this.lowIntactBlkXM[bi] - xM) < 0.052 &&
+              Math.abs(this.lowIntactBlkZM[bi] - zM) < 0.052
+            ) {
+              matchedBi = bi;
+              break;
+            }
+          }
+        }
+        if (matchedBi >= 0) {
+          sandwichedUnderSettlingBlock = true;
+          if (geomContype[s.colliderHandle] === MJ_CONTYPE_HERO_SHARD && s.quietSubsteps > 280) {
+            const offRimSand = Math.hypot(xM, zM) > (TABLE_RADIUS + 0.01) * M_PER_DM;
+            const caffSand = this.getCulletConaffinity(offRimSand);
+            this.setBodyGeomCollisionMaskCached(
+              s.bodyHandle,
+              s.colliderHandle,
+              MJ_CONTYPE_CULLET_SHARD,
+              caffSand
+            );
+            if (info) {
+              info.enabled = true;
+              info.settledAsleep = false;
+              info.quietTicks = 0;
+              info.savedContype = MJ_CONTYPE_CULLET_SHARD;
+              info.savedConaffinity = caffSand;
+            } else {
               this.worldCompat.markShardActive(
                 s.bodyHandle,
                 true,
@@ -8060,20 +9354,19 @@ export class MujocoPhysicsEngine {
                 caffSand
               );
             }
-            vx *= 0.35;
-            vy *= 0.18;
-            vz *= 0.35;
-            wx *= 0.28;
-            wy *= 0.28;
-            wz *= 0.28;
-            qvel[dofAdr + 0] = vx;
-            qvel[dofAdr + 1] = vy;
-            qvel[dofAdr + 2] = vz;
-            qvel[dofAdr + 3] = wx;
-            qvel[dofAdr + 4] = wy;
-            qvel[dofAdr + 5] = wz;
-            break;
           }
+          vx *= 0.35;
+          vy *= 0.18;
+          vz *= 0.35;
+          wx *= 0.28;
+          wy *= 0.28;
+          wz *= 0.28;
+          qvel[dofAdr + 0] = vx;
+          qvel[dofAdr + 1] = vy;
+          qvel[dofAdr + 2] = vz;
+          qvel[dofAdr + 3] = wx;
+          qvel[dofAdr + 4] = wy;
+          qvel[dofAdr + 5] = wz;
         }
       }
       const vSi = Math.hypot(vx, vy, vz);
@@ -8120,7 +9413,9 @@ export class MujocoPhysicsEngine {
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
         if (b.shattered || b.extracted || b.id === this.activeBlockId) continue;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
+        const treeId = bodyTreeId[b.bodyHandle];
+        if (treeId >= 0 && treeAsleep[treeId] >= 0) continue;
+        const info = this.getMappingFast(b.bodyHandle);
         if (!info || !info.enabled || info.settledAsleep) continue;
         const dof = info.dofAdr;
         const vx = qvel[dof + 0];
@@ -8186,9 +9481,7 @@ export class MujocoPhysicsEngine {
    * thermodynamically passive when newly generated 4-point box contacts relax minor interpenetrations.
    */
   private enforceMulticcdReentryPassivity(ePreReentryJ: number, dampFloorPop: boolean): void {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) return;
+    if (!this.ensureCachedViews()) return;
     const isPostAbortStackRelax =
       this.shards.length === 0 &&
       !this.sandboxCollapseActive &&
@@ -8199,13 +9492,13 @@ export class MujocoPhysicsEngine {
     let ePostReentryJ = this.computeMechanicalEnergyJ();
     if (ePostReentryJ <= ePreReentryJ + tolJ) return;
 
-    const qpos = d.qpos;
-    const qvel = d.qvel;
+    const qpos = this.vcQpos!;
+    const qvel = this.vcQvel!;
     if (dampFloorPop) {
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
         if (b.shattered || b.extracted) continue;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
+        const info = this.getMappingFast(b.bodyHandle);
         if (!info || !info.enabled || info.settledAsleep) continue;
         const yM = qpos[info.qposAdr + 1];
         const dof = info.dofAdr;
@@ -8218,13 +9511,13 @@ export class MujocoPhysicsEngine {
       if (ePostReentryJ <= ePreReentryJ + tolJ) return;
     }
 
-    const qfrcApplied = d.qfrc_applied;
-    const qfrcConstraint = d.qfrc_constraint;
-    const qaccWarm = d.qacc_warmstart;
-    const bodyMass = m.body_mass;
-    const bodyInertia = m.body_inertia;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
+    const qfrcApplied = this.vcQfrcApplied!;
+    const qfrcConstraint = this.vcQfrcConstraint!;
+    const qaccWarm = this.vcQaccWarm!;
+    const bodyMass = this.vcBodyMass!;
+    const bodyInertia = this.vcBodyInertia!;
+    const bodyTreeId = this.vcBodyTreeId!;
+    const treeAsleep = this.vcTreeAsleep!;
 
     const protectNudgedSlot =
       !this.lastStepWasUnforced && this.simTime - this.lastShardNudgeSimTime < 0.06
@@ -8264,7 +9557,7 @@ export class MujocoPhysicsEngine {
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
         if (b.shattered || b.extracted) continue;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
+        const info = this.getMappingFast(b.bodyHandle);
         if (info && info.enabled) {
           visit(b.bodyHandle, info.qposAdr, info.dofAdr, info.settledAsleep);
         }
@@ -8272,7 +9565,7 @@ export class MujocoPhysicsEngine {
       for (let i = 0; i < this.shards.length; i++) {
         const s = this.shards[i];
         if (skipNudged && s.slotIndex === protectNudgedSlot) continue;
-        const info = this.worldCompat.getMapping(s.bodyHandle);
+        const info = this.getMappingFast(s.bodyHandle);
         if (info && info.enabled) {
           visit(
             s.bodyHandle,
@@ -8330,9 +9623,7 @@ export class MujocoPhysicsEngine {
     maxVisibleShardSpeedSi: number;
     activeFallingBlocks: number;
   } {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) {
+    if (!this.ensureCachedViews()) {
       return {
         visibleAwakeTrees: 0,
         visibleAwakeBlocks: 0,
@@ -8342,12 +9633,12 @@ export class MujocoPhysicsEngine {
         activeFallingBlocks: 0,
       };
     }
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const qfrcApplied = d.qfrc_applied;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
-    const geomContype = m.geom_contype;
+    const qpos = this.vcQpos!;
+    const qvel = this.vcQvel!;
+    const qfrcApplied = this.vcQfrcApplied!;
+    const bodyTreeId = this.vcBodyTreeId!;
+    const treeAsleep = this.vcTreeAsleep!;
+    const geomContype = this.vcGeomContype!;
 
     let visibleAwakeTrees = 0;
     let visibleAwakeBlocks = 0;
@@ -8359,7 +9650,7 @@ export class MujocoPhysicsEngine {
     for (let i = 0; i < this.blocks.length; i++) {
       const b = this.blocks[i];
       if (b.shattered || b.extracted || geomContype[b.colliderHandle] === 0) continue;
-      const info = this.worldCompat.getMapping(b.bodyHandle);
+      const info = this.getMappingFast(b.bodyHandle);
       if (!info || !info.enabled) continue;
       const dof = info.dofAdr;
       const treeId = bodyTreeId[b.bodyHandle];
@@ -8408,19 +9699,22 @@ export class MujocoPhysicsEngine {
    * and transition cleanly into native sleeping islands (`d.tree_asleep >= 0`).
    */
   private preStepClampSettledVelocities(): void {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d || d.ntree_awake === 0) return;
+    if (!this.ensureCachedViews()) return;
+    const m = this.model!;
+    const d = this.data!;
+    if (d.ntree_awake === 0) return;
 
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const qacc = d.qacc;
-    const qaccWarm = d.qacc_warmstart;
-    const qfrcConstraint = d.qfrc_constraint;
-    const bodyMass = m.body_mass;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
-    const geomContype = m.geom_contype;
+    const qpos = this.vcQpos!;
+    const qvel = this.vcQvel!;
+    const qacc = this.vcQacc!;
+    const qaccWarm = this.vcQaccWarm!;
+    const qfrcApplied = this.vcQfrcApplied!;
+    const qfrcConstraint = this.vcQfrcConstraint!;
+    const bodyMass = this.vcBodyMass!;
+    const bodyTreeId = this.vcBodyTreeId!;
+    const treeAsleep = this.vcTreeAsleep!;
+    const geomContype = this.vcGeomContype!;
+    const bodyGeomAdr = m.body_geomadr;
 
     // 1. Settle any awake underground parked bodies (`y < -10 m`) on `parking_shelf` in O(awakeParked) time
     for (let i = this.awakeParkedBodies.length - 1; i >= 0; i--) {
@@ -8428,7 +9722,7 @@ export class MujocoPhysicsEngine {
       const treeId = bodyTreeId[entry.bodyId];
       if (
         (treeId >= 0 && treeAsleep[treeId] >= 0) ||
-        geomContype[m.body_geomadr[entry.bodyId]] !== 0 ||
+        geomContype[bodyGeomAdr[entry.bodyId]] !== 0 ||
         qpos[entry.qposAdr + 1] > -10.0
       ) {
         this.awakeParkedBodies.splice(i, 1);
@@ -8456,12 +9750,12 @@ export class MujocoPhysicsEngine {
     }
     const shardRimM = (TABLE_RADIUS + 0.008) * M_PER_DM;
     const shardRimM2 = shardRimM * shardRimM;
-    const geomAabb = this.shards.length > 0 ? m.geom_aabb : null;
-    const geomXpos = this.shards.length > 0 ? d.geom_xpos : null;
-    const geomXmat = this.shards.length > 0 ? d.geom_xmat : null;
+    const geomAabb = this.shards.length > 0 ? this.vcGeomAabb : null;
+    const geomXpos = this.shards.length > 0 ? this.vcGeomXpos : null;
+    const geomXmat = this.shards.length > 0 ? this.vcGeomXmat : null;
     for (let i = 0; i < this.shards.length; i++) {
       const s = this.shards[i];
-      const info = this.worldCompat.getMapping(s.bodyHandle);
+      const info = this.getMappingFast(s.bodyHandle);
       if (!info || !info.settledAsleep) continue;
       const treeId = bodyTreeId[s.bodyHandle];
       if (treeId >= 0 && treeAsleep[treeId] >= 0) {
@@ -8473,7 +9767,7 @@ export class MujocoPhysicsEngine {
       const yM = qpos[qposAdr + 1];
       const zM = qpos[qposAdr + 2];
       if (
-        d.qfrc_applied[dofAdr + 1] !== 0 ||
+        qfrcApplied[dofAdr + 1] !== 0 ||
         this.getContactingMovingBlockSpeedSi(xM, yM, zM) >= 0.015
       ) {
         info.settledAsleep = false;
@@ -8537,7 +9831,7 @@ export class MujocoPhysicsEngine {
       for (let i = 0; i < this.blocks.length; i++) {
         const b = this.blocks[i];
         if (b.shattered || b.extracted) continue;
-        const info = this.worldCompat.getMapping(b.bodyHandle);
+        const info = this.getMappingFast(b.bodyHandle);
         if (!info || !info.settledAsleep) continue;
         const treeId = bodyTreeId[b.bodyHandle];
         if (treeId >= 0 && treeAsleep[treeId] >= 0) {
@@ -8605,15 +9899,13 @@ export class MujocoPhysicsEngine {
   }
 
   private syncTransformsAndRules(): void {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) return;
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
-    const geomContype = m.geom_contype;
-    const geomConaffinity = m.geom_conaffinity;
+    if (!this.ensureCachedViews()) return;
+    const qpos = this.vcQpos!;
+    const qvel = this.vcQvel!;
+    const bodyTreeId = this.vcBodyTreeId!;
+    const treeAsleep = this.vcTreeAsleep!;
+    const geomContype = this.vcGeomContype!;
+    const geomConaffinity = this.vcGeomConaffinity!;
 
     let maxTowerY = 0;
     let maxStructuralY = 0;
@@ -8639,7 +9931,7 @@ export class MujocoPhysicsEngine {
     for (let i = 0; i < this.blocks.length; i++) {
       const b = this.blocks[i];
       if (b.shattered) continue;
-      const mapping = this.worldCompat.getMapping(b.bodyHandle);
+      const mapping = this.getMappingFast(b.bodyHandle);
       if (!mapping || !mapping.enabled) continue;
 
       const adr = mapping.qposAdr;
@@ -8651,6 +9943,8 @@ export class MujocoPhysicsEngine {
       const rz = qpos[adr + 6];
       const rw = qpos[adr + 3];
 
+      b.rotation[0] = rx; b.rotation[1] = ry; b.rotation[2] = rz; b.rotation[3] = rw;
+
       const treeId = bodyTreeId[b.bodyHandle];
       const asleep = mapping.settledAsleep || (treeId >= 0 && treeAsleep[treeId] >= 0);
 
@@ -8661,18 +9955,24 @@ export class MujocoPhysicsEngine {
         lvx = qvel[dof + 0] * FROUDE_VEL_SCALE;
         lvy = qvel[dof + 1] * FROUDE_VEL_SCALE;
         lvz = qvel[dof + 2] * FROUDE_VEL_SCALE;
-        const wWorldSi = quatRotateVec3([rx, ry, rz, rw], [qvel[dof + 3], qvel[dof + 4], qvel[dof + 5]]);
-        avx = wWorldSi[0] * INV_FROUDE_VEL_SCALE;
-        avy = wWorldSi[1] * INV_FROUDE_VEL_SCALE;
-        avz = wWorldSi[2] * INV_FROUDE_VEL_SCALE;
+        quatRotateVec3InPlace(
+          b.rotation,
+          qvel[dof + 3],
+          qvel[dof + 4],
+          qvel[dof + 5],
+          scratchRotTmpA
+        );
+        avx = scratchRotTmpA[0] * INV_FROUDE_VEL_SCALE;
+        avy = scratchRotTmpA[1] * INV_FROUDE_VEL_SCALE;
+        avz = scratchRotTmpA[2] * INV_FROUDE_VEL_SCALE;
       }
 
+      const isOffTableRim = Math.hypot(tx, tz) > TABLE_RADIUS + 0.06;
       if (
-        Math.hypot(tx, tz) > TABLE_RADIUS + 0.06 &&
+        isOffTableRim &&
         geomConaffinity[b.colliderHandle] !== MJ_CONAFFINITY_BLOCK_OFF_RIM
       ) {
-        setBodyGeomCollisionMask(
-          m,
+        this.setBodyGeomCollisionMaskCached(
           b.bodyHandle,
           b.colliderHandle,
           geomContype[b.colliderHandle],
@@ -8681,8 +9981,13 @@ export class MujocoPhysicsEngine {
         this.worldCompat.wakeBody(b.bodyHandle);
       }
 
-      if (ty < -2.4) {
-        this.shatterBlock(b, [0, 0, 0], 8.0, [0, 1, 0], false);
+      if (ty < -2.4 || (isOffTableRim && ty < -0.6)) {
+        const isOffRimDiscard = this.hadFullSleepAfterCollapse && !this.sandboxCollapseActive;
+        this.shatterBlock(b, [0, 0, 0], 8.0, [0, 1, 0], false, {
+          closingSpeedReal: 8.0,
+          isAnvilCrush: false,
+          isOffRimDiscard,
+        });
         continue;
       }
 
@@ -8693,8 +9998,9 @@ export class MujocoPhysicsEngine {
 
       if (!b.extracted && b.id !== this.activeBlockId) {
         const horizR = Math.hypot(tx, tz);
-        const upVec = quatRotateVec3(b.rotation, [0, 1, 0]);
-        const tilt = Math.acos(Math.max(-1, Math.min(1, upVec[1])));
+        quatRotateVec3InPlace(b.rotation, 0, 1, 0, scratchRotTmpA);
+        const upY = scratchRotTmpA[1];
+        const tilt = Math.acos(Math.max(-1, Math.min(1, upY)));
         const omegaHoriz = Math.hypot(avx, avz);
         const linSpeed = Math.hypot(lvx, lvy, lvz);
         const nominalY = (b.assignedLayer + 0.5) * BLOCK_HEIGHT;
@@ -8702,18 +10008,20 @@ export class MujocoPhysicsEngine {
 
         // Continuous Unsupported-Sleep Invariant on elevated intact blocks (`ty > 2.6 cm` & lowest OBB point > `3 mm`):
         if (asleep && ty > 0.26) {
-          const exVec = quatRotateVec3(b.rotation, [1, 0, 0]);
-          const ezVec = quatRotateVec3(b.rotation, [0, 0, 1]);
+          quatRotateVec3InPlace(b.rotation, 1, 0, 0, scratchRotTmpA);
+          const exY = scratchRotTmpA[1];
+          quatRotateVec3InPlace(b.rotation, 0, 0, 1, scratchRotTmpA);
+          const ezY = scratchRotTmpA[1];
           const extY =
-            Math.abs(exVec[1]) * BLOCK_HALF_X +
-            Math.abs(upVec[1]) * BLOCK_HALF_Y +
-            Math.abs(ezVec[1]) * BLOCK_HALF_Z;
+            Math.abs(exY) * BLOCK_HALF_X +
+            Math.abs(upY) * BLOCK_HALF_Y +
+            Math.abs(ezY) * BLOCK_HALF_Z;
           if (ty - extY > 0.03) {
             let hasBlockSupport = false;
             for (let j = 0; j < this.blocks.length; j++) {
               const sb = this.blocks[j];
               if (sb.id === b.id || sb.shattered || sb.extracted) continue;
-              const sMap = this.worldCompat.getMapping(sb.bodyHandle);
+              const sMap = this.getMappingFast(sb.bodyHandle);
               if (!sMap || !sMap.enabled) continue;
               const sx = qpos[sMap.qposAdr + 0] * DM_PER_M;
               const sy = qpos[sMap.qposAdr + 1] * DM_PER_M;
@@ -8795,10 +10103,10 @@ export class MujocoPhysicsEngine {
       }
     }
 
-    const geomAabb = this.shards.length > 0 ? m.geom_aabb : null;
-    const geomXpos = this.shards.length > 0 ? d.geom_xpos : null;
-    const geomXmat = this.shards.length > 0 ? d.geom_xmat : null;
-    const geomRbound = this.shards.length > 0 ? m.geom_rbound : null;
+    const geomAabb = this.shards.length > 0 ? this.vcGeomAabb : null;
+    const geomXpos = this.shards.length > 0 ? this.vcGeomXpos : null;
+    const geomXmat = this.shards.length > 0 ? this.vcGeomXmat : null;
+    const geomRbound = this.shards.length > 0 ? this.vcGeomRbound : null;
     for (let i = this.shards.length - 1; i >= 0; i--) {
       const s = this.shards[i];
       const adr = this.map.shardQposAdr[s.slotIndex];
@@ -8816,18 +10124,21 @@ export class MujocoPhysicsEngine {
           this.activeWedgeEscapeCount = Math.max(0, this.activeWedgeEscapeCount - 1);
         }
         this.shardPinchSubsteps[s.slotIndex] = 0;
+        this.shardLastPinchSimTime[s.slotIndex] = -10;
         if (geomConaffinity[s.colliderHandle] !== caff) {
-          setBodyGeomCollisionMask(m, s.bodyHandle, s.colliderHandle, ctype, caff);
+          this.setBodyGeomCollisionMaskCached(s.bodyHandle, s.colliderHandle, ctype, caff);
           this.worldCompat.wakeBody(s.bodyHandle);
         }
       }
-      if (ty < -3.2 || Math.hypot(tx, tz) > 8.5) {
+      const isOffRimShard = Math.hypot(tx, tz) > TABLE_RADIUS + 0.04;
+      if (ty < -3.2 || Math.hypot(tx, tz) > 8.5 || (isOffRimShard && ty < -0.4)) {
         if (this.shardWedgeCooldownUntilSim[s.slotIndex] > -5) {
           this.shardWedgeCooldownUntilSim[s.slotIndex] = -10;
           this.activeWedgeEscapeCount = Math.max(0, this.activeWedgeEscapeCount - 1);
         }
         this.shardPinchSubsteps[s.slotIndex] = 0;
-        this.bodyToShard.delete(s.bodyHandle);
+        this.shardLastPinchSimTime[s.slotIndex] = -10;
+        this.deleteBodyShard(s.bodyHandle);
         this.slotRenderVertices[s.slotIndex] = null;
         this.shardAirborneSubsteps[s.slotIndex] = 0;
         this.freeShardSlots.push(s.slotIndex);
@@ -8841,11 +10152,13 @@ export class MujocoPhysicsEngine {
         this.shards.splice(i, 1);
         continue;
       }
-      const sRot: Quat = [qpos[adr + 4], qpos[adr + 5], qpos[adr + 6], qpos[adr + 3]];
       s.position[0] = tx; s.position[1] = ty; s.position[2] = tz;
-      s.rotation[0] = sRot[0]; s.rotation[1] = sRot[1]; s.rotation[2] = sRot[2]; s.rotation[3] = sRot[3];
+      s.rotation[0] = qpos[adr + 4];
+      s.rotation[1] = qpos[adr + 5];
+      s.rotation[2] = qpos[adr + 6];
+      s.rotation[3] = qpos[adr + 3];
       const sTree = bodyTreeId[s.bodyHandle];
-      const sInfo = this.worldCompat.getMapping(s.bodyHandle);
+      const sInfo = this.getMappingFast(s.bodyHandle);
       const nativelyAsleep = sTree >= 0 && treeAsleep[sTree] >= 0;
       const isAsleep = nativelyAsleep || Boolean(sInfo?.settledAsleep);
 
@@ -8921,11 +10234,11 @@ export class MujocoPhysicsEngine {
                 hasSupportBeneath = true;
                 break;
               }
-              const localPt = quatInverseRotateVec3(sb.rotation, [dx, dy, dz]);
+              quatInverseRotateVec3InPlace(sb.rotation, dx, dy, dz, scratchRotTmpA);
               if (
-                Math.abs(localPt[0]) < BLOCK_HALF_X + fullRadDm &&
-                Math.abs(localPt[1]) < BLOCK_HALF_Y + fullRadDm &&
-                Math.abs(localPt[2]) < BLOCK_HALF_Z + fullRadDm
+                Math.abs(scratchRotTmpA[0]) < BLOCK_HALF_X + fullRadDm &&
+                Math.abs(scratchRotTmpA[1]) < BLOCK_HALF_Y + fullRadDm &&
+                Math.abs(scratchRotTmpA[2]) < BLOCK_HALF_Z + fullRadDm
               ) {
                 hasSupportBeneath = true;
                 break;
@@ -8976,10 +10289,16 @@ export class MujocoPhysicsEngine {
         s.preLinVel[0] = qvel[sDof + 0] * FROUDE_VEL_SCALE;
         s.preLinVel[1] = qvel[sDof + 1] * FROUDE_VEL_SCALE;
         s.preLinVel[2] = qvel[sDof + 2] * FROUDE_VEL_SCALE;
-        const sw = quatRotateVec3(sRot, [qvel[sDof + 3], qvel[sDof + 4], qvel[sDof + 5]]);
-        s.preAngVel[0] = sw[0] * INV_FROUDE_VEL_SCALE;
-        s.preAngVel[1] = sw[1] * INV_FROUDE_VEL_SCALE;
-        s.preAngVel[2] = sw[2] * INV_FROUDE_VEL_SCALE;
+        quatRotateVec3InPlace(
+          s.rotation,
+          qvel[sDof + 3],
+          qvel[sDof + 4],
+          qvel[sDof + 5],
+          scratchRotTmpA
+        );
+        s.preAngVel[0] = scratchRotTmpA[0] * INV_FROUDE_VEL_SCALE;
+        s.preAngVel[1] = scratchRotTmpA[1] * INV_FROUDE_VEL_SCALE;
+        s.preAngVel[2] = scratchRotTmpA[2] * INV_FROUDE_VEL_SCALE;
       }
     }
 
@@ -9560,7 +10879,7 @@ export class MujocoPhysicsEngine {
       };
     }
 
-    const shd = this.bodyToShard.get(bodyId);
+    const shd = this.shards.length > 0 ? this.bodyToShard.get(bodyId) : undefined;
     if (shd) {
       const localPointDm = quatInverseRotateVec3(shd.rotation, [
         worldPointDm[0] - shd.position[0],
@@ -9689,28 +11008,31 @@ export class MujocoPhysicsEngine {
    * floor so `-50 m` hidden pool shelf bodies never pollute passive energy monotonicity).
    */
   public computeMechanicalEnergyJ(): number {
-    const m = this.model;
-    const d = this.data;
-    if (!m || !d) return 0;
+    if (!this.ensureCachedViews()) return 0;
 
-    const qpos = d.qpos;
-    const qvel = d.qvel;
-    const qfrcApplied = d.qfrc_applied;
-    const bodyMass = m.body_mass;
-    const bodyInertia = m.body_inertia;
-    const bodyTreeId = m.body_treeid;
-    const treeAsleep = d.tree_asleep;
+    const qpos = this.vcQpos!;
+    const qvel = this.vcQvel!;
+    const qfrcApplied = this.vcQfrcApplied!;
+    const bodyMass = this.vcBodyMass!;
+    const bodyInertia = this.vcBodyInertia!;
+    const bodyTreeId = this.vcBodyTreeId!;
+    const treeAsleep = this.vcTreeAsleep!;
     const gSi = 9.81;
     const yDatumM = -0.35;
     let totalJ = 0;
 
-    const addBodyEnergy = (bodyId: number, adr: number, dof: number, settledAsleep: boolean): void => {
+    for (let i = 0; i < this.blocks.length; i++) {
+      const b = this.blocks[i];
+      if (b.shattered || b.extracted) continue;
+      const info = this.getMappingFast(b.bodyHandle);
+      if (!info || !info.enabled) continue;
+      const bodyId = b.bodyHandle;
       const mass = bodyMass[bodyId];
-      if (!(mass > 0)) return;
-      const yM = Math.max(yDatumM, qpos[adr + 1]);
+      if (!(mass > 0)) continue;
+      const yM = Math.max(yDatumM, qpos[info.qposAdr + 1]);
       totalJ += mass * gSi * (yM - yDatumM);
-
-      if (settledAsleep) return;
+      if (info.settledAsleep) continue;
+      const dof = info.dofAdr;
       const vx = qvel[dof + 0];
       const vy = qvel[dof + 1];
       const vz = qvel[dof + 2];
@@ -9720,7 +11042,7 @@ export class MujocoPhysicsEngine {
       const speedSq = vx * vx + vy * vy + vz * vz + wx * wx + wy * wy + wz * wz;
       const tid = bodyTreeId[bodyId];
       if (tid >= 0 && treeAsleep[tid] >= 0 && qfrcApplied[dof + 1] === 0 && speedSq <= 1e-12) {
-        return;
+        continue;
       }
       const ib = bodyId * 3;
       totalJ +=
@@ -9729,26 +11051,38 @@ export class MujocoPhysicsEngine {
           (bodyInertia[ib + 0] * wx * wx +
             bodyInertia[ib + 1] * wy * wy +
             bodyInertia[ib + 2] * wz * wz);
-    };
-
-    for (let i = 0; i < this.blocks.length; i++) {
-      const b = this.blocks[i];
-      if (b.shattered || b.extracted) continue;
-      const info = this.worldCompat.getMapping(b.bodyHandle);
-      if (!info || !info.enabled) continue;
-      addBodyEnergy(b.bodyHandle, info.qposAdr, info.dofAdr, info.settledAsleep);
     }
 
     for (let i = 0; i < this.shards.length; i++) {
       const s = this.shards[i];
-      const info = this.worldCompat.getMapping(s.bodyHandle);
+      const info = this.getMappingFast(s.bodyHandle);
       if (!info || !info.enabled) continue;
-      addBodyEnergy(
-        s.bodyHandle,
-        this.map.shardQposAdr[s.slotIndex],
-        this.map.shardDofAdr[s.slotIndex],
-        info.settledAsleep
-      );
+      const bodyId = s.bodyHandle;
+      const mass = bodyMass[bodyId];
+      if (!(mass > 0)) continue;
+      const adr = this.map.shardQposAdr[s.slotIndex];
+      const yM = Math.max(yDatumM, qpos[adr + 1]);
+      totalJ += mass * gSi * (yM - yDatumM);
+      if (info.settledAsleep) continue;
+      const dof = this.map.shardDofAdr[s.slotIndex];
+      const vx = qvel[dof + 0];
+      const vy = qvel[dof + 1];
+      const vz = qvel[dof + 2];
+      const wx = qvel[dof + 3];
+      const wy = qvel[dof + 4];
+      const wz = qvel[dof + 5];
+      const speedSq = vx * vx + vy * vy + vz * vz + wx * wx + wy * wy + wz * wz;
+      const tid = bodyTreeId[bodyId];
+      if (tid >= 0 && treeAsleep[tid] >= 0 && qfrcApplied[dof + 1] === 0 && speedSq <= 1e-12) {
+        continue;
+      }
+      const ib = bodyId * 3;
+      totalJ +=
+        0.5 * mass * (vx * vx + vy * vy + vz * vz) +
+        0.5 *
+          (bodyInertia[ib + 0] * wx * wx +
+            bodyInertia[ib + 1] * wy * wy +
+            bodyInertia[ib + 2] * wz * wz);
     }
 
     return totalJ;
@@ -10377,7 +11711,16 @@ export class MujocoPhysicsEngine {
     this.carriedYawOffsetRad = snap.carriedYawOffsetRad;
     this.deferredFractures.length = 0;
     this.sandboxCollapseActive = false;
+    this.passivityWindowJ.fill(0);
+    this.passivityWindowCursor = 0;
+    this.passivityRunBaselineJ = -1;
+    this.lastStepEndEnergyJ = -1;
+    this.lastStepEndShatteredCount = -1;
+    this.lastStepWasUnforced = false;
     this.shardPinchSubsteps.fill(0);
+    this.shardLastPinchSimTime.fill(-10);
+    this.shardBlockNormalN.fill(0);
+    this.shardTableNormalN.fill(0);
     this.shardWedgeCooldownUntilSim.fill(-10);
     this.activeWedgeEscapeCount = 0;
     if (!this.isPointerDraggingBlock) {
@@ -10427,10 +11770,10 @@ export class MujocoPhysicsEngine {
       b.swatchId = (bits >>> 12) & 0xf;
       b.motif = ((bits >>> 16) & 0x3) as TraceryMotif;
 
-      const info = this.worldCompat.getMapping(b.bodyHandle);
+      const info = this.getMappingFast(b.bodyHandle);
       if (!info) continue;
       if (b.shattered) {
-        this.bodyToBlock.delete(b.bodyHandle);
+        this.deleteBodyBlock(b.bodyHandle);
         this.parkBodyOnHiddenShelf(
           b.bodyHandle,
           b.colliderHandle,
@@ -10439,7 +11782,7 @@ export class MujocoPhysicsEngine {
           520 + (b.id % 64)
         );
       } else {
-        this.bodyToBlock.set(b.bodyHandle, b);
+        this.setBodyBlock(b);
         const caff =
           Math.hypot(px, pz) > TABLE_RADIUS + 0.06
             ? MJ_CONAFFINITY_BLOCK_OFF_RIM
@@ -10492,7 +11835,7 @@ export class MujocoPhysicsEngine {
 
     // Reset shard pool first, then activate exact snapshot slots
     for (const oldS of this.shards) {
-      this.bodyToShard.delete(oldS.bodyHandle);
+      this.deleteBodyShard(oldS.bodyHandle);
       this.parkBodyOnHiddenShelf(
         oldS.bodyHandle,
         oldS.colliderHandle,
@@ -10761,7 +12104,7 @@ export class MujocoPhysicsEngine {
         spawnSimTime: prev?.spawnSimTime ?? this.simTime - 0.06,
       };
       this.shards.push(shardState);
-      this.bodyToShard.set(bodyId, shardState);
+      this.setBodyShard(shardState);
     }
 
     this.nextShardId = maxSeenShardId;
@@ -10773,6 +12116,10 @@ export class MujocoPhysicsEngine {
     }
 
     this.multiccdReentrySubstepsRemaining = 0;
+    this.vcModel = null;
+    this.vcData = null;
+    this.ensureCachedViews();
+    this.syncBodyLookupCapacity(m.nbody);
     d.qacc_warmstart.fill(0);
     this.mj.mj_forward(m, d);
     this.syncTransformsAndRules();

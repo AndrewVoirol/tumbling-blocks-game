@@ -682,5 +682,374 @@ describe('Vitrail First-Principles Physical Modal & Impact Acoustics', () => {
 
     iosAudio.dispose();
   });
+
+  // ============================================================================
+  // 10. Track 2 (M12) Ductile Solder-Held Cracked Brick Acoustic Doublet Splitting
+  // ============================================================================
+  it('10. models Track 2 (M12) ductile solder-held cracked brick acoustic doublet splitting (30–48 Hz beat) across tap test and impact resonance', () => {
+    // --- Tier 1.1: Doublet frequency bracket across ductile cleavage range [0.78, 0.96] ---
+    const damageBrackets = [0.78, 0.82, 0.85, 0.88, 0.92, 0.96];
+    for (const d of damageBrackets) {
+      const modes = computeGlassBarModes({ damage: d });
+      const fund = modes[0];
+      expect(fund.splitBeatHz).toBeGreaterThanOrEqual(25.0);
+      expect(fund.splitBeatHz).toBeLessThanOrEqual(48.0);
+      expect(fund.doubletFreqHz).toBeCloseTo(fund.freqHz + fund.splitBeatHz, 5);
+    }
+
+    // --- Tier 2.1: Boundary values d = 0.78, d = 0.96, d = 0.0, d = 1.0 ---
+    const intact = computeGlassBarModes({ damage: 0.0 })[0];
+    const lowerBound = computeGlassBarModes({ damage: 0.78 })[0];
+    const upperBound = computeGlassBarModes({ damage: 0.96 })[0];
+    const maxDamage = computeGlassBarModes({ damage: 1.0 })[0];
+
+    expect(intact.splitBeatHz).toBe(0.0);
+    expect(intact.doubletFreqHz).toBe(intact.freqHz);
+    expect(lowerBound.splitBeatHz).toBeGreaterThanOrEqual(30.0);
+    expect(lowerBound.splitBeatHz).toBeLessThanOrEqual(32.5);
+    expect(upperBound.splitBeatHz).toBeGreaterThanOrEqual(46.0);
+    expect(upperBound.splitBeatHz).toBeLessThanOrEqual(48.0);
+    expect(maxDamage.splitBeatHz).toBeGreaterThan(upperBound.splitBeatHz);
+
+    // Verify full ductile damage range [0.78, 0.96] produces beats strictly in [30, 48] Hz
+    for (const d of [0.78, 0.82, 0.85, 0.88, 0.92, 0.96]) {
+      const mode = computeGlassBarModes({ damage: d })[0];
+      expect(mode.splitBeatHz).toBeGreaterThanOrEqual(30.0);
+      expect(mode.splitBeatHz).toBeLessThanOrEqual(48.0);
+      expect(mode.doubletFreqHz).toBeCloseTo(mode.freqHz + mode.splitBeatHz, 5);
+    }
+
+    // Monotonicity verification
+    let prevBeat = 0;
+    for (let d = 0.1; d <= 1.0; d += 0.1) {
+      const beat = computeGlassBarModes({ damage: d })[0].splitBeatHz;
+      expect(beat).toBeGreaterThan(prevBeat);
+      prevBeat = beat;
+    }
+
+    // --- Tier 1.2 & 1.3: Interactive Tap Test Voice Spawning & Mode Contrast ---
+    const mockCtx = new InstrumentedMockAudioContext();
+    const audio = new GlassAudioEngine(mockCtx as unknown as AudioContext);
+
+    // A. Intact tap: 0 damage -> exactly 1 fundamental oscillator (no oscSplit)
+    const oscsBeforeIntact = mockCtx.createdOscillators.length;
+    audio.playTapTestResonance(0.1, [0, 1, 0], undefined, undefined, 0.0);
+    const intactOscs = mockCtx.createdOscillators.slice(oscsBeforeIntact);
+    const intactFreqs = intactOscs.map((o) => o.frequencyValues[0]);
+    // Primary flexural is near 2865 Hz, overtone is near 6700 Hz
+    const intactFundamentals = intactFreqs.filter((f) => f >= 2200 && f <= 3600);
+    expect(intactFundamentals.length).toBe(1);
+    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(false);
+
+    // B. Cracked tap: d = 0.85 -> modes compute doublet in [30, 48] Hz and spawns oscSplit
+    const tapModes = computeGlassBarModes({ clampingLoadN: 0.1 * 3.5, damage: 0.85 });
+    expect(tapModes[0].splitBeatHz).toBeGreaterThanOrEqual(30.0);
+    expect(tapModes[0].splitBeatHz).toBeLessThanOrEqual(48.0);
+    expect(tapModes[0].doubletFreqHz).toBeCloseTo(tapModes[0].freqHz + tapModes[0].splitBeatHz, 5);
+
+    // Direct mathematical model assertion for doublet splitting
+    const modesCracked = computeGlassBarModes({ damage: 0.85 });
+    expect(modesCracked[0].splitBeatHz).toBeGreaterThanOrEqual(30.0);
+    expect(modesCracked[0].splitBeatHz).toBeLessThanOrEqual(48.0);
+    expect(modesCracked[0].doubletFreqHz).toBeCloseTo(modesCracked[0].freqHz + modesCracked[0].splitBeatHz, 5);
+
+    // Tap test resonance runs cleanly, spawns oscSplit, and captures diagnostics
+    const oscsBeforeCrackedTap = mockCtx.createdOscillators.length;
+    audio.playTapTestResonance(0.1, [0, 1, 0], undefined, undefined, 0.85);
+    expect(audio.lastTapDiagnostics?.fundamentalHz).toBeGreaterThan(0);
+    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(true);
+    expect(audio.lastTapDiagnostics?.splitBeatHz).toBeGreaterThanOrEqual(30.0);
+    expect(audio.lastTapDiagnostics?.splitBeatHz).toBeLessThanOrEqual(48.0);
+
+    const crackedTapOscs = mockCtx.createdOscillators.slice(oscsBeforeCrackedTap);
+    const crackedTapFundOscs = crackedTapOscs.filter(
+      (o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600
+    );
+    expect(crackedTapFundOscs.length).toBe(2);
+    const tapBeat = Math.abs(crackedTapFundOscs[1].frequencyValues[0] - crackedTapFundOscs[0].frequencyValues[0]);
+    expect(tapBeat).toBeGreaterThanOrEqual(30.0);
+    expect(tapBeat).toBeLessThanOrEqual(48.0);
+
+    // --- Tier 1.5: Glass Impact Spawns Mode Doublet ---
+    const oscsBeforeImpact = mockCtx.createdOscillators.length;
+    audio.playGlassImpact(0.75, 1.0, [0, 0.5, 0], undefined, undefined, { damage: 0.88 });
+    const impactOscs = mockCtx.createdOscillators.slice(oscsBeforeImpact);
+    const impactFundOscs = impactOscs.filter(
+      (o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600
+    );
+    expect(impactFundOscs.length).toBeGreaterThanOrEqual(2);
+    const impactBeat = Math.abs(impactFundOscs[1].frequencyValues[0] - impactFundOscs[0].frequencyValues[0]);
+    expect(impactBeat).toBeGreaterThanOrEqual(30.0);
+    expect(impactBeat).toBeLessThanOrEqual(48.0);
+
+    // Clean decay
+    mockCtx.currentTime += 0.3;
+    expect(audio.getActiveVoiceCount()).toBe(0);
+    audio.dispose();
+  });
+
+  // ============================================================================
+  // 11. Track 1 Solder-Came Slide Texture Audio Modulation
+  // ============================================================================
+  it('11. models Track 1 solder-came proud seam-crossing slide texture audio modulation and discrete catch-and-release pulses', () => {
+    const mockCtx = new InstrumentedMockAudioContext();
+    const audio = new GlassAudioEngine(mockCtx as unknown as AudioContext);
+
+    // Tier 1.4: Base slide vs slide with seam crossing pulse
+    audio.updateSlideFriction(1.2, 0.4, 15, 0.5, 2.0); // Baseline glide
+    const baseDiag = { ...audio.lastSlideDiagnostics! };
+
+    // Pass seamCrossingIntensity = 0.85
+    audio.updateSlideFriction(1.2, 0.4, 15, 0.5, 2.0, 0.85);
+    const seamDiag = { ...audio.lastSlideDiagnostics! };
+
+    expect(baseDiag.seamCrossingIntensity).toBe(0.0);
+    expect(seamDiag.seamCrossingIntensity).toBe(0.85);
+    expect(seamDiag.raspGain).toBeGreaterThan(baseDiag.raspGain);
+
+    // Tier 2.3: Extrema seam intensities (0.0 vs 1.0) and non-finite guards
+    audio.updateSlideFriction(1.2, 0.4, 15, 0.5, 2.0, 0.0);
+    expect(audio.lastSlideDiagnostics!.seamCrossingIntensity).toBe(0.0);
+
+    audio.updateSlideFriction(1.2, 0.4, 15, 0.5, 2.0, 1.0);
+    expect(audio.lastSlideDiagnostics!.seamCrossingIntensity).toBe(1.0);
+
+    // Guard NaN / non-finite inputs on numerical parameters
+    expect(() => {
+      audio.updateSlideFriction(Number.NaN, 0.4, 15, 0.5, 2.0, 0.5);
+    }).not.toThrow();
+
+    for (const v of mockCtx.recordedParamValues) {
+      expect(Number.isFinite(v)).toBe(true);
+    }
+
+    // Smooth ramp-down on slide stop
+    audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
+    mockCtx.currentTime += 0.05;
+    audio.dispose();
+  });
+
+  // ============================================================================
+  // 12. Tiers 3–4 Pairwise Matrices & Real-World Workload Stress
+  // ============================================================================
+  it('12. enforces Tiers 3–4 pairwise combinations and workload stress (cracking × clamping × seam crossing × multi-block collapse)', () => {
+    // Tier 3.1: Pairwise Damage × Clamping Matrix
+    const damages = [0.0, 0.78, 0.88, 0.96];
+    const clampLoadsN = [0.0, 2.0, 8.0];
+
+    for (const d of damages) {
+      for (const fn of clampLoadsN) {
+        const modes = computeGlassBarModes({ damage: d, clampingLoadN: fn });
+        const f0 = modes[0].freqHz;
+        const beat = modes[0].splitBeatHz;
+
+        if (d === 0.0) {
+          expect(beat).toBe(0.0);
+        } else {
+          expect(beat).toBeGreaterThanOrEqual(25.0);
+          expect(beat).toBeLessThanOrEqual(60.0);
+        }
+        if (fn > 0) {
+          // Winkler foundation stiffens fundamental
+          const unconstrainedF0 = computeGlassBarModes({ damage: d, clampingLoadN: 0 })[0].freqHz;
+          expect(f0).toBeGreaterThan(unconstrainedF0);
+        }
+      }
+    }
+
+    // Tier 3.2: Pairwise Damage × Substrate Surface Matrix
+    const mockCtx = new InstrumentedMockAudioContext();
+    const audio = new GlassAudioEngine(mockCtx as unknown as AudioContext);
+
+    const testMatrix: Array<{ d: number; surface: 'glass' | 'wood'; expectPlate: boolean }> = [
+      { d: 0.0, surface: 'glass', expectPlate: false },
+      { d: 0.85, surface: 'glass', expectPlate: false },
+      { d: 0.0, surface: 'wood', expectPlate: true },
+      { d: 0.85, surface: 'wood', expectPlate: true },
+    ];
+
+    for (const item of testMatrix) {
+      mockCtx.currentTime += 0.25;
+      const baseCount = mockCtx.createdOscillators.length;
+      audio.playGlassImpact(0.8, 1.0, [1.0, 0.1, 0], undefined, undefined, {
+        damage: item.d,
+        surface: item.surface,
+      });
+      const spawned = mockCtx.createdOscillators.slice(baseCount);
+      const hasPlateModes = spawned.some((o) =>
+        o.frequencyValues.some((f) => f >= 90 && f <= 650)
+      );
+      expect(hasPlateModes).toBe(item.expectPlate);
+
+      if (item.d > 0.75) {
+        const fundOscs = spawned.filter(
+          (o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600
+        );
+        expect(fundOscs.length).toBeGreaterThanOrEqual(2);
+      }
+    }
+
+    // Tier 4.1: Real-World Workload — 50-Event Collapse Burst with Mixed Damage
+    for (let i = 0; i < 50; i++) {
+      mockCtx.currentTime += 0.003;
+      const dmg = i % 4 === 0 ? 0.0 : 0.75 + (i % 5) * 0.04;
+      audio.playGlassImpact(0.5 + (i % 10) * 0.05, 1.0, [(i % 7) - 3, 0.1, 0], undefined, undefined, {
+        damage: dmg,
+        surface: i % 2 === 0 ? 'wood' : 'glass',
+      });
+      expect(audio.getActiveVoiceCount()).toBeLessThanOrEqual(audio.MAX_VOICES);
+    }
+
+    // Tier 4.2: Real-World Workload — 18-Block Tap Scouting Survey
+    for (let b = 0; b < 18; b++) {
+      mockCtx.currentTime += 0.08;
+      const pinch = (b % 3) * 0.45;
+      const dmg = b % 5 === 0 ? 0.85 : 0.0;
+      audio.playTapTestResonance(pinch, [0, b * 0.15, 0], undefined, undefined, dmg);
+    }
+
+    // Tier 4.3: Real-World Workload — Continuous 12-Seam Extraction Slide
+    for (let step = 0; step < 12; step++) {
+      mockCtx.currentTime += 0.1;
+      const isCrossing = step % 2 === 1;
+      audio.updateSlideFriction(0.4, 0.5, 20, 0.1, 4.0, isCrossing ? 0.75 : 0.0);
+    }
+    audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
+
+    // Full drain and disposal verification
+    mockCtx.currentTime += 0.5;
+    expect(audio.getActiveVoiceCount()).toBe(0);
+    expect(audio.getConnectedTransientNodes()).toBe(0);
+    audio.dispose();
+  });
+
+  // ============================================================================
+  // 13. Milestone 2 Comprehensive Verification Suite
+  // ============================================================================
+  it('13. Milestone 2: comprehensive verification of Track 2 modal doublet splitting, tap/impact warble, seam-crossing slide modulation, and zero-leak polyphony', () => {
+    // 1. Mathematical model checks across ductile damage range [0.78, 0.96]
+    const testDamages = [0.78, 0.82, 0.85, 0.88, 0.92, 0.96];
+    for (const d of testDamages) {
+      const modes = computeGlassBarModes({ damage: d });
+      const f0 = modes[0].freqHz;
+      const beat = modes[0].splitBeatHz;
+      const doublet = modes[0].doubletFreqHz;
+
+      expect(beat).toBeGreaterThanOrEqual(30.0);
+      expect(beat).toBeLessThanOrEqual(48.0);
+      expect(doublet).toBeCloseTo(f0 + beat, 5);
+      expect(modes[0].kind).toBe('flexural-y');
+      expect(modes[0].order).toBe(1);
+    }
+
+    // Exact milestone target bounds
+    const mode78 = computeGlassBarModes({ damage: 0.78 })[0];
+    const mode85 = computeGlassBarModes({ damage: 0.85 })[0];
+    const mode92 = computeGlassBarModes({ damage: 0.92 })[0];
+    const mode96 = computeGlassBarModes({ damage: 0.96 })[0];
+    const mode00 = computeGlassBarModes({ damage: 0.0 })[0];
+    const mode45 = computeGlassBarModes({ damage: 0.45 })[0];
+
+    expect(mode78.splitBeatHz).toBeGreaterThanOrEqual(30.0);
+    expect(mode78.splitBeatHz).toBeLessThanOrEqual(32.5);
+    expect(mode85.splitBeatHz).toBeGreaterThanOrEqual(36.0);
+    expect(mode85.splitBeatHz).toBeLessThanOrEqual(39.0);
+    expect(mode92.splitBeatHz).toBeGreaterThanOrEqual(42.0);
+    expect(mode92.splitBeatHz).toBeLessThanOrEqual(45.0);
+    expect(mode96.splitBeatHz).toBeGreaterThanOrEqual(46.0);
+    expect(mode96.splitBeatHz).toBeLessThanOrEqual(48.0);
+
+    expect(mode00.splitBeatHz).toBe(0.0);
+    expect(mode45.splitBeatHz).toBeGreaterThan(10.0);
+    expect(mode45.splitBeatHz).toBeLessThan(18.0);
+
+    // 2. Interactive Tap Test Doublet Warble
+    const mockCtx = new InstrumentedMockAudioContext();
+    const audio = new GlassAudioEngine(mockCtx as unknown as AudioContext);
+
+    // Intact tap (d = 0.0): exactly 1 fundamental oscillator in [2200, 3600]
+    let baseOscs = mockCtx.createdOscillators.length;
+    audio.playTapTestResonance(0.2, [0, 0, 0], undefined, undefined, 0.0);
+    let tapOscs = mockCtx.createdOscillators.slice(baseOscs);
+    let fundOscs = tapOscs.filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
+    expect(fundOscs.length).toBe(1);
+    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(false);
+
+    // Intermediate crazing (d = 0.45): still exactly 1 fundamental oscillator (ductile tether only active at d in [0.78, 0.96])
+    baseOscs = mockCtx.createdOscillators.length;
+    audio.playTapTestResonance(0.2, [0, 0, 0], undefined, undefined, 0.45);
+    tapOscs = mockCtx.createdOscillators.slice(baseOscs);
+    fundOscs = tapOscs.filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
+    expect(fundOscs.length).toBe(1);
+    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(false);
+
+    // Ductile cracked brick taps (d = 0.78, 0.85, 0.96): exactly 2 fundamental oscillators (primary + oscSplit)
+    for (const d of [0.78, 0.85, 0.96]) {
+      baseOscs = mockCtx.createdOscillators.length;
+      audio.playTapTestResonance(0.15, [0, 0, 0], undefined, undefined, d);
+      tapOscs = mockCtx.createdOscillators.slice(baseOscs);
+      fundOscs = tapOscs.filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
+      expect(fundOscs.length).toBe(2);
+      expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(true);
+      expect(audio.lastTapDiagnostics?.splitBeatHz).toBeGreaterThanOrEqual(30.0);
+      expect(audio.lastTapDiagnostics?.splitBeatHz).toBeLessThanOrEqual(48.0);
+
+      const beatHz = Math.abs(fundOscs[1].frequencyValues[0] - fundOscs[0].frequencyValues[0]);
+      expect(beatHz).toBeGreaterThanOrEqual(30.0);
+      expect(beatHz).toBeLessThanOrEqual(48.0);
+    }
+
+    // 3. Track 1 Solder Came Slide Texture Modulation
+    audio.updateSlideFriction(1.0, 0.3, 10, 0.2, 1.5, 0.0);
+    const diagNoSeam = { ...audio.lastSlideDiagnostics! };
+    expect(diagNoSeam.seamCrossingIntensity).toBe(0.0);
+
+    audio.updateSlideFriction(1.0, 0.3, 10, 0.2, 1.5, 0.4);
+    const diagMidSeam = { ...audio.lastSlideDiagnostics! };
+    expect(diagMidSeam.seamCrossingIntensity).toBe(0.4);
+    expect(diagMidSeam.raspGain).toBeGreaterThan(diagNoSeam.raspGain);
+
+    audio.updateSlideFriction(1.0, 0.3, 10, 0.2, 1.5, 1.0);
+    const diagMaxSeam = { ...audio.lastSlideDiagnostics! };
+    expect(diagMaxSeam.seamCrossingIntensity).toBe(1.0);
+    expect(diagMaxSeam.raspGain).toBeGreaterThan(diagMidSeam.raspGain);
+
+    // Stop slide
+    audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
+
+    // 4. Zero-leak polyphony & strict MAX_VOICES <= 12 + ductile [0.78, 0.96] boundary hygiene
+    expect(audio.MAX_VOICES).toBeLessThanOrEqual(12);
+
+    // Tap & impact doublets strictly bounded to ductile bracket d in [0.78, 0.96]
+    for (const dOut of [0.0, 0.779, 0.961, 1.0]) {
+      const tapStart = mockCtx.createdOscillators.length;
+      audio.playTapTestResonance(0.15, [0, 0, 0], undefined, undefined, dOut);
+      const tapFund = mockCtx.createdOscillators
+        .slice(tapStart)
+        .filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
+      expect(tapFund.length).toBe(1);
+      expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(false);
+
+      mockCtx.currentTime += 0.05;
+      const impStart = mockCtx.createdOscillators.length;
+      audio.playGlassImpact(0.8, 1.0, [0, 0.5, 0], undefined, undefined, { damage: dOut });
+      const impFund = mockCtx.createdOscillators
+        .slice(impStart)
+        .filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
+      expect(impFund.length).toBe(1);
+    }
+
+    // Heavy burst must never exceed 12 concurrent voices
+    for (let i = 0; i < 40; i++) {
+      mockCtx.currentTime += 0.002;
+      audio.playGlassImpact(0.85, 1.0, [0, 0.2, 0], undefined, undefined, { damage: 0.88 });
+      expect(audio.getActiveVoiceCount()).toBeLessThanOrEqual(12);
+    }
+
+    mockCtx.currentTime += 0.5;
+    expect(audio.getActiveVoiceCount()).toBe(0);
+    expect(audio.getConnectedTransientNodes()).toBe(0);
+    audio.dispose();
+  });
 });
 

@@ -23,6 +23,18 @@ import {
   buildNominalGlassBlocks,
   buildNominalTopSupportFrameAndSlots,
 } from './mujocoTowerBuilder';
+import {
+  computeEffectiveGrabClampingLoadN,
+  countOtherBlocksInLayer,
+  estimateClampingLoadFromWrenchAndStack,
+  evaluateCompetitiveDragSlip,
+  F_SLIP,
+  isCompetitiveInwardEndPush,
+  normalizeCompetitiveSlipResult,
+  shouldReleaseCompetitiveSlip,
+  type ExtractionSlipResult,
+  updateEndPushSmoothedClampingLoadN,
+} from './extractionMechanics';
 import type {
   WorkerAudioEvent,
   WorkerInboundMessage,
@@ -90,6 +102,7 @@ export class MujocoWorkerBridge {
   public openTopSlots: TopPlacementSlot[] = [];
   public blockPhotoelasticStress01: Float32Array = new Float32Array(0);
   public blockPhotoelasticWrench: Float32Array = new Float32Array(0);
+  private blockClampingLoadsN: Float32Array = new Float32Array(0);
 
   public gameMode: GameMode = 'solo';
   public playerCount: number = 2;
@@ -100,6 +113,7 @@ export class MujocoWorkerBridge {
   public collapseReason: string | null = null;
 
   public hoveredBlockId: number | null = null;
+  public hoverLocalPoint: Vec3 | null = null;
   public activeBlockId: number | null = null;
   public hoveredSlotIndex: number | null = null;
 
@@ -110,6 +124,13 @@ export class MujocoWorkerBridge {
   public grabResistance01: number = 0;
   public isPointerDraggingBlock: boolean = false;
   public isExtractionLiftReady: boolean = false;
+  public lastExtractionSlip: ExtractionSlipResult | null = null;
+  private grabStartAnchor: Vec3 | null = null;
+  private grabStartBlockPos: Vec3 | null = null;
+  private grabInitialClampingLoadN: number = 0;
+  private grabSmoothedClampingLoadN: number = 0;
+  private grabLastSmoothSimTime: number = -1;
+  private slipAudioClearTicks: number = 0;
 
   public listenerCamPos: Vec3 = [0, 2.2, 5.2];
   public listenerCamRight: Vec3 = [1, 0, 0];
@@ -146,6 +167,7 @@ export class MujocoWorkerBridge {
   private epoch: number = 1;
   private commandSeq: number = 0;
   private grabLockUntilSeq: number = 0;
+  private endGrabLockUntilSeq: number = 0;
   private releaseLockUntilSeq: number = 0;
   private sandboxCollapseLatchUntilSeq: number = 0;
   private preGrabTurnPhase: TurnPhase = 'SELECT_BLOCK';
@@ -312,7 +334,15 @@ export class MujocoWorkerBridge {
     this.stepInFlight = false;
     this.accumDtWhileInFlight = 0;
     this.grabLockUntilSeq = 0;
+    this.endGrabLockUntilSeq = 0;
     this.releaseLockUntilSeq = 0;
+    this.grabStartAnchor = null;
+    this.grabStartBlockPos = null;
+    this.grabInitialClampingLoadN = 0;
+    this.grabSmoothedClampingLoadN = 0;
+    this.grabLastSmoothSimTime = -1;
+    this.slipAudioClearTicks = 0;
+    this.lastExtractionSlip = null;
     for (const cb of this.oracleCallbacks.values()) {
       cb([]);
     }
@@ -485,6 +515,9 @@ export class MujocoWorkerBridge {
 
     this.blockPhotoelasticStress01 = snap.blockPhotoelasticStress01;
     this.blockPhotoelasticWrench = snap.blockPhotoelasticWrench;
+    if (snap.blockClampingLoadsN) {
+      this.blockClampingLoadsN = snap.blockClampingLoadsN;
+    }
 
     for (const meta of snap.newShardMetas) {
       this.shardMetaById.set(meta.id, meta);
@@ -598,6 +631,9 @@ export class MujocoWorkerBridge {
     if (this.grabLockUntilSeq > 0 && ackSeq >= this.grabLockUntilSeq) {
       this.grabLockUntilSeq = 0;
     }
+    if (this.endGrabLockUntilSeq > 0 && ackSeq >= this.endGrabLockUntilSeq) {
+      this.endGrabLockUntilSeq = 0;
+    }
 
     this.gameMode = snap.gameMode;
     this.playerCount = snap.playerCount;
@@ -617,6 +653,17 @@ export class MujocoWorkerBridge {
         ...snap.telemetry,
         turnPhase: this.turnPhase,
         activeBlockId: null,
+      };
+    } else if (this.endGrabLockUntilSeq > 0) {
+      this.turnPhase = snap.turnPhase === 'COLLAPSED' ? 'COLLAPSED' : 'SELECT_BLOCK';
+      this.activeBlockId = null;
+      this.isPointerDraggingBlock = false;
+      this.grabResistance01 = 0;
+      this.latestTelemetry = {
+        ...snap.telemetry,
+        turnPhase: this.turnPhase,
+        activeBlockId: null,
+        grabResistance01: 0,
       };
     } else if (this.grabLockUntilSeq > 0) {
       // Preserve optimistic `'PULLING'` state until `startGrabBlock` is acknowledged by the worker
@@ -660,6 +707,50 @@ export class MujocoWorkerBridge {
     }
 
     this.replayAudioEvents(snap.audioEvents);
+    if (
+      this.endGrabLockUntilSeq === 0 &&
+      this.releaseLockUntilSeq === 0 &&
+      this.gameMode !== 'sandbox' &&
+      this.turnPhase === 'PULLING' &&
+      this.isPointerDraggingBlock &&
+      this.activeBlockId !== null
+    ) {
+      const blk = this.blocks[this.activeBlockId];
+      if (blk && !blk.shattered) {
+        const isEndPush = isCompetitiveInwardEndPush({
+          gameMode: this.gameMode,
+          turnPhase: this.turnPhase,
+          blockRotation: blk.rotation,
+          grabLocalPointDm: this.grabLocalPoint,
+          grabCurrentWorldOnBlockDm: this.grabCurrentWorldOnBlock,
+          grabAnchorStartDm: this.grabStartAnchor ?? undefined,
+          targetWorldDm: this.grabWorldAnchor,
+        });
+        if (isEndPush && snap.simTime !== this.grabLastSmoothSimTime) {
+          const dtSmooth =
+            this.grabLastSmoothSimTime >= 0 && snap.simTime > this.grabLastSmoothSimTime
+              ? snap.simTime - this.grabLastSmoothSimTime
+              : 1 / 60;
+          this.grabSmoothedClampingLoadN = updateEndPushSmoothedClampingLoadN(
+            this.grabSmoothedClampingLoadN,
+            this.computeBlockClampingLoadN(blk.id),
+            dtSmooth
+          );
+          this.grabLastSmoothSimTime = snap.simTime;
+        }
+      }
+      if (snap.turnPhase === 'PULLING' && snap.lastExtractionSlip) {
+        this.lastExtractionSlip = snap.lastExtractionSlip;
+      } else {
+        this.evaluateActiveExtractionSlip();
+      }
+    } else if (
+      this.endGrabLockUntilSeq === 0 &&
+      this.releaseLockUntilSeq === 0 &&
+      snap.lastExtractionSlip?.slipped
+    ) {
+      this.lastExtractionSlip = snap.lastExtractionSlip;
+    }
   }
 
   private replayAudioEvents(events: WorkerAudioEvent[]): void {
@@ -672,7 +763,8 @@ export class MujocoWorkerBridge {
             ev.resistance01,
             ev.slipPowerMw,
             ev.torsionRadPerSec,
-            ev.clampingLoadN
+            ev.clampingLoadN,
+            ev.seamCrossingIntensity
           );
           break;
         case 'tapTest':
@@ -811,6 +903,13 @@ export class MujocoWorkerBridge {
       return this.lastStepResult;
     }
 
+    if (this.slipAudioClearTicks > 0 && !this.isPointerDraggingBlock) {
+      this.slipAudioClearTicks--;
+      if (this.slipAudioClearTicks === 0) {
+        this.audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
+      }
+    }
+
     let shardImpacts: ShardImpactEvent[] = [];
     if (this.stepResultShardQueue.length > 0) {
       if (this.stepResultShardQueue.length > 8) {
@@ -893,6 +992,7 @@ export class MujocoWorkerBridge {
     this.openTopSlots = nominalTop.openTopSlots;
     this.blockPhotoelasticStress01 = new Float32Array(this.blocks.length);
     this.blockPhotoelasticWrench = new Float32Array(this.blocks.length * 4);
+    this.blockClampingLoadsN = new Float32Array(0);
 
     this.turnPhase = 'SELECT_BLOCK';
     this.preGrabTurnPhase = 'SELECT_BLOCK';
@@ -902,7 +1002,15 @@ export class MujocoWorkerBridge {
     this.collapseReason = null;
     this.activeBlockId = null;
     this.hoveredBlockId = null;
+    this.hoverLocalPoint = null;
     this.hoveredSlotIndex = null;
+    this.lastExtractionSlip = null;
+    this.grabStartAnchor = null;
+    this.grabStartBlockPos = null;
+    this.grabInitialClampingLoadN = 0;
+    this.grabSmoothedClampingLoadN = 0;
+    this.grabLastSmoothSimTime = -1;
+    this.slipAudioClearTicks = 0;
     this.grabLocalPoint = [0, 0, 0];
     this.grabWorldAnchor = [0, 0, 0];
     this.grabCurrentWorldOnBlock = [0, 0, 0];
@@ -1115,7 +1223,15 @@ export class MujocoWorkerBridge {
     this.shatteredCount = snap.shatteredCount;
     this.collapseReason = snap.collapseReason;
     this.activeBlockId = snap.activeBlockId;
+    this.hoverLocalPoint = null;
     this.hoveredSlotIndex = snap.hoveredSlotIndex;
+    this.lastExtractionSlip = null;
+    this.grabStartAnchor = null;
+    this.grabStartBlockPos = null;
+    this.grabInitialClampingLoadN = 0;
+    this.grabSmoothedClampingLoadN = 0;
+    this.grabLastSmoothSimTime = -1;
+    this.slipAudioClearTicks = 0;
     this.isPointerDraggingBlock = snap.isPointerDraggingBlock;
     this.grabLocalPoint = [...snap.grabLocalPoint];
     this.grabWorldAnchor = [...snap.grabWorldAnchor];
@@ -1201,6 +1317,7 @@ export class MujocoWorkerBridge {
     }
 
     this.blockPhotoelasticWrench = new Float32Array(snap.blockPhotoelasticWrench);
+    this.blockClampingLoadsN = new Float32Array(0);
     this.blockPhotoelasticStress01 = new Float32Array(snap.blockCount);
     for (let i = 0; i < snap.blockCount; i++) {
       const wb = i * 4;
@@ -1343,6 +1460,14 @@ export class MujocoWorkerBridge {
     // Optimistically mirror grab state for immediate spring-filament feedback on current frame
     this.activeBlockId = blockId;
     this.isPointerDraggingBlock = true;
+    this.lastExtractionSlip = null;
+    this.grabStartAnchor = [...worldPoint];
+    this.grabStartBlockPos = null;
+    this.grabInitialClampingLoadN = 0;
+    this.grabInitialClampingLoadN = this.getEffectiveGrabClampingLoadN(blockId, blk.position);
+    this.grabSmoothedClampingLoadN = this.grabInitialClampingLoadN;
+    this.grabLastSmoothSimTime = this.simTime;
+    this.grabStartBlockPos = [...blk.position];
     this.grabLocalPoint = [...localPoint];
     this.grabWorldAnchor = [...worldPoint];
     this.grabCurrentWorldOnBlock = [...worldPoint];
@@ -1359,6 +1484,7 @@ export class MujocoWorkerBridge {
     }
     const reqId = this.nextReqId++;
     const seq = ++this.commandSeq;
+    this.endGrabLockUntilSeq = 0;
     this.grabLockUntilSeq = seq;
     this.post({
       type: 'startGrabBlock',
@@ -1373,6 +1499,35 @@ export class MujocoWorkerBridge {
     return true;
   }
 
+  private getEffectiveGrabClampingLoadN(
+    blkId: number,
+    blkPos: Vec3,
+    isEndPush: boolean = false
+  ): number {
+    const blk = this.blocks[blkId];
+    const liveLoadN = this.computeBlockClampingLoadN(blkId);
+    let wrenchSum = 0;
+    if (blk?.isLooseSlot) {
+      const wb = blkId * 4;
+      wrenchSum =
+        wb + 2 < this.blockPhotoelasticWrench.length
+          ? (this.blockPhotoelasticWrench[wb + 0] ?? 0) +
+            (this.blockPhotoelasticWrench[wb + 1] ?? 0) +
+            (this.blockPhotoelasticWrench[wb + 2] ?? 0)
+          : 0;
+    }
+    return computeEffectiveGrabClampingLoadN({
+      liveLoadN,
+      isLooseSlot: Boolean(blk?.isLooseSlot),
+      wrenchSum,
+      blockPos: blkPos,
+      grabStartBlockPos: this.grabStartBlockPos,
+      grabInitialClampingLoadN: this.grabInitialClampingLoadN,
+      isEndPush,
+      smoothedLoadN: isEndPush ? this.grabSmoothedClampingLoadN : undefined,
+    });
+  }
+
   public updateGrabTarget(worldTargetOnPlane: Vec3, timestampMs?: number): void {
     this.grabWorldAnchor = [...worldTargetOnPlane];
     this.post({
@@ -1382,6 +1537,52 @@ export class MujocoWorkerBridge {
       worldTargetOnPlane: [...worldTargetOnPlane],
       timestampMs,
     });
+    if (
+      this.gameMode !== 'sandbox' &&
+      this.turnPhase === 'PULLING' &&
+      this.activeBlockId !== null
+    ) {
+      const blk = this.blocks[this.activeBlockId];
+      if (!blk || blk.shattered) return;
+      const isEndPush = isCompetitiveInwardEndPush({
+        gameMode: this.gameMode,
+        turnPhase: this.turnPhase,
+        blockRotation: blk.rotation,
+        grabLocalPointDm: this.grabLocalPoint,
+        grabCurrentWorldOnBlockDm: this.grabCurrentWorldOnBlock,
+        grabAnchorStartDm: this.grabStartAnchor ?? undefined,
+        targetWorldDm: worldTargetOnPlane,
+      });
+      const clampingLoadN = this.getEffectiveGrabClampingLoadN(blk.id, blk.position, isEndPush);
+      const evalRes = evaluateCompetitiveDragSlip({
+        gameMode: this.gameMode,
+        turnPhase: this.turnPhase,
+        blockRotation: blk.rotation,
+        grabLocalPointDm: this.grabLocalPoint,
+        grabCurrentWorldOnBlockDm: this.grabCurrentWorldOnBlock,
+        grabAnchorStartDm: this.grabStartAnchor ?? undefined,
+        targetWorldDm: worldTargetOnPlane,
+        clampingLoadN,
+        grabResistance01: this.grabResistance01,
+      });
+      const sameRowOtherCount = countOtherBlocksInLayer(this.blocks, blk);
+      const normalizedSlip = normalizeCompetitiveSlipResult(evalRes, sameRowOtherCount);
+      this.lastExtractionSlip = normalizedSlip;
+
+      if (shouldReleaseCompetitiveSlip(evalRes, sameRowOtherCount)) {
+        this.endGrab(false, timestampMs);
+        this.audio.updateSlideFriction(
+          1.25,
+          0.35,
+          16.0,
+          0,
+          Math.min(F_SLIP, clampingLoadN),
+          0.38
+        );
+        this.audio.playUiKeyUp?.('step');
+        this.slipAudioClearTicks = 3;
+      }
+    }
   }
 
   public updateCarriedHover(rayOrigin: Vec3, rayDir: Vec3): void {
@@ -1413,11 +1614,62 @@ export class MujocoWorkerBridge {
     });
   }
 
+  public computeBlockClampingLoadN(blockId: number): number {
+    if (blockId >= 0 && blockId < this.blockClampingLoadsN.length) {
+      return this.blockClampingLoadsN[blockId];
+    }
+    return estimateClampingLoadFromWrenchAndStack(
+      blockId,
+      this.blocks,
+      this.blockPhotoelasticWrench
+    );
+  }
+
+  public evaluateActiveExtractionSlip(targetWorldOnPlane?: Vec3): ExtractionSlipResult | null {
+    if (this.activeBlockId === null) return null;
+    const blk = this.blocks[this.activeBlockId];
+    if (!blk || blk.shattered) return null;
+    const targetDm = targetWorldOnPlane ?? this.grabWorldAnchor;
+    const isEndPush = isCompetitiveInwardEndPush({
+      gameMode: this.gameMode,
+      turnPhase: this.turnPhase,
+      blockRotation: blk.rotation,
+      grabLocalPointDm: this.grabLocalPoint,
+      grabCurrentWorldOnBlockDm: this.grabCurrentWorldOnBlock,
+      grabAnchorStartDm: this.grabStartAnchor ?? undefined,
+      targetWorldDm: targetDm,
+    });
+    const clampingLoadN = this.getEffectiveGrabClampingLoadN(blk.id, blk.position, isEndPush);
+    const res = evaluateCompetitiveDragSlip({
+      gameMode: this.gameMode,
+      turnPhase: this.turnPhase,
+      blockRotation: blk.rotation,
+      grabLocalPointDm: this.grabLocalPoint,
+      grabCurrentWorldOnBlockDm: this.grabCurrentWorldOnBlock,
+      grabAnchorStartDm: this.grabStartAnchor ?? undefined,
+      targetWorldDm: targetDm,
+      clampingLoadN,
+      grabResistance01: this.grabResistance01,
+    });
+    const sameRowOtherCount = countOtherBlocksInLayer(this.blocks, blk);
+    const normalized = normalizeCompetitiveSlipResult(res, sameRowOtherCount);
+    this.lastExtractionSlip = normalized;
+    return normalized;
+  }
+
   public endGrab(dropIfPoisedOverTower: boolean = false, timestampMs?: number): void {
     this.isPointerDraggingBlock = false;
     this.grabResistance01 = 0;
     this.grabLockUntilSeq = 0;
+    this.grabStartAnchor = null;
+    this.grabStartBlockPos = null;
+    this.grabInitialClampingLoadN = 0;
+    this.grabSmoothedClampingLoadN = 0;
+    this.grabLastSmoothSimTime = -1;
+    this.slipAudioClearTicks = 0;
+    const seq = ++this.commandSeq;
     if (this.turnPhase !== 'EXTRACTED') {
+      this.endGrabLockUntilSeq = seq;
       this.activeBlockId = null;
       if (this.turnPhase === 'PULLING') {
         this.turnPhase = 'SELECT_BLOCK';
@@ -1434,7 +1686,7 @@ export class MujocoWorkerBridge {
     this.post({
       type: 'endGrab',
       epoch: this.epoch,
-      seq: ++this.commandSeq,
+      seq,
       dropIfPoisedOverTower,
       timestampMs,
     });

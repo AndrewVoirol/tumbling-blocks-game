@@ -14,6 +14,7 @@ import {
   Vec3,
 } from '../math/vecMat';
 import {
+  BLOCK_HALF_X,
   LIGHTING_PRESETS,
   LightingPreset,
   STAINED_GLASS_PALETTE,
@@ -994,6 +995,7 @@ export class WebGPURenderer {
         { binding: 6, resource: this.sunOpticalDepthView },
         { binding: 7, resource: { buffer: this.shardVertexBuffer } },
         { binding: 8, resource: { buffer: this.blockCentersUniformBuffer } },
+        { binding: 9, resource: this.causticView },
       ],
     });
 
@@ -1197,8 +1199,28 @@ export class WebGPURenderer {
         this.blockStorageData[base + 42] = b.crackLocalOrigin[2];
         this.blockStorageData[base + 43] = b.damage;
 
-        const isHover = physics.hoveredBlockId === b.id ? 1.0 : 0.0;
-        const isGrab = physics.activeBlockId === b.id ? 1.0 : 0.0;
+        const ZONE_BOUNDARY_DM = BLOCK_HALF_X * 0.58; // 0.2175 dm (21.75 mm)
+        const isSandboxMode = physics.gameMode === 'sandbox';
+        let isHover = 0.0;
+        if (physics.hoveredBlockId === b.id) {
+          if (isSandboxMode) {
+            const hPt = (physics as any).hoverLocalPoint as Vec3 | null | undefined;
+            const hx = hPt ? Math.abs(hPt[0]) : 0.0;
+            isHover = hx > ZONE_BOUNDARY_DM ? 3.0 : 2.0;
+          } else {
+            isHover = 1.0;
+          }
+        }
+        let isGrab = 0.0;
+        if (physics.activeBlockId === b.id) {
+          if (isSandboxMode) {
+            const gPt = (physics as any).grabLocalPoint as Vec3 | null | undefined;
+            const gx = gPt ? Math.abs(gPt[0]) : 0.0;
+            isGrab = gx > ZONE_BOUNDARY_DM ? 3.0 : 2.0;
+          } else {
+            isGrab = 1.0;
+          }
+        }
         this.blockStorageData[base + 44] = isHover;
         this.blockStorageData[base + 45] = isGrab;
         this.blockStorageData[base + 46] = b.isLegalTarget ? 1.0 : 0.0;
@@ -1435,10 +1457,14 @@ export class WebGPURenderer {
       physics.activeBlockId !== null &&
       (physics.turnPhase === 'PULLING' || physics.gameMode === 'sandbox');
     if (showSpring) {
+      const gPt = (physics as any).grabLocalPoint as Vec3 | null | undefined;
+      const gx = gPt ? Math.abs(gPt[0]) : 0.0;
+      const springMode =
+        physics.gameMode === 'sandbox' ? (gx > BLOCK_HALF_X * 0.58 ? 3.0 : 2.0) : 1.0;
       this.springUniformData[0] = physics.grabCurrentWorldOnBlock[0];
       this.springUniformData[1] = physics.grabCurrentWorldOnBlock[1];
       this.springUniformData[2] = physics.grabCurrentWorldOnBlock[2];
-      this.springUniformData[3] = 1.0;
+      this.springUniformData[3] = springMode;
       this.springUniformData[4] = physics.grabWorldAnchor[0];
       this.springUniformData[5] = physics.grabWorldAnchor[1];
       this.springUniformData[6] = physics.grabWorldAnchor[2];

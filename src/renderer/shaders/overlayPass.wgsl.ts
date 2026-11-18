@@ -72,22 +72,25 @@ fn fs_slot_guide(input: SlotVSOut) -> @location(0) vec4<f32> {
   return vec4<f32>(rgb, alpha);
 }
 
-// Tactile Spring Tension Ribbon
+// Tactile Spring Tension Ribbon (with Sandbox 2-Zone Brass vs. Crystal Pivot Anchor Cue)
 struct LineVSOut {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) tAlong: f32,
   @location(1) vCross: f32,
   @location(2) resistance: f32,
+  @location(3) springMode: f32,
 };
 
 @vertex
 fn vs_spring_line(@builtin(vertex_index) vid: u32) -> LineVSOut {
   var out: LineVSOut;
-  if (uSpring.p0.w < 0.5) {
+  let mode = uSpring.p0.w;
+  if (mode < 0.5) {
     out.clipPos = vec4<f32>(0.0, 0.0, -2.0, 1.0);
     out.tAlong = 0.0;
     out.vCross = 0.0;
     out.resistance = 0.0;
+    out.springMode = 0.0;
     return out;
   }
 
@@ -106,19 +109,22 @@ fn vs_spring_line(@builtin(vertex_index) vid: u32) -> LineVSOut {
     out.tAlong = 0.0;
     out.vCross = 0.0;
     out.resistance = 0.0;
+    out.springMode = 0.0;
     return out;
   }
 
   let worldPt = mix(p0, p1, q.x);
   let toCam = normalize(uScene.cameraPosAndTime.xyz - worldPt);
   let side = normalize(cross(seg / segLen, toCam));
-  let thickness = 0.0055 + uSpring.p1AndRes.w * 0.0045;
+  let anchorFlare = select(1.0, 1.0 + 0.55 * (1.0 - smoothstep(0.0, 0.14, q.x)), mode > 1.5);
+  let thickness = (0.0055 + uSpring.p1AndRes.w * 0.0045) * anchorFlare;
   let finalWorld = worldPt + side * (q.y * thickness);
 
   out.clipPos = uScene.viewProj * vec4<f32>(finalWorld, 1.0);
   out.tAlong = q.x;
   out.vCross = q.y;
   out.resistance = uSpring.p1AndRes.w;
+  out.springMode = mode;
   return out;
 }
 
@@ -130,15 +136,26 @@ fn fs_spring_line(input: LineVSOut) -> @location(0) vec4<f32> {
   let looseCol = vec3<f32>(0.75, 0.94, 1.0);
   let snugCol = vec3<f32>(1.0, 0.76, 0.24);
   let pinnedCol = vec3<f32>(1.0, 0.22, 0.22);
-  let col = select(
+  var col = select(
     mix(looseCol, snugCol, clamp(input.resistance * 2.0, 0.0, 1.0)),
     mix(snugCol, pinnedCol, clamp((input.resistance - 0.5) * 2.0, 0.0, 1.0)),
     input.resistance > 0.5
   );
 
+  // Gap B: Sandbox 2-Zone Grip Anchor Cue (2.0 = Brass Heading-Hold, 3.0 = Silvered-Crystal Pivot)
+  var collarBoost = 0.0;
+  if (input.springMode > 1.5) {
+    let brassAnchor = vec3<f32>(0.96, 0.80, 0.42);
+    let pivotCrystal = vec3<f32>(0.72, 0.90, 1.0);
+    let zoneCol = select(brassAnchor, pivotCrystal, input.springMode > 2.5);
+    let anchorCollar = 1.0 - smoothstep(0.0, 0.18, input.tAlong);
+    col = mix(mix(col, zoneCol, 0.62), zoneCol, anchorCollar * 0.85);
+    collarBoost = anchorCollar * 0.28;
+  }
+
   // Subtle flowing bead animation toward cursor
   let wave = 0.75 + 0.25 * sin(input.tAlong * 22.0 - uScene.cameraPosAndTime.w * 10.0);
-  let alpha = soft * wave * 0.85;
+  let alpha = clamp(soft * (wave * 0.85 + collarBoost), 0.0, 0.96);
   return vec4<f32>(col * 2.2 * alpha, alpha);
 }
 `;

@@ -11,6 +11,16 @@ import {
 } from './MujocoPhysicsEngine';
 import { ensureMujocoInitialized } from './mujocoRuntime';
 import {
+  applyAssistiveEndPushImpulse,
+  computeEffectiveGrabClampingLoadN,
+  countOtherBlocksInLayer,
+  estimateClampingLoadFromWrenchAndStack,
+  type ExtractionSlipResult,
+  isCompetitiveInwardEndPush,
+  normalizeCompetitiveSlipResult,
+  updateEndPushSmoothedClampingLoadN,
+} from './extractionMechanics';
+import {
   GameMode,
   GlassBlockState,
   MicroSplinter,
@@ -33,6 +43,7 @@ export type WorkerAudioEvent =
       slipPowerMw: number;
       torsionRadPerSec: number;
       clampingLoadN?: number;
+      seamCrossingIntensity?: number;
     }
   | {
       kind: 'tapTest';
@@ -110,6 +121,7 @@ export interface WorkerSnapshotPayload {
   blockTransforms: Float32Array;
   blockPhotoelasticStress01: Float32Array;
   blockPhotoelasticWrench: Float32Array;
+  blockClampingLoadsN?: Float32Array;
   /** Packed stride = 14 floats per active shard: id(1), pos(3), quat(4), linVel(3), angVel(3) */
   shardTransforms: Float32Array;
   newShardMetas: WorkerShardStaticMeta[];
@@ -137,6 +149,7 @@ export interface WorkerSnapshotPayload {
   grabResistance01: number;
   isPointerDraggingBlock: boolean;
   isExtractionLiftReady: boolean;
+  lastExtractionSlip?: ExtractionSlipResult | null;
   carriedLandingPos: Vec3;
   carriedTargetPos: Vec3;
   carriedTargetQuat: Quat;
@@ -299,7 +312,8 @@ class WorkerAudioProxy extends GlassAudioEngine {
     resistance01: number,
     slipPowerMilliwatts: number = 0,
     torsionRadPerSec: number = 0,
-    clampingLoadN?: number
+    clampingLoadN?: number,
+    seamCrossingIntensity?: number
   ): void {
     this.latestSlide = {
       kind: 'slideFriction',
@@ -308,6 +322,7 @@ class WorkerAudioProxy extends GlassAudioEngine {
       slipPowerMw: slipPowerMilliwatts,
       torsionRadPerSec,
       clampingLoadN,
+      seamCrossingIntensity,
     };
   }
 
@@ -429,6 +444,41 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
   let lastProcessedSeq = 0;
   let disposed = false;
   const knownShardIds = new Set<number>();
+  let grabStartAnchor: Vec3 | null = null;
+  let grabStartBlockPos: Vec3 | null = null;
+  let grabInitialClampingLoadN = 0;
+  let grabSmoothedClampingLoadN = 0;
+  let lastExtractionSlip: ExtractionSlipResult | null = null;
+  const wrenchScratch = new Float32Array(4);
+
+  const getEffectiveGrabClampingLoadN = (
+    eng: MujocoPhysicsEngine,
+    blkId: number,
+    blkPos: Vec3,
+    useEngineDirect: boolean = true,
+    isEndPush: boolean = false
+  ): number => {
+    const blk = eng.blocks[blkId];
+    const liveLoadN = useEngineDirect
+      ? eng.computeBlockClampingLoadN(blkId)
+      : estimateClampingLoadFromWrenchAndStack(blkId, eng.blocks, eng.blockPhotoelasticWrench);
+    let wrenchSum = 0;
+    if (blk?.isLooseSlot) {
+      wrenchScratch.fill(0);
+      eng.writeBlockPhotoelasticWrench(blkId, wrenchScratch, 0);
+      wrenchSum = wrenchScratch[0] + wrenchScratch[1] + wrenchScratch[2];
+    }
+    return computeEffectiveGrabClampingLoadN({
+      liveLoadN,
+      isLooseSlot: Boolean(blk?.isLooseSlot),
+      wrenchSum,
+      blockPos: blkPos,
+      grabStartBlockPos,
+      grabInitialClampingLoadN,
+      isEndPush,
+      smoothedLoadN: isEndPush ? grabSmoothedClampingLoadN : undefined,
+    });
+  };
 
   function buildSnapshot(isFullRebuild: boolean): {
     snapshot: WorkerSnapshotPayload;
@@ -481,6 +531,10 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
 
     const stressCopy = new Float32Array(eng.blockPhotoelasticStress01);
     const wrenchCopy = new Float32Array(eng.blockPhotoelasticWrench);
+    const clampingLoadsCopy = new Float32Array(blockCount);
+    for (let i = 0; i < blockCount; i++) {
+      clampingLoadsCopy[i] = eng.computeBlockClampingLoadN(i);
+    }
 
     const shardCount = eng.shards.length;
     const shardTransforms = new Float32Array(shardCount * 14);
@@ -549,6 +603,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
       blockTransforms.buffer,
       stressCopy.buffer,
       wrenchCopy.buffer,
+      clampingLoadsCopy.buffer,
       shardTransforms.buffer,
     ];
     for (const up of shardUploads) {
@@ -572,6 +627,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
       blockTransforms,
       blockPhotoelasticStress01: stressCopy,
       blockPhotoelasticWrench: wrenchCopy,
+      blockClampingLoadsN: clampingLoadsCopy,
       shardTransforms,
       newShardMetas,
       shardUploads,
@@ -612,6 +668,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
       grabResistance01: eng.grabResistance01,
       isPointerDraggingBlock: eng.isPointerDraggingBlock,
       isExtractionLiftReady: eng.isExtractionLiftReady,
+      lastExtractionSlip,
       carriedLandingPos: [...eng.carriedLandingPos],
       carriedTargetPos: [...eng.carriedTargetPos],
       carriedTargetQuat: [...eng.carriedTargetQuat],
@@ -676,6 +733,11 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         undefined,
         msg.seed
       );
+      grabStartAnchor = null;
+      grabStartBlockPos = null;
+      grabInitialClampingLoadN = 0;
+      grabSmoothedClampingLoadN = 0;
+      lastExtractionSlip = null;
       const { snapshot, transfer } = buildSnapshot(true);
       scope.postMessage(
         {
@@ -714,18 +776,85 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         if (engine.turnPhase === 'SELECT_BLOCK' || engine.gameMode === 'sandbox') {
           engine.hoveredBlockId = msg.hoveredBlockId;
         }
+        if (
+          engine.gameMode !== 'sandbox' &&
+          engine.turnPhase === 'PULLING' &&
+          engine.isPointerDraggingBlock &&
+          engine.activeBlockId !== null
+        ) {
+          const blk = engine.blocks[engine.activeBlockId];
+          if (blk && !blk.shattered && !blk.extracted) {
+            const isEndPush = isCompetitiveInwardEndPush({
+              gameMode: engine.gameMode,
+              turnPhase: engine.turnPhase,
+              blockRotation: blk.rotation,
+              grabLocalPointDm: engine.grabLocalPoint,
+              grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+              grabAnchorStartDm: grabStartAnchor ?? undefined,
+              targetWorldDm: engine.grabWorldAnchor,
+            });
+            if (isEndPush) {
+              grabSmoothedClampingLoadN = updateEndPushSmoothedClampingLoadN(
+                grabSmoothedClampingLoadN,
+                engine.computeBlockClampingLoadN(blk.id),
+                msg.dt
+              );
+            }
+            const clampingLoadN = getEffectiveGrabClampingLoadN(
+              engine,
+              blk.id,
+              blk.position,
+              true,
+              isEndPush
+            );
+            const rb = engine.getWorld()?.getRigidBody(blk.bodyHandle);
+            const evalRes = applyAssistiveEndPushImpulse({
+              gameMode: engine.gameMode,
+              turnPhase: engine.turnPhase,
+              isPointerDraggingBlock: engine.isPointerDraggingBlock,
+              blockPos: blk.position,
+              blockRotation: blk.rotation,
+              blockLinVel: blk.linVel,
+              grabLocalPointDm: engine.grabLocalPoint,
+              grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+              grabWorldAnchorDm: engine.grabWorldAnchor,
+              grabAnchorStartDm: grabStartAnchor ?? undefined,
+              grabStartBlockPos,
+              clampingLoadN,
+              grabResistance01: engine.grabResistance01,
+              dt: msg.dt,
+              applyImpulseAtPoint: (impulseSim, pointDm) => {
+                rb?.applyImpulseAtPoint(impulseSim, pointDm, true);
+              },
+            });
+            const sameRowOtherCount = countOtherBlocksInLayer(engine.blocks, blk);
+            lastExtractionSlip = normalizeCompetitiveSlipResult(evalRes, sameRowOtherCount);
+          }
+        } else {
+          lastExtractionSlip = null;
+        }
         engine.step(msg.dt);
         postSnapshot(false);
         break;
       }
       case 'rebuildTower': {
         audioProxy?.flush();
+        grabStartAnchor = null;
+        grabStartBlockPos = null;
+        grabInitialClampingLoadN = 0;
+        grabSmoothedClampingLoadN = 0;
+        lastExtractionSlip = null;
         engine.rebuildTower(msg.mode, msg.players, msg.layers, msg.seed);
         postSnapshot(true);
         break;
       }
       case 'resetTower': {
         audioProxy?.flush();
+        grabStartAnchor = null;
+        grabStartBlockPos = null;
+        grabInitialClampingLoadN = 0;
+        grabSmoothedClampingLoadN = 0;
+        lastExtractionSlip = null;
         engine.resetTower(msg.layers, msg.seed);
         postSnapshot(true);
         break;
@@ -733,6 +862,11 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
       case 'applyCompactSnapshot': {
         audioProxy?.flush();
         knownShardIds.clear();
+        grabStartAnchor = null;
+        grabStartBlockPos = null;
+        grabInitialClampingLoadN = 0;
+        grabSmoothedClampingLoadN = 0;
+        lastExtractionSlip = null;
         engine.applyCompactSnapshot(msg.snapshot);
         postSnapshot(true);
         break;
@@ -749,6 +883,18 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
           msg.worldPoint,
           msg.timestampMs
         );
+        if (started) {
+          lastExtractionSlip = null;
+          grabStartAnchor = [...msg.worldPoint];
+          const blk = engine.blocks[msg.blockId];
+          grabStartBlockPos = null;
+          grabInitialClampingLoadN = 0;
+          grabInitialClampingLoadN = blk
+            ? getEffectiveGrabClampingLoadN(engine, msg.blockId, blk.position)
+            : 0;
+          grabSmoothedClampingLoadN = grabInitialClampingLoadN;
+          grabStartBlockPos = blk ? [...blk.position] : null;
+        }
         scope.postMessage({
           type: 'grabStarted',
           epoch: workerEpoch,
@@ -778,6 +924,11 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         break;
       }
       case 'endGrab': {
+        grabStartAnchor = null;
+        grabStartBlockPos = null;
+        grabInitialClampingLoadN = 0;
+        grabSmoothedClampingLoadN = 0;
+        lastExtractionSlip = null;
         engine.endGrab(msg.dropIfPoisedOverTower, msg.timestampMs);
         postSnapshot(false);
         break;

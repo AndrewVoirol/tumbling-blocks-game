@@ -18,6 +18,7 @@ ${COMMON_GLASS_WGSL}
 @group(0) @binding(6) var uSunOpticalDepthTex: texture_2d<f32>;
 @group(0) @binding(7) var<storage, read> uShardVerts: array<f32>;
 @group(0) @binding(8) var<storage, read> uBlockCenters: array<vec4<f32>>;
+@group(0) @binding(9) var uCausticTex: texture_2d<f32>;
 
 struct ShardVSOut {
   @builtin(position) clipPos: vec4<f32>,
@@ -107,6 +108,7 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let aaFilter = max(dParent.x, max(dParent.y, dParent.z));
   let _keepDepth = f32(textureDimensions(uSunDepthTex).x) * 0.0;
   let _keepOpt = f32(textureDimensions(uSunOpticalDepthTex).x) * 0.0;
+  let _keepCaustic = f32(textureDimensions(uCausticTex).x) * 0.0;
   let polariscope = uBlockCenters[97].w;
   let _keepCenters = uBlockCenters[0].x * 0.0;
 
@@ -145,7 +147,19 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let sigmaSelf = mix(shAbs, shAcc.xyz, vitrail.accentMix) + SODA_LIME_IRON_SIGMA;
   let tauSelfApprox = sigmaSelf * 0.09 + vec3<f32>(0.088);
   let tauUpstream = max(vec3<f32>(0.0), optSample.rgb - tauSelfApprox) * (1.0 - rawSunVis);
-  let sunTransRGB = mix(exp(-tauUpstream * 0.80), vec3<f32>(1.0), rawSunVis) * windowGobo;
+
+  let sunClip = uScene.sunViewProj * vec4<f32>(input.worldPos, 1.0);
+  let sunNdc = sunClip.xyz / max(sunClip.w, 1e-6);
+  let sunUV = vec2<f32>(sunNdc.x * 0.5 + 0.5, 0.5 - sunNdc.y * 0.5);
+  var causticFlux = vec3<f32>(0.0);
+  if (sunUV.x >= 0.002 && sunUV.x <= 0.998 && sunUV.y >= 0.002 && sunUV.y <= 0.998) {
+    causticFlux = textureSampleLevel(uCausticTex, uLinearSampler, sunUV, 0.0).rgb;
+  }
+
+  let polariscopeMod = 1.0 - 0.75 * polariscope;
+  let rawSunTrans = mix(exp(-tauUpstream * 0.80), vec3<f32>(1.0), rawSunVis) * windowGobo;
+  let sunTransRGB = (rawSunTrans + causticFlux * (1.0 - rawSunVis * 0.45) * windowGobo) * polariscopeMod;
+  let directSunVis = rawSunVis * windowGobo * polariscopeMod;
 
   // Measure exact 3D distance & ridge normal along this facet to nearest snapped dihedral glass edge
   var minCleavageEdgeDist: f32 = 1.0;
@@ -230,7 +244,6 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   }
 
   // 3. Refract out of back facet — with exact dielectric Fresnel transition into Total Internal Reflection (TIR)!
-  let directSunVis = rawSunVis * windowGobo;
   let reflSunColor = sunColor * mix(0.14 + 0.86 * sunTransRGB, vec3<f32>(1.0), directSunVis);
 
   let internalExitCos = clamp(abs(dot(internalWorld, exitNWorld)), 0.0, 1.0);
@@ -344,7 +357,8 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let transmitWeight = 1.0 - untintedF - tintedGrazingF * 0.45;
   let rawGlint = sunSpec + edgeSpecGlint;
   let boundedGlint = rawGlint / (vec3<f32>(1.0) + rawGlint * 0.45);
-  var shardRGB = interiorRadiant * transmitWeight + reflTerm + boundedGlint + vec3<f32>(_keepDepth + _keepOpt + _keepCenters);
+  let surfaceCaustic = causticFlux * sunColor * 0.10 * windowGobo * polariscopeMod;
+  var shardRGB = interiorRadiant * transmitWeight + reflTerm + boundedGlint + surfaceCaustic + vec3<f32>(_keepDepth + _keepOpt + _keepCenters + _keepCaustic);
 
   // Optional recessed 60/40 tin-lead / copper-foil came conductor shading on outer motif facets
   let cameWeight = vitrail.cameMask * input.isOuter;
@@ -392,7 +406,7 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
     let fringeEnergy = max(0.18, bgLuma * 1.35 + dot(transmittedSunGlow, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.15 + 0.13 * skyScale);
     let fringeGate = smoothstep(0.11, 0.46, residualStress);
     shardRGB = (darkFieldBase + shardIsochromatic * fringeEnergy * fringeGate * (1.0 - fresnel * 0.42)) * (1.0 - cameWeight * 0.84)
-             + vec3<f32>(_keepDepth + _keepOpt + _keepCenters);
+             + vec3<f32>(_keepDepth + _keepOpt + _keepCenters + _keepCaustic);
   }
 
   return vec4<f32>(shardRGB, camDist);

@@ -82,6 +82,7 @@ export interface SlideScrapeParams {
   torsionRadPerSec?: number;
   damage?: number;
   worldPos?: [number, number, number];
+  seamCrossingIntensity?: number;
 }
 
 interface TrackedVoice {
@@ -142,7 +143,7 @@ export class GlassAudioEngine {
   private trackedVoices: TrackedVoice[] = [];
 
   /** Total concurrent transient Web Audio oscillator/buffer voices ceiling (with priority voice-stealing) */
-  public readonly MAX_VOICES = 24;
+  public readonly MAX_VOICES = 12;
   /** Strict concurrent secondary Voronoi shard micro-grain cap (<= 12) */
   public readonly MAX_SHARD_GRAINS = 12;
 
@@ -163,6 +164,9 @@ export class GlassAudioEngine {
     qFactor: number;
     decayMs: number;
     fundamentalHz: number;
+    splitBeatHz?: number;
+    doubletFreqHz?: number;
+    doubletSpawned?: boolean;
   } | null = null;
 
   public lastSlideDiagnostics: {
@@ -173,6 +177,7 @@ export class GlassAudioEngine {
     resonatorQ: number;
     singGain: number;
     raspGain: number;
+    seamCrossingIntensity: number;
   } | null = null;
 
   private recentImpactLog: AudioImpactTelemetryEntry[] = [];
@@ -580,6 +585,7 @@ export class GlassAudioEngine {
       resonatorQ: profile.resonatorQ,
       singGain: profile.singGain,
       raspGain: profile.raspGain,
+      seamCrossingIntensity: clampFinite(params.seamCrossingIntensity ?? 0, 0, 1, 0),
     };
 
     if (!this.ctx || !this.slideGain || !this.slideFilterA || !this.slideFilterB) return;
@@ -604,9 +610,11 @@ export class GlassAudioEngine {
       return;
     }
 
+    const seamIntensity = clampFinite(params.seamCrossingIntensity ?? 0, 0, 1, 0);
+
     if (this.slideRaspGain && this.slideRaspFilter) {
       this.slideRaspFilter.frequency.setTargetAtTime(
-        safeFreqHz(3150 + clampFinite(params.slideSpeedMps, 0, 1.5, 0) * 2400, sr),
+        safeFreqHz(3150 + clampFinite(params.slideSpeedMps, 0, 1.5, 0) * 2400 + seamIntensity * 950, sr),
         now,
         0.02
       );
@@ -629,7 +637,7 @@ export class GlassAudioEngine {
         0.02
       );
       this.slideStickLfoDepth.gain.setTargetAtTime(
-        0.28 * profile.stickSlipIndex01,
+        clampFinite(0.28 * profile.stickSlipIndex01, 0, 1, 0),
         now,
         0.02
       );
@@ -647,7 +655,8 @@ export class GlassAudioEngine {
     resistance01: number,
     slipPowerMilliwatts: number = 0,
     torsionRadPerSec: number = 0,
-    clampingLoadN?: number
+    clampingLoadN?: number,
+    seamCrossingIntensity?: number
   ): void {
     const speedMps = clampFinite(slideSpeedDmPerSec, 0, 30, 0) * 0.1;
     const res = clampFinite(resistance01, 0, 1, 0);
@@ -655,11 +664,13 @@ export class GlassAudioEngine {
       clampingLoadN !== undefined
         ? clampFinite(clampingLoadN, 0, 60, 0)
         : res * 9.5 + clampFinite(slipPowerMilliwatts, 0, 100, 0) * 0.04;
+    const seamIntensity = clampFinite(seamCrossingIntensity ?? 0, 0, 1, 0);
     this.updateSlideScrape({
       slideSpeedMps: speedMps,
       clampingLoadN: inferredClampN,
       slipPowerMilliwatts,
       torsionRadPerSec,
+      seamCrossingIntensity: seamIntensity,
     });
   }
 
@@ -688,11 +699,17 @@ export class GlassAudioEngine {
     const decayMs = clampFinite(28.0 + 0.82 * t60Ms, 28.0, 240.0, 160.0);
     const fundamentalHz = primary.freqHz;
 
+    const isDuctile = dmg >= 0.78 && dmg <= 0.96;
+    const shouldSpawnDoublet = isDuctile && primary.splitBeatHz > 0;
+
     this.lastTapDiagnostics = {
       pinch01: p,
       qFactor,
       decayMs,
       fundamentalHz,
+      splitBeatHz: primary.splitBeatHz,
+      doubletFreqHz: primary.doubletFreqHz,
+      doubletSpawned: shouldSpawnDoublet,
     };
 
     const tapNowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -730,6 +747,29 @@ export class GlassAudioEngine {
     this.registerTransientVoice(osc0, [g0], cleanup0, stop0, 0.55);
     osc0.start(now);
     osc0.stop(stop0);
+
+    // 1b. Ductile solder-held cracked brick acoustic doublet partner (warble tone)
+    if (shouldSpawnDoublet && this.acquireVoiceSlot(now, 0.50)) {
+      const oscSplit = this.ctx.createOscillator();
+      const gSplit = this.ctx.createGain();
+      oscSplit.type = 'sine';
+      const splitFreq =
+        primary.doubletFreqHz > 0
+          ? primary.doubletFreqHz
+          : fundamentalHz + primary.splitBeatHz;
+      oscSplit.frequency.value = safeFreqHz(splitFreq * detune, sr);
+      const splitDur = Math.max(0.014, durSec * 0.88);
+      const splitGain = safeGain(looseGain * (0.35 + 0.35 * dmg));
+      gSplit.gain.setValueAtTime(0.0001, now);
+      gSplit.gain.linearRampToValueAtTime(splitGain, now + 0.001);
+      gSplit.gain.exponentialRampToValueAtTime(0.0001, now + splitDur);
+      oscSplit.connect(gSplit);
+      const cleanupSplit = this.connectPanned(gSplit, worldPos, camPos, camRight);
+      const stopSplit = now + splitDur + 0.008;
+      this.registerTransientVoice(oscSplit, [gSplit], cleanupSplit, stopSplit, 0.50);
+      oscSplit.start(now);
+      oscSplit.stop(stopSplit);
+    }
 
     // 2. Timoshenko second flexural overtone (suppressed under heavy clamping or crazing)
     if (secondary && this.acquireVoiceSlot(now, 0.4)) {
@@ -802,7 +842,8 @@ export class GlassAudioEngine {
         computeHertzianModeGain(pm.freqHz, hertzWood.cutoffHz) *
         (i === 0 ? 0.95 : 0.68);
       if (modeGain < 0.004) continue;
-      if (!this.acquireVoiceSlot(now, 0.52 - i * 0.06)) break;
+      const platePriority = 0.66 - i * 0.08;
+      if (!this.acquireVoiceSlot(now, platePriority)) break;
 
       const osc = this.ctx.createOscillator();
       const g = this.ctx.createGain();
@@ -817,7 +858,7 @@ export class GlassAudioEngine {
       osc.connect(g);
       const cleanup = this.connectPanned(g, worldPos, camPos, camRight);
       const stopT = now + dur + 0.008;
-      this.registerTransientVoice(osc, [g], cleanup, stopT, 0.52 - i * 0.06);
+      this.registerTransientVoice(osc, [g], cleanup, stopT, platePriority);
       osc.start(now);
       osc.stop(stopT);
     }
@@ -1070,8 +1111,8 @@ export class GlassAudioEngine {
       osc.stop(stopT);
       scheduledVoices++;
 
-      // Crazed glass doublet-splitting beat partner on the primary flexural mode
-      if (i === 0 && damage > 0.12 && m.splitBeatHz > 1.0 && this.acquireVoiceSlot(now, priorityBase - 0.08)) {
+      // Ductile copper-foil cracked brick doublet-splitting beat partner on the primary flexural mode (d in [0.78, 0.96])
+      if (i === 0 && damage >= 0.78 && damage <= 0.96 && m.splitBeatHz > 1.0 && this.acquireVoiceSlot(now, priorityBase - 0.08)) {
         const oscSplit = this.ctx.createOscillator();
         const gSplit = this.ctx.createGain();
         oscSplit.type = 'sine';

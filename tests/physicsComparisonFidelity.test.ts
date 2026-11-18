@@ -1,11 +1,31 @@
 import { describe, expect, it } from 'vitest';
 import { GlassAudioEngine } from '../src/audio/GlassAudioEngine';
+import { computeGlassBarModes } from '../src/audio/physicalModalModels';
 import { GameEngine } from '../src/engine/GameEngine';
-import { quatFromAxisAngle, quatInverseRotateVec3, quatRotateVec3 } from '../src/math/vecMat';
+import { MultiplayerGuestWorld } from '../src/multiplayer';
+import { quatFromAxisAngle, quatInverseRotateVec3, quatRotateVec3, Vec3 } from '../src/math/vecMat';
+import {
+  BLOCK_HALF_X as EXTRACTION_BLOCK_HALF_X,
+  F_PINCH,
+  F_PUSH_MAX,
+  F_SLIP,
+  MU_FINGER,
+  ZONE_BODY,
+  ZONE_BOUNDARY_DM,
+  ZONE_END_TIP,
+  applyAssistiveEndPushImpulse,
+  computeGripZoneFromLocalDm,
+  estimateClampingLoadFromWrenchAndStack,
+  evaluateExtractionSlip,
+  normalizeCompetitiveSlipResult,
+  shouldReleaseCompetitiveSlip,
+  updateEndPushSmoothedClampingLoadN,
+} from '../src/physics/extractionMechanics';
 import {
   BLOCK_HALF_X,
   BLOCK_HALF_Y,
   BLOCK_HALF_Z,
+  LIGHTING_PRESETS,
   SIM_TIME_SCALE,
   TABLE_RADIUS,
 } from '../src/physics/constants';
@@ -30,6 +50,19 @@ import {
   PhysicsWorld,
   SHIPPED_FIDELITY_CONFIG,
 } from '../src/physics/PhysicsWorld';
+import {
+  CAME_INNER_BOUND_X_DM,
+  CAME_INNER_BOUND_Z_DM,
+  accumulateSolderCameContact,
+  evaluateSolderCamePoint,
+  MU_KINETIC_GLASS,
+  MU_KINETIC_SOLDER,
+  resetSolderCameAggregate,
+  SOLDER_CAME_HEIGHT_DM,
+  SOLDER_CAME_WIDTH_DM,
+  type SolderCameAggregateResult,
+} from '../src/physics/solderCameTribology';
+import { GLASS_TOWER_WGSL } from '../src/renderer/shaders/glassTower.wgsl';
 
 function syncBlockPoseClean(
   pw: PhysicsWorld,
@@ -2310,4 +2343,1530 @@ describe('Vitrail A/B Physics & Acoustic Fidelity Comparison (M1–M6)', () => {
       nw.dispose();
     }
   }, 120000);
+
+  // =========================================================================
+  // Gap A: Single-Block Under-Belly Cullet Wedge Escape & Re-Solidification
+  // =========================================================================
+  it('Gap A: Single-block under-belly cullet wedge escape (nearIntactBlocks === 1, high vertical force) & mandatory 0x22 re-solidification', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    const pw = new PhysicsWorld(audio, 2, { seed: 42 });
+    pw.rebuildTower('sandbox', 2, 2, 42);
+    for (let f = 0; f < 20; f++) pw.step(1 / 60);
+
+    const rw = pw.getWorld();
+    const mjModel = rw.getModel()!;
+
+    const syncPose = (idx: number, pos: [number, number, number], quat: [number, number, number, number] = [0, 0, 0, 1]) => {
+      const b = pw.blocks[idx]!;
+      const rb = rw.getRigidBody(b.bodyHandle)!;
+      rb.setTranslation({ x: pos[0], y: pos[1], z: pos[2] }, true);
+      rb.setRotation({ x: quat[0], y: quat[1], z: quat[2], w: quat[3] }, true);
+      rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    };
+
+    // Teleport blocks 2, 4..5 away, keep block 3 (layer 1) to sit on top of block 0
+    for (let i = 2; i < pw.blocks.length; i++) {
+      if (i === 3) continue; // keep weight block 3
+      pw.blocks[i]!.extracted = true;
+      rw.getRigidBody(pw.blocks[i]!.bodyHandle)!.setTranslation({ x: -6 - i * 0.8, y: -5, z: -5 }, false);
+    }
+    syncPose(1, [0.0, 0.22, 0.0]);
+    pw.shatterBlock(pw.blocks[1]!, [0, 0, 0], 11.0, [0, 1, 0], true);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+
+    const targetShard = pw.shards.find((s) => mjModel.geom_contype[s.colliderHandle] === MJ_CONTYPE_CULLET_SHARD)!;
+    expect(targetShard).toBeDefined();
+    const rbShard = rw.getRigidBody(targetShard.bodyHandle)!;
+
+    for (const s of pw.shards) {
+      if (s.slotIndex !== targetShard.slotIndex) {
+        rw.getRigidBody(s.bodyHandle)!.setTranslation({ x: 5.0 + s.slotIndex * 0.2, y: 0.1, z: 5.0 }, false);
+      }
+    }
+
+    const pusher = pw.blocks[0]!;
+    // 1. Under-belly pinch: position shard under pusher belly with weight block 3 on top
+    rbShard.setTranslation({ x: 0.0, y: 0.015, z: 0.0 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+
+    syncPose(0, [0.0, 0.090, 0.0]);
+    // Place weight block 3 directly on top of pusher to supply sustained vertical bearing load
+    syncPose(3, [0.0, 0.090 + 0.15, 0.0]);
+    rw.getRigidBody(pw.blocks[3]!.bodyHandle)!.setGravityScale(5.0, true);
+
+    const g0: [number, number, number] = [0.0, 0.090, 0.0];
+    pw.startGrabBlock(0, [0, 0, 0], g0, 1000);
+
+    let sawEscape = false;
+    let recordedNearIntactBlocks = 0;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, 0.075, 0.0], 1000 + f * 16.67);
+      pw.step(1 / 60);
+
+      const caff = mjModel.geom_conaffinity[targetShard.colliderHandle];
+      if ((caff & 0x02) === 0) {
+        sawEscape = true;
+        if (recordedNearIntactBlocks === 0) {
+          recordedNearIntactBlocks = (targetShard as { nearIntactBlocks?: number }).nearIntactBlocks ?? 0;
+        }
+      }
+    }
+
+    // Verify 0x20 escape was triggered during underbelly drag under strict nearIntactBlocks === 1
+    expect(sawEscape).toBe(true);
+    expect(recordedNearIntactBlocks).toBe(1);
+
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+
+    // Verify mandatory 100% re-solidification (postSettleGhosts === 0 and targetShard conaffinity === 0x22)
+    let postSettleGhosts = 0;
+    for (const s of pw.shards) {
+      const offRim = Math.hypot(s.position[0], s.position[2]) > TABLE_RADIUS + 0.01;
+      if (!offRim && mjModel.geom_contype[s.colliderHandle] === MJ_CONTYPE_CULLET_SHARD) {
+        if ((mjModel.geom_conaffinity[s.colliderHandle] & MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE) !== MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE) {
+          postSettleGhosts++;
+        }
+      }
+    }
+    expect(postSettleGhosts).toBe(0);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 2. Frontal plow check: shard placed in front of leading bevel is actively plowed forward
+    pw.blocks[3]!.extracted = true;
+    rw.getRigidBody(pw.blocks[3]!.bodyHandle)!.setGravityScale(1.0, false);
+    rw.getRigidBody(pw.blocks[3]!.bodyHandle)!.setTranslation({ x: -10, y: -5, z: -5 }, false);
+
+    syncPose(0, [0.0, BLOCK_HALF_Y, 0.0]);
+    for (let f = 0; f < 30; f++) pw.step(1 / 60);
+
+    const initShardX = pusher.position[0] + BLOCK_HALF_X + 0.04;
+    rbShard.setTranslation({ x: initShardX, y: 0.02, z: pusher.position[2] }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    for (let f = 0; f < 10; f++) pw.step(1 / 60);
+
+    const plowG0: [number, number, number] = [pusher.position[0], pusher.position[1], pusher.position[2]];
+    pw.startGrabBlock(0, [0, 0, 0], plowG0, 2000);
+
+    let interiorPassThroughs = 0;
+    for (let f = 1; f <= 50; f++) {
+      const gx = plowG0[0] + (0.6 * f) / 50;
+      pw.updateGrabTarget([gx, plowG0[1], plowG0[2]], 2000 + f * 16.67);
+      pw.step(1 / 60);
+
+      if (targetShard.position[0] < pusher.position[0]) {
+        interiorPassThroughs++;
+      }
+    }
+
+    pw.endGrab(false);
+    for (let f = 0; f < 30; f++) pw.step(1 / 60);
+
+    const adv = targetShard.position[0] - initShardX;
+    const plowRatio = adv > 0.15 ? 1.0 : adv / 0.15;
+    expect(plowRatio).toBe(1.0);
+    expect(interiorPassThroughs).toBe(0);
+    expect((mjModel.geom_conaffinity[targetShard.colliderHandle] & MJ_CONTYPE_BLOCK)).toBe(MJ_CONTYPE_BLOCK);
+
+    // 3. Normal 1.0g two-block under-belly pinch (no 5.0g multiplier): paired normal force triggers 0x20 escape & re-solidifies
+    pw.blocks[3]!.extracted = false;
+    rw.getRigidBody(pw.blocks[3]!.bodyHandle)!.setGravityScale(1.0, true);
+    rbShard.setTranslation({ x: 0.0, y: 0.015, z: 0.0 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [0.0, 0.090, 0.0]);
+    syncPose(3, [0.0, 0.090 + 0.15, 0.0]);
+    const g1g: [number, number, number] = [0.0, 0.090, 0.0];
+    pw.startGrabBlock(0, [0, 0, 0], g1g, 3000);
+    let sawEscape1g = false;
+    let recordedNear1g = 0;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, 0.075, 0.0], 3000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[targetShard.colliderHandle] & 0x02) === 0) {
+        sawEscape1g = true;
+        if (recordedNear1g === 0) {
+          recordedNear1g = (targetShard as { nearIntactBlocks?: number }).nearIntactBlocks ?? 0;
+        }
+      }
+    }
+    expect(sawEscape1g).toBe(true);
+    expect(recordedNear1g).toBe(1);
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 4. Upside-down (180° roll around X) 1.0g under-belly pinch: orientation-symmetric hasUnderbellyWedge triggers 0x20 escape & re-solidifies
+    rbShard.setTranslation({ x: 0.0, y: 0.015, z: 0.0 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [0.0, 0.090, 0.0], [1, 0, 0, 0]);
+    syncPose(3, [0.0, 0.090 + 0.15, 0.0]);
+    const gUpsideDown: [number, number, number] = [0.0, 0.090, 0.0];
+    pw.startGrabBlock(0, [0, 0, 0], gUpsideDown, 5000);
+    let sawEscapeUpsideDown = false;
+    let recordedNearUpsideDown = 0;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, 0.075, 0.0], 5000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[targetShard.colliderHandle] & 0x02) === 0) {
+        sawEscapeUpsideDown = true;
+        if (recordedNearUpsideDown === 0) {
+          recordedNearUpsideDown = (targetShard as { nearIntactBlocks?: number }).nearIntactBlocks ?? 0;
+        }
+      }
+    }
+    expect(sawEscapeUpsideDown).toBe(true);
+    expect(recordedNearUpsideDown).toBe(1);
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 5. On-edge (90° roll around X) 1.0g under-belly pinch: long narrow side facing down triggers 0x20 escape & re-solidifies
+    rbShard.setTranslation({ x: 0.0, y: 0.015, z: 0.0 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [0.0, 0.140, 0.0], [Math.SQRT1_2, 0, 0, Math.SQRT1_2]);
+    syncPose(3, [0.0, 0.340, 0.0]);
+    const gOnEdge: [number, number, number] = [0.0, 0.140, 0.0];
+    pw.startGrabBlock(0, [0, 0, 0], gOnEdge, 7000);
+    let sawEscapeOnEdge = false;
+    let recordedNearOnEdge = 0;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, 0.125, 0.0], 7000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[targetShard.colliderHandle] & 0x02) === 0) {
+        sawEscapeOnEdge = true;
+        if (recordedNearOnEdge === 0) {
+          recordedNearOnEdge = (targetShard as { nearIntactBlocks?: number }).nearIntactBlocks ?? 0;
+        }
+      }
+    }
+    expect(sawEscapeOnEdge).toBe(true);
+    expect(recordedNearOnEdge).toBe(1);
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 6. On-edge 6.0 mm off-center narrow-face contact (inside 7.5 mm half-face) escapes & re-solidifies
+    rbShard.setTranslation({ x: 0.0, y: 0.015, z: 0.060 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [0.0, 0.140, 0.0], [Math.SQRT1_2, 0, 0, Math.SQRT1_2]);
+    syncPose(3, [0.0, 0.340, 0.0]);
+    pw.startGrabBlock(0, [0, 0, 0], [0.0, 0.140, 0.0], 9000);
+    let sawEscapeOnEdgeOff6 = false;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, 0.125, 0.0], 9000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[targetShard.colliderHandle] & 0x02) === 0) {
+        sawEscapeOnEdgeOff6 = true;
+      }
+    }
+    expect(sawEscapeOnEdgeOff6).toBe(true);
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 7. On-end (90° pitch around Z) under-belly pinch escapes & re-solidifies
+    rbShard.setTranslation({ x: 0.0, y: 0.015, z: 0.0 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [0.0, 0.395, 0.0], [0, 0, Math.SQRT1_2, Math.SQRT1_2]);
+    syncPose(3, [0.0, 0.855, 0.0]);
+    pw.startGrabBlock(0, [0, 0, 0], [0.0, 0.395, 0.0], 11000);
+    let sawEscapeOnEnd = false;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, 0.375, 0.0], 11000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[targetShard.colliderHandle] & 0x02) === 0) {
+        sawEscapeOnEnd = true;
+      }
+    }
+    expect(sawEscapeOnEnd).toBe(true);
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 8. Tri-axial ~35° tilt (all |downLocal*| < 0.7) escapes & re-solidifies (full SO(3) coverage)
+    const qRawTilt = [0.28, 0.28, 0.28, 0.87];
+    const qNormTilt = Math.hypot(qRawTilt[0], qRawTilt[1], qRawTilt[2], qRawTilt[3]);
+    const qTilt: [number, number, number, number] = [
+      qRawTilt[0] / qNormTilt,
+      qRawTilt[1] / qNormTilt,
+      qRawTilt[2] / qNormTilt,
+      qRawTilt[3] / qNormTilt,
+    ];
+    const wLowTilt = quatRotateVec3(qTilt, [-0.34, -BLOCK_HALF_Y, 0.10]);
+    const bxTilt = -wLowTilt[0];
+    const byTilt = 0.060 - wLowTilt[1] + 0.01;
+    const bzTilt = -wLowTilt[2];
+    rbShard.setTranslation({ x: 0.0, y: 0.025, z: 0.0 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [bxTilt, byTilt, bzTilt], qTilt);
+    syncPose(3, [bxTilt, byTilt + 0.30, bzTilt]);
+    pw.startGrabBlock(0, [0.30, 0, 0], [bxTilt + 0.25, byTilt, bzTilt], 13000);
+    let sawEscapeTilt = false;
+    for (let f = 1; f <= 40; f++) {
+      pw.updateGrabTarget([bxTilt + 0.25 + 0.001 * f, byTilt - 0.03, bzTilt], 13000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[targetShard.colliderHandle] & 0x02) === 0) {
+        sawEscapeTilt = true;
+      }
+    }
+    expect(sawEscapeTilt).toBe(true);
+    pw.endGrab(false);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    expect(mjModel.geom_conaffinity[targetShard.colliderHandle]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    // 9. Thick 6.0 mm shard (`hy = 0.060 dm`) under upright block escapes without micro-bounce starvation
+    const gidT = targetShard.colliderHandle;
+    mjModel.geom_type[gidT] = 6;
+    mjModel.geom_dataid[gidT] = -1;
+    mjModel.geom_pos[gidT * 3 + 0] = 0;
+    mjModel.geom_pos[gidT * 3 + 1] = 0;
+    mjModel.geom_pos[gidT * 3 + 2] = 0;
+    mjModel.geom_size[gidT * 3 + 0] = 0.004;
+    mjModel.geom_size[gidT * 3 + 1] = 0.006;
+    mjModel.geom_size[gidT * 3 + 2] = 0.004;
+    mjModel.geom_aabb[gidT * 6 + 3] = 0.004;
+    mjModel.geom_aabb[gidT * 6 + 4] = 0.006;
+    mjModel.geom_aabb[gidT * 6 + 5] = 0.004;
+    mjModel.geom_rbound[gidT] = Math.hypot(0.004, 0.006, 0.004);
+    rbShard.setTranslation({ x: 0.0, y: 0.060, z: 0.0 }, true);
+    rbShard.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+    rbShard.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    syncPose(0, [0.0, 0.197, 0.0], [0, 0, 0, 1]);
+    syncPose(3, [0.0, 0.350, 0.0], [0, 0, 0, 1]);
+    pw.startGrabBlock(0, [0, 0, 0], [0.0, 0.197, 0.0], 15000);
+    let sawEscapeThick = false;
+    for (let f = 1; f <= 50; f++) {
+      pw.updateGrabTarget([0.001 * f, BLOCK_HALF_Y, 0.0], 15000 + f * 16.67);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[gidT] & 0x02) === 0) {
+        sawEscapeThick = true;
+      }
+    }
+    expect(sawEscapeThick).toBe(true);
+
+    // 10. Post-drag re-solidification is local-block scoped: unrelated 0.035 m/s sliding neighbor does not keep ghost alive
+    pw.blocks[4]!.extracted = false;
+    syncPose(4, [2.0, BLOCK_HALF_Y, 2.0], [0, 0, 0, 1]);
+    pw.endGrab(false);
+    let postDragGhostWithMovingNeighbor = 0;
+    for (let f = 1; f <= 20; f++) {
+      rw.getRigidBody(pw.blocks[4]!.bodyHandle)!.setLinvel({ x: 0.35, y: 0, z: 0 }, true);
+      pw.step(1 / 60);
+      if ((mjModel.geom_conaffinity[gidT] & 0x02) === 0) {
+        postDragGhostWithMovingNeighbor++;
+      }
+    }
+    expect(postDragGhostWithMovingNeighbor).toBe(0);
+    expect(mjModel.geom_conaffinity[gidT]).toBe(MJ_CONAFFINITY_SOLID_CULLET_ON_TABLE);
+
+    pw.dispose();
+  }, 60000);
+
+  // =========================================================================
+  // Gap B: 2-Zone Physical Grip Boundary & Visual Anchor Plumbing
+  // =========================================================================
+  it('Gap B: 2-Zone physical grip boundary (|localX| <= 21.75 mm) & legible visual anchor plumbing', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    const pw = new PhysicsWorld(audio, 2, { seed: 42 });
+    pw.rebuildTower('sandbox', 2, 2, 42);
+    for (let f = 0; f < 20; f++) pw.step(1 / 60);
+
+    const thresholdDm = BLOCK_HALF_X * 0.58; // 0.2175 dm = 21.75 mm
+    expect(thresholdDm).toBeCloseTo(0.2175, 4);
+
+    const pusher = pw.blocks[0]!;
+    const g0: [number, number, number] = [pusher.position[0], pusher.position[1], pusher.position[2]];
+
+    // 1. Production 2-zone grip state via startGrabBlock
+    // Center point (Body grip: |localX| <= 21.75 mm)
+    pw.startGrabBlock(0, [0.0, 0, 0], g0, 1000);
+    expect((pw as any).grabIsEndGrip).toBe(false);
+
+    // Just inside boundary (Body grip)
+    pw.startGrabBlock(0, [thresholdDm - 0.005, 0, 0], g0, 1001);
+    expect((pw as any).grabIsEndGrip).toBe(false);
+
+    // Just outside boundary (End-Tip grip)
+    pw.startGrabBlock(0, [thresholdDm + 0.005, 0, 0], g0, 1002);
+    expect((pw as any).grabIsEndGrip).toBe(true);
+
+    // Negative X just inside boundary (Body grip)
+    pw.startGrabBlock(0, [-thresholdDm + 0.005, 0, 0], g0, 1003);
+    expect((pw as any).grabIsEndGrip).toBe(false);
+
+    // Negative X just outside boundary (End-Tip grip)
+    pw.startGrabBlock(0, [-thresholdDm - 0.005, 0, 0], g0, 1004);
+    expect((pw as any).grabIsEndGrip).toBe(true);
+
+    pw.endGrab(false);
+
+    // 2. Shader has 2-zone came line and anchor feedback
+    expect(GLASS_TOWER_WGSL).toContain('0.2175');
+    expect(GLASS_TOWER_WGSL).toContain('boundaryCameLine');
+    expect(GLASS_TOWER_WGSL).toContain('brassCameAnchor');
+    expect(GLASS_TOWER_WGSL).toContain('jewelPivotTrailer');
+
+    pw.dispose();
+  }, 25000);
+
+  // =========================================================================
+  // M11: Proud Solder Came Perimeter Tribology (Track 1)
+  // =========================================================================
+  it('M11: Proud solder came perimeter tribology (Track 1): energy-passive catch-release force step, audio coupling & T1/T4 non-interference', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    // 1. Perimeter geometry check: 2.0 mm border on 75 x 25 x 15 mm block
+    expect(SOLDER_CAME_WIDTH_DM * 100).toBeCloseTo(2.0, 2);
+    expect(SOLDER_CAME_HEIGHT_DM * 100).toBeCloseTo(0.15, 2);
+    expect(CAME_INNER_BOUND_X_DM * 100).toBeCloseTo(35.5, 2);
+    expect(CAME_INNER_BOUND_Z_DM * 100).toBeCloseTo(10.5, 2);
+
+    // Center point (smooth glass)
+    const center = { ...evaluateSolderCamePoint([0, 0.075, 0], [0.1, 0, 0], 1.0) };
+    expect(center.isOnCame).toBe(false);
+    expect(center.effectiveFriction).toBeCloseTo(MU_KINETIC_GLASS, 3);
+    expect(center.isSeamCrossing).toBe(false);
+
+    // Came border point (60/40 Sn-Pb solder)
+    const border = { ...evaluateSolderCamePoint([0.365, 0.075, 0], [0.1, 0, 0], 1.0) };
+    expect(border.isOnCame).toBe(true);
+    expect(border.effectiveFriction).toBeCloseTo(MU_KINETIC_SOLDER, 3);
+
+    // Seam crossing point (transition band with tangential catch force)
+    const seam = { ...evaluateSolderCamePoint([0.355, 0.075, 0], [0.05, 0, 0], 2.0) };
+    expect(seam.isSeamCrossing).toBe(true);
+    expect(seam.tangentialResistForceN).toBeGreaterThanOrEqual(0.05);
+    expect(seam.tangentialResistForceN).toBeLessThanOrEqual(0.50);
+    expect(seam.seamCrossingIntensity).toBeGreaterThan(0);
+    expect(seam.seamCrossingIntensity).toBeLessThanOrEqual(1.0);
+
+    // Energy passivity: resistance opposes velocity (delta E <= 0)
+    expect(seam.tangentialResistForceN).toBeGreaterThan(0);
+
+    // 2. Audio texture coupling
+    audio.updateSlideFriction(0.12, 0.8, 15, 0.5, 2.0, seam.seamCrossingIntensity);
+    expect(audio.lastSlideDiagnostics?.seamCrossingIntensity).toBe(seam.seamCrossingIntensity);
+
+    // 3. T1 18L tower sag remains < 0.15 mm
+    const pw = new PhysicsWorld(audio, 18, { seed: 42 });
+    pw.rebuildTower('solo', 2, 18, 42);
+    for (let f = 0; f < 90; f++) pw.step(1 / 60);
+    let maxTopCenter18 = 0;
+    for (const b of pw.blocks) {
+      if (b.assignedLayer === 17 && !b.isLooseSlot) {
+        maxTopCenter18 = Math.max(maxTopCenter18, b.position[1]);
+      }
+    }
+    const idealTopCenter18 = (17 + 0.5) * 0.15;
+    const sagMm = Math.max(0, idealTopCenter18 - maxTopCenter18) * 100.0;
+    expect(sagMm).toBeLessThan(0.15);
+    pw.dispose();
+
+    // 4. Tier 2: 24L tower sag remains < 0.50 mm under solder came tribology
+    const pw24 = new PhysicsWorld(audio, 24, { seed: 42 });
+    pw24.rebuildTower('solo', 2, 24, 42);
+    for (let f = 0; f < 100; f++) pw24.step(1 / 60);
+    let maxTopCenter24 = 0;
+    for (const b of pw24.blocks) {
+      if (b.assignedLayer === 23 && !b.isLooseSlot) {
+        maxTopCenter24 = Math.max(maxTopCenter24, b.position[1]);
+      }
+    }
+    const idealTopCenter24 = (23 + 0.5) * 0.15;
+    const sag24Mm = Math.max(0, idealTopCenter24 - maxTopCenter24) * 100.0;
+    expect(sag24Mm).toBeLessThan(0.50);
+    pw24.dispose();
+
+    // 5. Diagonal sliding continuity check (|vx| ~ |vz|): zero knife-edge step jump
+    // Corner (+X, -Z) at [CAME_INNER_BOUND_X_DM, 0.075, -CAME_INNER_BOUND_Z_DM] dm:
+    // dx = 0 and dz = 0 continuously; verify smooth C1 climbRatio across theta = 45 deg
+    const hitDiag: [number, number, number] = [CAME_INNER_BOUND_X_DM, 0.075, -CAME_INNER_BOUND_Z_DM];
+    const th1 = (44.95 * Math.PI) / 180;
+    const th2 = (45.05 * Math.PI) / 180;
+    const velDiag1: [number, number, number] = [0.05 * Math.cos(th1), 0, 0.05 * Math.sin(th1)];
+    const velDiag2: [number, number, number] = [0.05 * Math.cos(th2), 0, 0.05 * Math.sin(th2)];
+    const resDiag1 = { ...evaluateSolderCamePoint(hitDiag, velDiag1, 2.0) };
+    const resDiag2 = { ...evaluateSolderCamePoint(hitDiag, velDiag2, 2.0) };
+
+    // Assert that friction delta and tangential force delta are smooth and bounded (delta F <= 0.005 N vs 0.150 N step jump)
+    expect(Math.abs(resDiag1.effectiveFriction - resDiag2.effectiveFriction)).toBeLessThan(0.005);
+    expect(Math.abs(resDiag1.tangentialResistForceN - resDiag2.tangentialResistForceN)).toBeLessThan(0.005);
+    expect(Math.abs(resDiag1.seamCrossingIntensity - resDiag2.seamCrossingIntensity)).toBeLessThan(0.005);
+
+    // Exact orthogonal decoupling: pure X velocity completely decouples Z came border
+    const hitZOnly: [number, number, number] = [0, 0.075, 0.115];
+    const velPureX: [number, number, number] = [0.05, 0, 0];
+    const resPureX = evaluateSolderCamePoint(hitZOnly, velPureX, 1.0);
+    expect(resPureX.isOnCame).toBe(false);
+    expect(resPureX.effectiveFriction).toBeCloseTo(MU_KINETIC_GLASS, 4);
+
+    // 6. Live PhysicsWorld extraction sweep: smooth interior glass glide -> came seam crossing catch & audio -> EXTRACTED
+    const pwLive = new PhysicsWorld(audio, 18, { seed: 42 });
+    pwLive.rebuildTower('solo', 2, 18, 42);
+    for (let f = 0; f < 48; f++) pwLive.step(1 / 60);
+    const midLoose =
+      pwLive.blocks.find((b) => b.assignedLayer === 8 && b.isLooseSlot) ??
+      pwLive.blocks.find((b) => b.assignedLayer >= 6 && b.assignedLayer <= 12 && b.isLooseSlot)!;
+    expect(midLoose).toBeDefined();
+    const axisX = quatRotateVec3(midLoose.rotation, [1, 0, 0]);
+    const grabOff = quatRotateVec3(midLoose.rotation, [0.18, 0, 0]);
+    const p0: [number, number, number] = [...midLoose.position];
+    const gStart: [number, number, number] = [
+      p0[0] + grabOff[0],
+      p0[1] + grabOff[1],
+      p0[2] + grabOff[2],
+    ];
+    pwLive.startGrabBlock(midLoose.id, [0.18, 0, 0], gStart, 1000);
+
+    let seamCrossingPeak = 0;
+    let minInteriorFriction = Number.POSITIVE_INFINITY;
+    let cameFrictionPeak = 0;
+    for (let s = 1; s <= 140; s++) {
+      const pullDist = (1.35 * s) / 140;
+      pwLive.updateGrabTarget(
+        [
+          gStart[0] + axisX[0] * pullDist,
+          gStart[1] + axisX[1] * pullDist,
+          gStart[2] + axisX[2] * pullDist,
+        ],
+        1000 + s * (1000 / 120)
+      );
+      pwLive.step(1 / 120);
+      const slidDist = Math.hypot(
+        midLoose.position[0] - p0[0],
+        midLoose.position[2] - p0[2]
+      );
+      if (slidDist > 0.04 && slidDist < 0.14) {
+        minInteriorFriction = Math.min(minInteriorFriction, midLoose.currentFriction);
+      }
+      if (slidDist >= 0.16 && !midLoose.extracted) {
+        cameFrictionPeak = Math.max(cameFrictionPeak, midLoose.currentFriction);
+      }
+      const diagSeam = audio.lastSlideDiagnostics?.seamCrossingIntensity ?? 0;
+      if (diagSeam > seamCrossingPeak) seamCrossingPeak = diagSeam;
+      if (pwLive.turnPhase === 'EXTRACTED') break;
+    }
+    expect(seamCrossingPeak).toBeGreaterThan(0.10);
+    expect(minInteriorFriction).toBeLessThan(0.165);
+    expect(cameFrictionPeak).toBeGreaterThan(0.175);
+    expect(pwLive.turnPhase).toBe('EXTRACTED');
+    expect(pwLive.leanAngleDeg).toBeLessThan(2.0);
+    pwLive.dispose();
+
+    // 7. Negative/NaN normalForceN clamping & multi-instance SolderCameAggregateResult re-entrancy safety
+    const negLoad = evaluateSolderCamePoint([0.355, 0.075, 0], [1.0, 0, 0], -5.0);
+    expect(negLoad.seamCrossingIntensity).toBe(0);
+    expect(negLoad.tangentialResistForceN).toBe(0);
+    const nanLoad = evaluateSolderCamePoint([0.355, 0.075, 0], [1.0, 0, 0], Number.NaN);
+    expect(nanLoad.seamCrossingIntensity).toBe(0);
+    expect(nanLoad.tangentialResistForceN).toBe(0);
+
+    const aggA: SolderCameAggregateResult = {
+      maxSeamCrossingIntensity: 0,
+      totalResistForceN: 0,
+      weightedEffectiveFriction: MU_KINETIC_GLASS,
+      contactCount: 0,
+      cameBorderContactCount: 0,
+    };
+    const aggB: SolderCameAggregateResult = {
+      maxSeamCrossingIntensity: 0,
+      totalResistForceN: 0,
+      weightedEffectiveFriction: MU_KINETIC_GLASS,
+      contactCount: 0,
+      cameBorderContactCount: 0,
+    };
+    resetSolderCameAggregate(aggA);
+    resetSolderCameAggregate(aggB);
+    accumulateSolderCameContact([0, 0.075, 0], [0.1, 0, 0], 4.0, aggA);
+    accumulateSolderCameContact([0.365, 0.075, 0], [0.1, 0, 0], 4.0, aggB);
+    accumulateSolderCameContact([0, 0.075, 0], [0.1, 0, 0], Number.NaN, aggA);
+    expect(aggA.weightedEffectiveFriction).toBeCloseTo(MU_KINETIC_GLASS, 4);
+    expect(aggB.weightedEffectiveFriction).toBeCloseTo(MU_KINETIC_SOLDER, 4);
+    expect(Number.isFinite(aggA.weightedEffectiveFriction)).toBe(true);
+
+    // 8. Worker boundary (`MujocoWorkerBridge`) & Host/Guest Multiplayer boundary (`installHostAudioTap` + `MultiplayerGuestWorld`)
+    //    must preserve `seamCrossingIntensity > 0` without dropping the 6th argument.
+    const wAudio = new GlassAudioEngine();
+    wAudio.setMuted(true);
+    const m11Chan = new MessageChannel();
+    const m11HostScope = {
+      onmessage: null as ((ev: MessageEvent<WorkerInboundMessage>) => void) | null,
+      postMessage: (msg: WorkerOutboundMessage, transfer?: Transferable[]) => {
+        m11Chan.port2.postMessage(msg, transfer as never);
+      },
+    };
+    const m11ClientEndpoint: WorkerEndpointLike = {
+      onmessage: null,
+      postMessage: (msg: WorkerInboundMessage, transfer?: Transferable[]) => {
+        m11Chan.port1.postMessage(msg, transfer as never);
+      },
+    };
+    m11Chan.port1.onmessage = (ev: MessageEvent<WorkerOutboundMessage>) => {
+      m11ClientEndpoint.onmessage?.(ev);
+    };
+    m11Chan.port2.onmessage = (ev: MessageEvent<WorkerInboundMessage>) => {
+      m11HostScope.onmessage?.(ev);
+    };
+    m11Chan.port1.start();
+    m11Chan.port2.start();
+
+    const m11HostHandle = attachMujocoWorkerHost(m11HostScope);
+    const m11Bridge = await MujocoWorkerBridge.create(wAudio, 18, 42, m11ClientEndpoint);
+    const stepM11Bridge = async (dt = 1 / 60): Promise<void> => {
+      await new Promise<void>((resolve) => {
+        const prev = m11ClientEndpoint.onmessage;
+        m11ClientEndpoint.onmessage = (ev: MessageEvent<WorkerOutboundMessage>) => {
+          prev?.(ev);
+          if (ev.data.type === 'snapshot' && ev.data.epoch === m11Bridge.getEpoch()) {
+            m11ClientEndpoint.onmessage = prev;
+            resolve();
+          }
+        };
+        m11Bridge.step(dt);
+      });
+    };
+    m11Bridge.rebuildTower('solo', 2, 18, 42);
+    for (let f = 0; f < 48; f++) await stepM11Bridge(1 / 60);
+    const wMidLoose =
+      m11Bridge.blocks.find((b) => b.assignedLayer === 8 && b.isLooseSlot) ??
+      m11Bridge.blocks.find((b) => b.assignedLayer >= 6 && b.assignedLayer <= 12 && b.isLooseSlot)!;
+    const wAx = quatRotateVec3(wMidLoose.rotation, [1, 0, 0]);
+    const wGrabOff = quatRotateVec3(wMidLoose.rotation, [0.18, 0, 0]);
+    const wStart: Vec3 = [
+      wMidLoose.position[0] + wGrabOff[0],
+      wMidLoose.position[1] + wGrabOff[1],
+      wMidLoose.position[2] + wGrabOff[2],
+    ];
+    m11Bridge.startGrabBlock(wMidLoose.id, [0.18, 0, 0], wStart, 2000);
+    let workerSeamPeak = 0;
+    for (let s = 1; s <= 75; s++) {
+      const pullDist = (1.35 * s) / 75;
+      m11Bridge.updateGrabTarget(
+        [wStart[0] + wAx[0] * pullDist, wStart[1] + wAx[1] * pullDist, wStart[2] + wAx[2] * pullDist],
+        2000 + Math.round(s * (1000 / 60))
+      );
+      await stepM11Bridge(1 / 60);
+      const diagSeam = wAudio.lastSlideDiagnostics?.seamCrossingIntensity ?? 0;
+      if (diagSeam > workerSeamPeak) workerSeamPeak = diagSeam;
+      if (m11Bridge.turnPhase === 'EXTRACTED') break;
+    }
+    expect(workerSeamPeak).toBeGreaterThan(0.10);
+    m11Bridge.dispose();
+    m11HostHandle.dispose();
+    m11Chan.port1.close();
+    m11Chan.port2.close();
+
+    // Host AudioTap -> Outbound Queue -> Guest Replay preserves seamCrossingIntensity
+    const tapEngine = new GameEngine();
+    await tapEngine.initHeadless();
+    (tapEngine as unknown as { mpRole: 'host' }).mpRole = 'host';
+    (tapEngine as unknown as { mpStatus: { peerConnected: boolean } }).mpStatus.peerConnected = true;
+    tapEngine.installHostAudioTap();
+    tapEngine.audio.updateSlideFriction(0.65, 0.55, 18, 0.2, 2.5, 0.72);
+    expect(tapEngine.audio.lastSlideDiagnostics?.seamCrossingIntensity).toBeCloseTo(0.72, 4);
+    const queuedSlide = tapEngine
+      .getOutboundAudioQueueSnapshot()
+      .find((ev) => ev.kind === 'slideFriction');
+    expect(queuedSlide?.kind).toBe('slideFriction');
+    if (queuedSlide?.kind === 'slideFriction') {
+      expect(queuedSlide.seamCrossingIntensity).toBeCloseTo(0.72, 4);
+      const guestAudio = new GlassAudioEngine();
+      guestAudio.setMuted(true);
+      const guestWorld = new MultiplayerGuestWorld(guestAudio);
+      guestWorld.replayNetworkAudioEvents([queuedSlide], 1);
+      expect(guestAudio.lastSlideDiagnostics?.seamCrossingIntensity).toBeCloseTo(0.72, 4);
+      guestWorld.dispose();
+    }
+    tapEngine.dispose();
+  }, 60000);
+
+  // =========================================================================
+  // M12: Ductile Solder-Held Cracked Bricks & Modal Doublet Splitting (Track 2)
+  // =========================================================================
+  it('M12: Ductile solder-held cracked bricks & acoustic doublet splitting (Track 2): cohesion bracket d in [0.78, 0.96], tear threshold & 30-48 Hz modal beating', async () => {
+    await ensurePhysicsInitialized();
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+
+    const pw = new PhysicsWorld(audio, 2, { seed: 42 });
+    pw.rebuildTower('sandbox', 2, 2, 42);
+    for (let f = 0; f < 20; f++) pw.step(1 / 60);
+
+    const rw = pw.getWorld();
+    const b0 = pw.blocks[0]!; // test block -> cleaved -> shattered
+    const b1 = pw.blocks[1]!; // fresh control block
+    for (let i = 2; i < pw.blocks.length; i++) {
+      pw.blocks[i]!.extracted = true;
+      rw.getRigidBody(pw.blocks[i]!.bodyHandle)!.setTranslation({ x: -6 - i * 0.8, y: -5, z: -5 }, false);
+    }
+
+    // Park control block b1 aside
+    syncBlockPoseClean(pw, 1, [2.8, BLOCK_HALF_Y, 2.8], [0, 0, 0, 1], [0, 0, 0]);
+
+    // 1. Stage 1: Fresh block b0 (damage === 0) drops 11.0 cm onto oak table (intermediate impact in [vCleave, vTearFresh))
+    // -> enters ductile copper-foil cleavage bracket [0.78, 0.96] WITHOUT shattering
+    expect(b0.damage).toBe(0);
+    syncBlockPoseClean(pw, 0, [0, 1.10 + BLOCK_HALF_Y, 0], [0, 0, 0, 1], [0, 0, 0]);
+    for (let f = 0; f < 40; f++) pw.step(1 / 60);
+
+    expect(b0.shattered).toBe(false);
+    expect(b0.damage).toBeGreaterThanOrEqual(0.78);
+    expect(b0.damage).toBeLessThanOrEqual(0.96);
+    expect(pw.splinters.length).toBeGreaterThan(0);
+    const cleavedDamage = b0.damage;
+
+    // 2. Stage 2: Cleaved brick survives moderate 1.5 cm handling drop without shattering
+    syncBlockPoseClean(pw, 0, [0, 0.15 + BLOCK_HALF_Y, 0], [0, 0, 0, 1], [0, 0, 0]);
+    for (let f = 0; f < 40; f++) pw.step(1 / 60);
+    expect(b0.shattered).toBe(false);
+    expect(b0.damage).toBeGreaterThanOrEqual(0.78);
+    expect(b0.damage).toBeLessThanOrEqual(0.96);
+
+    // 3. Stage 3: Fresh control b1 from 9.5 cm does NOT shatter; cleaved b0 from 9.5 cm tears seam & shatters into Voronoi shards
+    syncBlockPoseClean(pw, 0, [-2.8, BLOCK_HALF_Y, -2.8], [0, 0, 0, 1], [0, 0, 0]);
+    syncBlockPoseClean(pw, 1, [0, 0.95 + BLOCK_HALF_Y, 0], [0, 0, 0, 1], [0, 0, 0]);
+    for (let f = 0; f < 40; f++) pw.step(1 / 60);
+    expect(b1.shattered).toBe(false);
+    expect(b1.damage).toBeLessThan(0.78);
+
+    syncBlockPoseClean(pw, 1, [2.8, BLOCK_HALF_Y, 2.8], [0, 0, 0, 1], [0, 0, 0]);
+    syncBlockPoseClean(pw, 0, [0, 0.95 + BLOCK_HALF_Y, 0], [0, 0, 0, 1], [0, 0, 0]);
+    for (let f = 0; f < 40; f++) pw.step(1 / 60);
+    expect(b0.shattered).toBe(true);
+    expect(pw.shards.length).toBeGreaterThanOrEqual(10);
+
+    // 4. Stage 4: Modal doublet splitting & live GlassAudioEngine tap doublet check
+    const modes = computeGlassBarModes({ damage: cleavedDamage });
+    const fund = modes[0]!;
+    expect(fund.splitBeatHz).toBeGreaterThanOrEqual(25.0);
+    expect(fund.splitBeatHz).toBeLessThanOrEqual(48.0);
+    expect(fund.doubletFreqHz).toBeCloseTo(fund.freqHz + fund.splitBeatHz, 5);
+    audio.playTapTestResonance(0, b0.position, undefined, undefined, cleavedDamage);
+    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(true);
+
+    pw.dispose();
+  }, 30000);
+
+  // =========================================================================
+  // M13: 3D Inter-Course Colored Caustic Projection (Track 3)
+  // =========================================================================
+  it('M13: 3D inter-course colored caustic projection (Track 3): lower course & gap wall illumination across 4 lighting presets & Polariscope dark field', async () => {
+    // 1. Verify all 4 lighting presets exist and have valid solar angles
+    expect(LIGHTING_PRESETS.length).toBe(4);
+    const morning = LIGHTING_PRESETS.find((p) => p.id === 'lancet-morning')!;
+    const noon = LIGHTING_PRESETS.find((p) => p.id === 'high-clerestory')!;
+    const atelier = LIGHTING_PRESETS.find((p) => p.id === 'daylight-atelier')!;
+    const vespers = LIGHTING_PRESETS.find((p) => p.id === 'golden-vespers')!;
+
+    expect(morning).toBeDefined();
+    expect(noon).toBeDefined();
+    expect(atelier).toBeDefined();
+    expect(vespers).toBeDefined();
+
+    expect(noon.sunElevationDeg).toBeGreaterThan(morning.sunElevationDeg);
+    expect(vespers.sunElevationDeg).toBeLessThan(noon.sunElevationDeg);
+
+    // 2. Verify WGSL shaders contain caustic sampling, polariscope modulation and 2-zone came line
+    expect(GLASS_TOWER_WGSL).toContain('uCausticTex');
+    expect(GLASS_TOWER_WGSL).toContain('uBlockCenters[97].w');
+    expect(GLASS_TOWER_WGSL).toContain('polariscopeMod');
+    expect(GLASS_TOWER_WGSL).toContain('surfaceCaustic');
+  });
+
+  // =========================================================================
+  // M14: Push vs Pinch Extraction Mechanics (Track 4)
+  // =========================================================================
+  it('M14: Push vs pinch extraction mechanics (Track 4): end push (18 N) vs pinch slip (3.42 N), 18L clamping parity, hover zones, Glazier AI & Guest parity', async () => {
+    await ensurePhysicsInitialized();
+
+    // 1. Track 4 physical constants & evaluateExtractionSlip boundary verification
+    expect(EXTRACTION_BLOCK_HALF_X).toBeCloseTo(0.0375, 5);
+    expect(MU_FINGER).toBeCloseTo(0.38, 4);
+    expect(F_PINCH).toBeCloseTo(4.5, 4);
+    expect(F_SLIP).toBeCloseTo(2 * MU_FINGER * F_PINCH, 5); // 3.42 N
+    expect(F_PUSH_MAX).toBeCloseTo(18.0, 4);
+
+    // End face (|localX| >= 0.0325 m) inward push: resists slip up to 18.0 N
+    const pushWithinCap = evaluateExtractionSlip([0.035, 0, 0], 10.5, true);
+    expect(pushWithinCap).toEqual({ slipped: false, maxForceN: 18.0, slipAudio: false });
+
+    const pushAtBoundary = evaluateExtractionSlip({ x: -0.0325, y: 0, z: 0 }, 18.0, true);
+    expect(pushAtBoundary).toEqual({ slipped: false, maxForceN: 18.0, slipAudio: false });
+
+    const pushOverMax = evaluateExtractionSlip([0.036, 0, 0], 18.5, true);
+    expect(pushOverMax).toEqual({ slipped: true, maxForceN: 18.0, slipAudio: true });
+
+    // End face outward pull (isPush = false): bounded by F_SLIP = 3.42 N
+    const endPullSafe = evaluateExtractionSlip([0.035, 0, 0], 2.5, false);
+    expect(endPullSafe).toEqual({ slipped: false, maxForceN: F_SLIP, slipAudio: false });
+
+    const endPullSlip = evaluateExtractionSlip([0.035, 0, 0], 3.5, false);
+    expect(endPullSlip).toEqual({ slipped: true, maxForceN: F_SLIP, slipAudio: true });
+
+    // Slick side face (|localX| < 0.0325 m): always bounded by F_SLIP = 3.42 N even if isPush = true
+    const sidePinchSlip = evaluateExtractionSlip({ x: 0.01, y: 0, z: 0.0125 }, 4.2, true);
+    expect(sidePinchSlip).toEqual({ slipped: true, maxForceN: F_SLIP, slipAudio: true });
+
+    // 2. Real 18-layer MuJoCo tower clamping differentiation & solo extraction behavior
+    const audio = new GlassAudioEngine();
+    audio.setMuted(true);
+    const pw = new PhysicsWorld(audio, 18, { seed: 42 });
+    pw.rebuildTower('solo', 2, 18, 42);
+    for (let f = 0; f < 90; f++) pw.step(1 / 60);
+
+    const tightMid = pw.blocks.find((b) => b.assignedLayer === 8 && !b.isLooseSlot)!;
+    const looseMid = pw.blocks.find((b) => b.assignedLayer === 8 && b.isLooseSlot)!;
+    expect(tightMid).toBeDefined();
+    expect(looseMid).toBeDefined();
+
+    const tightLoadN = pw.computeBlockClampingLoadN(tightMid.id);
+    const looseLoadN = pw.computeBlockClampingLoadN(looseMid.id);
+    expect(tightLoadN).toBeGreaterThan(5.0);
+    expect(tightLoadN).toBeGreaterThan(F_SLIP);
+    expect(looseLoadN).toBeLessThan(2.0);
+    expect(looseLoadN).toBeLessThan(F_SLIP);
+
+    // 2a. Loose block extraction via side-pinch pull succeeds cleanly without slip
+    const looseAxisX = quatRotateVec3(looseMid.rotation, [1, 0, 0]);
+    const looseLocal: Vec3 = [0.10, 0, BLOCK_HALF_Z];
+    const looseOff = quatRotateVec3(looseMid.rotation, looseLocal);
+    const looseStart: Vec3 = [
+      looseMid.position[0] + looseOff[0],
+      looseMid.position[1] + looseOff[1],
+      looseMid.position[2] + looseOff[2],
+    ];
+    expect(pw.startGrabBlock(looseMid.id, looseLocal, looseStart, 1000)).toBe(true);
+    for (let s = 1; s <= 95 && pw.turnPhase === 'PULLING'; s++) {
+      const dist = Math.min(1.35, (s / 70) * 1.35);
+      pw.updateGrabTarget(
+        [looseStart[0] + looseAxisX[0] * dist, looseStart[1], looseStart[2] + looseAxisX[2] * dist],
+        1000 + s * 16
+      );
+      pw.step(1 / 60);
+    }
+    expect(pw.turnPhase).toBe('EXTRACTED');
+    expect(pw.lastExtractionSlip?.slipped).toBe(false);
+    pw.endGrab(false);
+
+    // Reset to settled 18L tower for clamped-block tests
+    pw.rebuildTower('solo', 2, 18, 42);
+    for (let f = 0; f < 90; f++) pw.step(1 / 60);
+
+    // 2b. Clamped bearing block side-pinch pull slips cleanly off with slipAudio = true
+    const tightSideBlk = pw.blocks.find((b) => b.assignedLayer === 8 && !b.isLooseSlot)!;
+    const tightAxisX = quatRotateVec3(tightSideBlk.rotation, [1, 0, 0]);
+    const sideLocal: Vec3 = [0.05, 0, BLOCK_HALF_Z];
+    const sideOff = quatRotateVec3(tightSideBlk.rotation, sideLocal);
+    const sideStart: Vec3 = [
+      tightSideBlk.position[0] + sideOff[0],
+      tightSideBlk.position[1] + sideOff[1],
+      tightSideBlk.position[2] + sideOff[2],
+    ];
+    expect(pw.startGrabBlock(tightSideBlk.id, sideLocal, sideStart, 2000)).toBe(true);
+    let sawSideSlip = false;
+    for (let s = 1; s <= 24; s++) {
+      const dist = s * 0.025;
+      pw.updateGrabTarget(
+        [sideStart[0] + tightAxisX[0] * dist, sideStart[1], sideStart[2] + tightAxisX[2] * dist],
+        2000 + s * 16
+      );
+      if (pw.lastExtractionSlip?.slipped) {
+        sawSideSlip = true;
+        break;
+      }
+      pw.step(1 / 60);
+    }
+    expect(sawSideSlip).toBe(true);
+    expect(pw.lastExtractionSlip?.maxForceN).toBeCloseTo(F_SLIP, 4);
+    expect(pw.lastExtractionSlip?.slipAudio).toBe(true);
+    expect(pw.turnPhase).toBe('SELECT_BLOCK');
+    expect(pw.activeBlockId).toBeNull();
+    expect(pw.leanAngleDeg).toBeLessThan(2.0);
+    expect(audio.lastSlideDiagnostics?.seamCrossingIntensity).toBeGreaterThan(0);
+
+    // 2c. Clamped bearing block one-finger inward end push does NOT slip (maxForceN = 18.0 N) & nudges block
+    for (let f = 0; f < 10; f++) pw.step(1 / 60);
+    const pushLocal: Vec3 = [-0.35, 0, 0]; // -35 mm end face (|x| >= 32.5 mm)
+    const pushOff = quatRotateVec3(tightSideBlk.rotation, pushLocal);
+    const pushStart: Vec3 = [
+      tightSideBlk.position[0] + pushOff[0],
+      tightSideBlk.position[1] + pushOff[1],
+      tightSideBlk.position[2] + pushOff[2],
+    ];
+    const initPushPos: Vec3 = [...tightSideBlk.position];
+    expect(pw.startGrabBlock(tightSideBlk.id, pushLocal, pushStart, 3000)).toBe(true);
+    for (let s = 1; s <= 35; s++) {
+      const inwardDist = Math.min(0.42, s * 0.015);
+      pw.updateGrabTarget(
+        [
+          pushStart[0] + tightAxisX[0] * inwardDist,
+          pushStart[1],
+          pushStart[2] + tightAxisX[2] * inwardDist,
+        ],
+        3000 + s * 16
+      );
+      pw.step(1 / 60);
+    }
+    const nudgedDistDm = Math.hypot(
+      tightSideBlk.position[0] - initPushPos[0],
+      tightSideBlk.position[2] - initPushPos[2]
+    );
+    expect(pw.lastExtractionSlip?.slipped).toBe(false);
+    expect(pw.lastExtractionSlip?.maxForceN).toBeCloseTo(F_PUSH_MAX, 4);
+    expect(nudgedDistDm).toBeGreaterThan(0.03); // Nudged >= 3 mm without finger slip
+    pw.endGrab(false);
+
+    // 2d. Sandbox mode leaves free-drag untouched (never triggers competitive pinch slip)
+    pw.rebuildTower('sandbox', 2, 18, 42);
+    for (let f = 0; f < 60; f++) pw.step(1 / 60);
+    const sbTight = pw.blocks.find((b) => b.assignedLayer === 8 && !b.isLooseSlot)!;
+    const sbAxis = quatRotateVec3(sbTight.rotation, [1, 0, 0]);
+    const sbOff = quatRotateVec3(sbTight.rotation, [0.05, 0, BLOCK_HALF_Z]);
+    const sbStart: Vec3 = [
+      sbTight.position[0] + sbOff[0],
+      sbTight.position[1] + sbOff[1],
+      sbTight.position[2] + sbOff[2],
+    ];
+    expect(pw.startGrabBlock(sbTight.id, [0.05, 0, BLOCK_HALF_Z], sbStart, 4000)).toBe(true);
+    for (let s = 1; s <= 20; s++) {
+      pw.updateGrabTarget(
+        [sbStart[0] + sbAxis[0] * (s * 0.025), sbStart[1], sbStart[2] + sbAxis[2] * (s * 0.025)],
+        4000 + s * 16
+      );
+      pw.step(1 / 60);
+    }
+    expect(pw.lastExtractionSlip).toBeNull();
+    expect(pw.activeBlockId).toBe(sbTight.id);
+    pw.endGrab(false);
+    pw.dispose();
+
+    // 3. GameEngine hover zone plumbing (Body = 1.0 vs End-Tip = 2.0) & Glazier AI push vs pinch plans
+    const engine = new GameEngine();
+    await engine.initHeadless();
+    engine.resetGame('party', 2);
+    for (let f = 0; f < 60; f++) engine.stepHeadless(1 / 60);
+
+    // Project a front-facing legal block's Body center vs End-Tip onto the viewport
+    const rect = { left: 0, top: 0, width: 1280, height: 800 };
+    engine.camera.update(0.25, rect.width / rect.height);
+    const projectToScreen = (pt: Vec3): [number, number] => {
+      const m = engine.camera.viewProjMatrix;
+      const cx = m[0] * pt[0] + m[4] * pt[1] + m[8] * pt[2] + m[12];
+      const cy = m[1] * pt[0] + m[5] * pt[1] + m[9] * pt[2] + m[13];
+      const cw = m[3] * pt[0] + m[7] * pt[1] + m[11] * pt[2] + m[15];
+      return [((cx / cw) * 0.5 + 0.5) * rect.width, (0.5 - (cy / cw) * 0.5) * rect.height];
+    };
+
+    const frontProbe = engine.physics.blocks.find(
+      (b) => b.assignedLayer === 8 && b.assignedSlot === 2 && b.isLegalTarget
+    )!;
+    expect(frontProbe).toBeDefined();
+    const frontFaceCenter: Vec3 = [
+      frontProbe.position[0],
+      frontProbe.position[1],
+      frontProbe.position[2] + BLOCK_HALF_Z,
+    ];
+    const [bx, by] = projectToScreen(frontFaceCenter);
+    engine.handlePointerMove(bx, by, 1, rect, 'mouse');
+    expect(engine.physics.hoveredBlockId).toBe(frontProbe.id);
+    expect(engine.physics.hoverLocalPoint).not.toBeNull();
+    expect(Math.abs(engine.physics.hoverLocalPoint![0])).toBeLessThanOrEqual(BLOCK_HALF_X * 0.58);
+    expect(engine.getHoveredZone()).toBe(1.0);
+
+    const endTipWorld: Vec3 = [
+      frontProbe.position[0] + BLOCK_HALF_X * 0.85,
+      frontProbe.position[1],
+      frontProbe.position[2] + BLOCK_HALF_Z * 0.5,
+    ];
+    const [ex, ey] = projectToScreen(endTipWorld);
+    engine.handlePointerMove(ex, ey, 1, rect, 'mouse');
+    expect(engine.physics.hoveredBlockId).toBe(frontProbe.id);
+    expect(engine.physics.hoverLocalPoint).not.toBeNull();
+    expect(Math.abs(engine.physics.hoverLocalPoint![0])).toBeGreaterThan(BLOCK_HALF_X * 0.58);
+    expect(engine.getHoveredZone()).toBe(2.0);
+
+    // Glazier AI extraction plan chooses pinch_pull for loose <= 3.42 N and end_push for clamped > 3.42 N
+    const aiLoose = engine.physics.blocks.find((b) => b.assignedLayer === 8 && b.isLooseSlot)!;
+    const aiTight = engine.physics.blocks.find((b) => b.assignedLayer === 8 && !b.isLooseSlot)!;
+    const loosePlan = engine.computeOptimalExtractionPlan(aiLoose.id, 'master')!;
+    const tightPlan = engine.computeOptimalExtractionPlan(aiTight.id, 'master')!;
+    expect(loosePlan.extractionMode).toBe('pinch_pull');
+    expect(loosePlan.maxForceN).toBeCloseTo(F_SLIP, 4);
+    expect(tightPlan.extractionMode).toBe('end_push');
+    expect(tightPlan.maxForceN).toBeCloseTo(F_PUSH_MAX, 4);
+    expect(Math.abs(tightPlan.localGrab[0])).toBeGreaterThanOrEqual(BLOCK_HALF_X - 0.05);
+
+    // 4. MultiplayerGuestWorld & MujocoWorkerBridge parity
+    const guestAudio = new GlassAudioEngine();
+    guestAudio.setMuted(true);
+    const guest = new MultiplayerGuestWorld(guestAudio, 18, 42);
+    const hostSnap = engine.physics.exportCompactSnapshot();
+    const guestBlocks = Array.from({ length: hostSnap.blockCount }, (_, i) => {
+      const b = engine.physics.blocks[i];
+      const wBase = i * 4;
+      const wrench: [number, number, number, number] = [
+        hostSnap.blockPhotoelasticWrench[wBase + 0] ?? 0,
+        hostSnap.blockPhotoelasticWrench[wBase + 1] ?? 0,
+        hostSnap.blockPhotoelasticWrench[wBase + 2] ?? 0,
+        hostSnap.blockPhotoelasticWrench[wBase + 3] ?? 0,
+      ];
+      return {
+        position: [...b.position] as Vec3,
+        rotation: [...b.rotation] as [number, number, number, number],
+        damage: b.damage,
+        shattered: b.shattered,
+        extracted: b.extracted,
+        isLegalTarget: b.isLegalTarget,
+        isLooseSlot: b.isLooseSlot,
+        swatchId: b.swatchId,
+        motif: b.motif,
+        assignedLayer: b.assignedLayer,
+        assignedSlot: b.assignedSlot,
+        stress01: engine.physics.getBlockPhotoelasticStress01(i),
+        crackLocalOrigin: [...b.crackLocalOrigin] as Vec3,
+        photoelasticWrench: wrench,
+      };
+    });
+    const baseGuestFrame = {
+      seq: 1,
+      hostElapsedSec: 1.5,
+      roomSeed: 42,
+      turnPhase: 'SELECT_BLOCK' as const,
+      gameMode: 'party' as const,
+      currentPlayer: 1,
+      playerCount: 2,
+      blocksStacked: 0,
+      shatteredCount: 0,
+      currentLayers: 18,
+      peakLayers: 18,
+      activeBlockId: null,
+      hoveredBlockId: null,
+      hoveredSlotIndex: null,
+      lockedMinRow: 17,
+      isPointerDraggingBlock: false,
+      isExtractionLiftReady: false,
+      polariscopeMode: false,
+      grabResistance01: 0,
+      settleProgress01: 0,
+      leanAngleDeg: 0,
+      wobbleSpeedDegPerSec: 0,
+      liveHeightCm: 27,
+      peakHeightCm: 27,
+      centerOfMassXZCm: [0, 0] as [number, number],
+      carriedYawOffsetRad: 0,
+      grabCurrentWorldOnBlock: [0, 0, 0] as Vec3,
+      grabWorldAnchor: [0, 0, 0] as Vec3,
+      carriedLandingPos: [0, 2.775, 0] as Vec3,
+      carriedTargetQuat: [0, 0, 0, 1] as [number, number, number, number],
+      topSupportSurfaceCenter: [0, 2.7, 0] as Vec3,
+      topSupportUpNormal: [0, 1, 0] as Vec3,
+      topSupportDefaultRot: [0, 0, 0, 1] as [number, number, number, number],
+      topSupportTargetLayer: 18,
+      blocks: guestBlocks,
+      shards: [],
+      splinters: [],
+    };
+    guest.applyNetworkStateFrame(baseGuestFrame);
+
+    expect(guest.computeBlockClampingLoadN(aiTight.id)).toBeGreaterThan(F_SLIP);
+    expect(guest.computeBlockClampingLoadN(aiLoose.id)).toBeLessThan(F_SLIP);
+
+    guest.setOptimisticGuestHover(aiTight.id, [0.34, 0, 0]);
+    expect(guest.hoverLocalPoint).toEqual([0.34, 0, 0]);
+
+    const gTight = guest.blocks[aiTight.id];
+    const gAxisX = quatRotateVec3(gTight.rotation, [1, 0, 0]);
+    const gSideWorld: Vec3 = [gTight.position[0], gTight.position[1], gTight.position[2] + BLOCK_HALF_Z];
+    guest.setOptimisticGuestGrab(aiTight.id, [0.05, 0, BLOCK_HALF_Z], gSideWorld);
+    // Pre-confirmation Host snapshot (isPointerDraggingBlock=false) must NOT wipe optimistic Guest grab
+    guest.applyNetworkStateFrame({
+      ...baseGuestFrame,
+      seq: 2,
+      turnPhase: 'SELECT_BLOCK',
+      activeBlockId: null,
+      isPointerDraggingBlock: false,
+    });
+    const guestPinchSlip = guest.evaluateGuestDragSlip([
+      gSideWorld[0] + gAxisX[0] * 0.20,
+      gSideWorld[1],
+      gSideWorld[2] + gAxisX[2] * 0.20,
+    ]);
+    expect(guestPinchSlip).not.toBeNull();
+    expect(guestPinchSlip?.slipped).toBe(true);
+    expect(guestPinchSlip?.maxForceN).toBeCloseTo(F_SLIP, 4);
+    expect(guestPinchSlip?.slipAudio).toBe(true);
+    guest.setOptimisticGuestPullAnchor(null);
+    expect(guest.evaluateGuestDragSlip(gSideWorld)).toBeNull();
+
+    // Loose block with small nonzero wrench (wSum = 0.16 < 0.18) must cap clamping load below F_SLIP
+    const gLoose = guest.blocks[aiLoose.id];
+    const gLooseAxisX = quatRotateVec3(gLoose.rotation, [1, 0, 0]);
+    const gLooseSideWorld: Vec3 = [gLoose.position[0], gLoose.position[1], gLoose.position[2] + BLOCK_HALF_Z];
+    guest.blockPhotoelasticWrench[aiLoose.id * 4 + 0] = 0.06;
+    guest.blockPhotoelasticWrench[aiLoose.id * 4 + 1] = 0.05;
+    guest.blockPhotoelasticWrench[aiLoose.id * 4 + 2] = 0.05;
+    guest.setOptimisticGuestGrab(aiLoose.id, [0.05, 0, BLOCK_HALF_Z], gLooseSideWorld);
+    const guestLooseWrenchSlip = guest.evaluateGuestDragSlip([
+      gLooseSideWorld[0] + gLooseAxisX[0] * 0.20,
+      gLooseSideWorld[1],
+      gLooseSideWorld[2] + gLooseAxisX[2] * 0.20,
+    ]);
+    expect(guestLooseWrenchSlip?.slipped).toBe(false);
+    guest.setOptimisticGuestPullAnchor(null);
+
+    const gPushWorld: Vec3 = [
+      gTight.position[0] - gAxisX[0] * 0.35,
+      gTight.position[1],
+      gTight.position[2] - gAxisX[2] * 0.35,
+    ];
+    guest.setOptimisticGuestGrab(aiTight.id, [-0.35, 0, 0], gPushWorld);
+    const guestEndPush = guest.evaluateGuestDragSlip([
+      gPushWorld[0] + gAxisX[0] * 0.20,
+      gPushWorld[1],
+      gPushWorld[2] + gAxisX[2] * 0.20,
+    ]);
+    expect(guestEndPush?.slipped).toBe(false);
+    expect(guestEndPush?.maxForceN).toBeCloseTo(F_PUSH_MAX, 4);
+    guest.setOptimisticGuestPullAnchor(null);
+
+    // 5. GameEngine DOM pointer drag (handlePointerDown + handlePointerMove) double-slip cleanup verification
+    const domTight = engine.physics.blocks.find(
+      (b) => b.assignedLayer === 8 && !b.isLooseSlot && b.assignedSlot === 2 && b.isLegalTarget
+    )!;
+    expect(domTight).toBeDefined();
+    const domAxisX = quatRotateVec3(domTight.rotation, [1, 0, 0]);
+    const domStartWorld: Vec3 = [
+      domTight.position[0],
+      domTight.position[1],
+      domTight.position[2] + BLOCK_HALF_Z,
+    ];
+    const domPullWorld: Vec3 = [
+      domStartWorld[0] + domAxisX[0] * 0.32,
+      domStartWorld[1],
+      domStartWorld[2] + domAxisX[2] * 0.32,
+    ];
+    const [downX, downY] = projectToScreen(domStartWorld);
+    const [dragX, dragY] = projectToScreen(domPullWorld);
+    engine.handlePointerDown(downX, downY, 1, 0, false, rect, 'mouse', 5000);
+    engine.handlePointerMove(dragX, dragY, 1, rect, 'mouse', 5016);
+    if (engine.getInteractionMode() === 'block') {
+      engine.handlePointerMove(dragX, dragY, 1, rect, 'mouse', 5032);
+    }
+    expect(engine.getLastExtractionSlip()?.slipped).toBe(true);
+    expect(engine.getInteractionMode()).toBe('none');
+    expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
+    expect(engine.physics.activeBlockId).toBeNull();
+    engine.handlePointerUp(dragX, dragY, 1, rect, 'mouse', 5048);
+
+    engine.dispose();
+
+    // 6. MujocoWorkerBridge + attachMujocoWorkerHost 18.0 N compressive end-push parity
+    const wAudio = new GlassAudioEngine();
+    wAudio.setMuted(true);
+    const m4Chan = new MessageChannel();
+    const m4HostScope = {
+      onmessage: null as ((ev: MessageEvent<WorkerInboundMessage>) => void) | null,
+      postMessage: (msg: WorkerOutboundMessage, transfer?: Transferable[]) => {
+        m4Chan.port2.postMessage(msg, transfer as never);
+      },
+    };
+    const m4ClientEndpoint: WorkerEndpointLike = {
+      onmessage: null,
+      postMessage: (msg: WorkerInboundMessage, transfer?: Transferable[]) => {
+        m4Chan.port1.postMessage(msg, transfer as never);
+      },
+    };
+    m4Chan.port1.onmessage = (ev: MessageEvent<WorkerOutboundMessage>) => {
+      m4ClientEndpoint.onmessage?.(ev);
+    };
+    m4Chan.port2.onmessage = (ev: MessageEvent<WorkerInboundMessage>) => {
+      m4HostScope.onmessage?.(ev);
+    };
+    m4Chan.port1.start();
+    m4Chan.port2.start();
+
+    const m4HostHandle = attachMujocoWorkerHost(m4HostScope);
+    const m4Bridge = await MujocoWorkerBridge.create(wAudio, 18, 42, m4ClientEndpoint);
+    const stepM4Bridge = async (dt = 1 / 60): Promise<void> => {
+      await new Promise<void>((resolve) => {
+        const prev = m4ClientEndpoint.onmessage;
+        m4ClientEndpoint.onmessage = (ev: MessageEvent<WorkerOutboundMessage>) => {
+          prev?.(ev);
+          if (ev.data.type === 'snapshot' && ev.data.epoch === m4Bridge.getEpoch()) {
+            m4ClientEndpoint.onmessage = prev;
+            resolve();
+          }
+        };
+        m4Bridge.step(dt);
+      });
+    };
+
+    m4Bridge.rebuildTower('solo', 2, 18, 42);
+    for (let f = 0; f < 90; f++) await stepM4Bridge(1 / 60);
+
+    const wTight = m4Bridge.blocks.find((b) => b.assignedLayer === 8 && !b.isLooseSlot)!;
+    const wAxisX = quatRotateVec3(wTight.rotation, [1, 0, 0]);
+    const wPushLocal: Vec3 = [-0.35, 0, 0];
+    const wPushOff = quatRotateVec3(wTight.rotation, wPushLocal);
+    const wPushStart: Vec3 = [
+      wTight.position[0] + wPushOff[0],
+      wTight.position[1] + wPushOff[1],
+      wTight.position[2] + wPushOff[2],
+    ];
+    const wInitPos: Vec3 = [...wTight.position];
+    expect(m4Bridge.startGrabBlock(wTight.id, wPushLocal, wPushStart, 6000)).toBe(true);
+    for (let s = 1; s <= 35; s++) {
+      const inwardDist = Math.min(0.42, s * 0.015);
+      m4Bridge.updateGrabTarget(
+        [
+          wPushStart[0] + wAxisX[0] * inwardDist,
+          wPushStart[1],
+          wPushStart[2] + wAxisX[2] * inwardDist,
+        ],
+        6000 + s * 16
+      );
+      await stepM4Bridge(1 / 60);
+    }
+    const wTightAfter = m4Bridge.blocks[wTight.id];
+    const wNudgedDistDm = Math.hypot(
+      wTightAfter.position[0] - wInitPos[0],
+      wTightAfter.position[2] - wInitPos[2]
+    );
+    expect(m4Bridge.lastExtractionSlip?.slipped).toBe(false);
+    expect(m4Bridge.lastExtractionSlip?.maxForceN).toBeCloseTo(F_PUSH_MAX, 4);
+    expect(wNudgedDistDm).toBeGreaterThan(0.03); // Nudged >= 3 mm in Worker mode!
+    m4Bridge.endGrab(false);
+
+    // 7. Batched 75 ms Worker step end-push impulse parity (`clampedDt <= 0.085 s`, zero 76% dt starvation)
+    const impulses60Hz: number[] = [];
+    const impulsesBatched75ms: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      applyAssistiveEndPushImpulse({
+        gameMode: 'solo',
+        turnPhase: 'PULLING',
+        isPointerDraggingBlock: true,
+        blockPos: [0, 1.2, 0],
+        blockRotation: [0, 0, 0, 1],
+        blockLinVel: [0, 0, 0],
+        grabLocalPointDm: [-0.35, 0, 0],
+        grabCurrentWorldOnBlockDm: [-0.35, 1.2, 0],
+        grabWorldAnchorDm: [-0.15, 1.2, 0],
+        grabAnchorStartDm: [-0.35, 1.2, 0],
+        grabStartBlockPos: [0, 1.2, 0],
+        clampingLoadN: 9.0,
+        grabResistance01: 0.7,
+        dt: 0.01875,
+        applyImpulseAtPoint: (imp) => impulses60Hz.push(Math.hypot(imp.x, imp.z)),
+      });
+    }
+    applyAssistiveEndPushImpulse({
+      gameMode: 'solo',
+      turnPhase: 'PULLING',
+      isPointerDraggingBlock: true,
+      blockPos: [0, 1.2, 0],
+      blockRotation: [0, 0, 0, 1],
+      blockLinVel: [0, 0, 0],
+      grabLocalPointDm: [-0.35, 0, 0],
+      grabCurrentWorldOnBlockDm: [-0.35, 1.2, 0],
+      grabWorldAnchorDm: [-0.15, 1.2, 0],
+      grabAnchorStartDm: [-0.35, 1.2, 0],
+      grabStartBlockPos: [0, 1.2, 0],
+      clampingLoadN: 9.0,
+      grabResistance01: 0.7,
+      dt: 0.075,
+      applyImpulseAtPoint: (imp) => impulsesBatched75ms.push(Math.hypot(imp.x, imp.z)),
+    });
+    const sum60Hz = impulses60Hz.reduce((a, b) => a + b, 0);
+    const sum75ms = impulsesBatched75ms.reduce((a, b) => a + b, 0);
+    expect(sum75ms).toBeGreaterThan(sum60Hz * 0.75);
+
+    // 8. Consistent 3.42 N competitive outward end-face slip across 1-block, 2-block, and 3-block rows
+    for (const sameRowOthers of [0, 1, 2]) {
+      const endPullEval = {
+        isEndFace: true,
+        slip: { slipped: true, maxForceN: F_SLIP, slipAudio: true },
+      };
+      expect(shouldReleaseCompetitiveSlip(endPullEval, sameRowOthers)).toBe(true);
+      expect(normalizeCompetitiveSlipResult(endPullEval, sameRowOthers)).toEqual({
+        slipped: true,
+        maxForceN: F_SLIP,
+        slipAudio: true,
+      });
+    }
+
+    // 9. Host vs Guest clamping threshold parity across 3.42 N on 18L (id=46) and 24L (id=60, 62, 64)
+    for (const [layers, checkIds] of [
+      [18, [41, 45, 46]],
+      [24, [57, 60, 62, 64]],
+    ] as const) {
+      const pwParity = new PhysicsWorld(wAudio, layers, { seed: 42 });
+      pwParity.rebuildTower('solo', 2, layers, 42);
+      for (let f = 0; f < 90; f++) pwParity.step(1 / 60);
+      for (const id of checkIds) {
+        const hostN = pwParity.computeBlockClampingLoadN(id);
+        const guestN = estimateClampingLoadFromWrenchAndStack(
+          id,
+          pwParity.blocks,
+          pwParity.blockPhotoelasticWrench
+        );
+        expect(guestN > F_SLIP).toBe(hostN > F_SLIP);
+      }
+      pwParity.dispose();
+    }
+
+    // 10. (18.0, 27.6923] N inward end-push alignment (non-zero impulse & >= 3 mm batched/60 Hz nudge on 24L L1/L4)
+    const impMidClamped: number[] = [];
+    const evalMidClamped = applyAssistiveEndPushImpulse({
+      gameMode: 'solo',
+      turnPhase: 'PULLING',
+      isPointerDraggingBlock: true,
+      blockPos: [0, 1.2, 0],
+      blockRotation: [0, 0, 0, 1],
+      blockLinVel: [0, 0, 0],
+      grabLocalPointDm: [-0.35, 0, 0],
+      grabCurrentWorldOnBlockDm: [-0.35, 1.2, 0],
+      grabWorldAnchorDm: [-0.15, 1.2, 0],
+      grabAnchorStartDm: [-0.35, 1.2, 0],
+      grabStartBlockPos: [0, 1.2, 0],
+      clampingLoadN: 20.0,
+      grabResistance01: 0.7,
+      dt: 1 / 60,
+      applyImpulseAtPoint: (imp) => impMidClamped.push(Math.hypot(imp.x, imp.z)),
+    });
+    expect(evalMidClamped.slip.slipped).toBe(false);
+    expect(impMidClamped.length).toBe(1);
+    expect(impMidClamped[0]).toBeGreaterThan(0);
+
+    const impOverPushMax: number[] = [];
+    const evalOverPushMax = applyAssistiveEndPushImpulse({
+      gameMode: 'solo',
+      turnPhase: 'PULLING',
+      isPointerDraggingBlock: true,
+      blockPos: [0, 1.2, 0],
+      blockRotation: [0, 0, 0, 1],
+      blockLinVel: [0, 0, 0],
+      grabLocalPointDm: [-0.35, 0, 0],
+      grabCurrentWorldOnBlockDm: [-0.35, 1.2, 0],
+      grabWorldAnchorDm: [-0.15, 1.2, 0],
+      grabAnchorStartDm: [-0.35, 1.2, 0],
+      grabStartBlockPos: [0, 1.2, 0],
+      clampingLoadN: 28.5,
+      grabResistance01: 0.7,
+      dt: 1 / 60,
+      applyImpulseAtPoint: (imp) => impOverPushMax.push(Math.hypot(imp.x, imp.z)),
+    });
+    expect(evalOverPushMax.slip.slipped).toBe(true);
+    expect(impOverPushMax.length).toBe(0);
+
+    // Worker 85 ms batched push & 60 Hz push on 24L L1 id=5 (18.0 < N <= 27.69) nudges >= 3 mm; id=4 (> 27.69 N) slips
+    for (const [dt, steps] of [
+      [0.085, 7],
+      [1 / 60, 35],
+    ] as const) {
+      m4Bridge.rebuildTower('solo', 2, 24, 42);
+      for (let f = 0; f < 90; f++) await stepM4Bridge(1 / 60);
+      const w24Blk5 = m4Bridge.blocks[5];
+      expect(m4Bridge.computeBlockClampingLoadN(5)).toBeGreaterThan(F_PUSH_MAX);
+      expect(m4Bridge.computeBlockClampingLoadN(5) * 0.65).toBeLessThanOrEqual(F_PUSH_MAX);
+      const w24Ax = quatRotateVec3(w24Blk5.rotation, [1, 0, 0]);
+      const w24Off = quatRotateVec3(w24Blk5.rotation, [-0.35, 0, 0]);
+      const w24Start: Vec3 = [
+        w24Blk5.position[0] + w24Off[0],
+        w24Blk5.position[1] + w24Off[1],
+        w24Blk5.position[2] + w24Off[2],
+      ];
+      const w24Init: Vec3 = [...w24Blk5.position];
+      expect(m4Bridge.startGrabBlock(5, [-0.35, 0, 0], w24Start, 7000)).toBe(true);
+      for (let s = 1; s <= steps; s++) {
+        const dist = Math.min(0.42, s * dt * 0.72);
+        m4Bridge.updateGrabTarget(
+          [w24Start[0] + w24Ax[0] * dist, w24Start[1], w24Start[2] + w24Ax[2] * dist],
+          7000 + Math.round(s * dt * 1000)
+        );
+        expect(m4Bridge.lastExtractionSlip?.slipped).toBe(false);
+        await stepM4Bridge(dt);
+      }
+      const w24After5 = m4Bridge.blocks[5];
+      expect(m4Bridge.lastExtractionSlip?.slipped).toBe(false);
+      expect(
+        Math.hypot(w24After5.position[0] - w24Init[0], w24After5.position[2] - w24Init[2])
+      ).toBeGreaterThan(0.03);
+      m4Bridge.endGrab(false);
+    }
+
+    // 24L L1 id=4 (> 27.69 N) must still slip immediately on inward end-push
+    m4Bridge.rebuildTower('solo', 2, 24, 42);
+    for (let f = 0; f < 90; f++) await stepM4Bridge(1 / 60);
+    const w24Blk4 = m4Bridge.blocks[4];
+    expect(m4Bridge.computeBlockClampingLoadN(4) * 0.65).toBeGreaterThan(F_PUSH_MAX);
+    const w24Ax4 = quatRotateVec3(w24Blk4.rotation, [1, 0, 0]);
+    const w24Off4 = quatRotateVec3(w24Blk4.rotation, [-0.35, 0, 0]);
+    const w24Start4: Vec3 = [
+      w24Blk4.position[0] + w24Off4[0],
+      w24Blk4.position[1] + w24Off4[1],
+      w24Blk4.position[2] + w24Off4[2],
+    ];
+    expect(m4Bridge.startGrabBlock(4, [-0.35, 0, 0], w24Start4, 7500)).toBe(true);
+    m4Bridge.updateGrabTarget(
+      [w24Start4[0] + w24Ax4[0] * 0.05, w24Start4[1], w24Start4[2] + w24Ax4[2] * 0.05],
+      7516
+    );
+    expect(m4Bridge.lastExtractionSlip?.slipped).toBe(true);
+    m4Bridge.endGrab(false);
+
+    // 11. 60 Hz continuous inward end-push on clamped 18L L4 id=12 & id=14 resists contact spikes without false slip
+    for (const blkId of [12, 14] as const) {
+      m4Bridge.rebuildTower('solo', 2, 18, 42);
+      for (let f = 0; f < 90; f++) await stepM4Bridge(1 / 60);
+      const w18L4 = m4Bridge.blocks[blkId];
+      const w18Ax = quatRotateVec3(w18L4.rotation, [1, 0, 0]);
+      const w18Off = quatRotateVec3(w18L4.rotation, [-0.35, 0, 0]);
+      const w18Start: Vec3 = [
+        w18L4.position[0] + w18Off[0],
+        w18L4.position[1] + w18Off[1],
+        w18L4.position[2] + w18Off[2],
+      ];
+      const w18Init: Vec3 = [...w18L4.position];
+      expect(m4Bridge.startGrabBlock(blkId, [-0.35, 0, 0], w18Start, 8000)).toBe(true);
+      for (let s = 1; s <= 35; s++) {
+        const dist = blkId === 12 ? Math.min(0.42, (s / 35) * 0.42) : Math.min(0.42, s * 0.015);
+        m4Bridge.updateGrabTarget(
+          [w18Start[0] + w18Ax[0] * dist, w18Start[1], w18Start[2] + w18Ax[2] * dist],
+          8000 + s * 16
+        );
+        expect(m4Bridge.lastExtractionSlip?.slipped).toBe(false);
+        await stepM4Bridge(1 / 60);
+      }
+      const w18After = m4Bridge.blocks[blkId];
+      expect(
+        Math.hypot(w18After.position[0] - w18Init[0], w18After.position[2] - w18Init[2])
+      ).toBeGreaterThan(0.03);
+      m4Bridge.endGrab(false);
+    }
+
+    // 12. dt-normalized asymmetric EMA resists single-step contact spikes near 27.69 N at 60 Hz & 120 Hz
+    //     while slipping sustained >27.69 N overloads within ~150-260 ms
+    for (const dt of [1 / 60, 1 / 120] as const) {
+      let spikeEma = 27.0;
+      spikeEma = updateEndPushSmoothedClampingLoadN(spikeEma, 36.0, dt);
+      expect(spikeEma * 0.65).toBeLessThanOrEqual(F_PUSH_MAX);
+      spikeEma = updateEndPushSmoothedClampingLoadN(spikeEma, 27.0, dt);
+      expect(spikeEma * 0.65).toBeLessThanOrEqual(F_PUSH_MAX);
+
+      let sustEma = 19.45;
+      let slipStep = -1;
+      const maxSteps = Math.round(0.4 / dt);
+      for (let s = 1; s <= maxSteps; s++) {
+        sustEma = updateEndPushSmoothedClampingLoadN(sustEma, 35.63, dt);
+        if (sustEma * 0.65 > F_PUSH_MAX && slipStep === -1) {
+          slipStep = s;
+        }
+      }
+      const slipMs = slipStep * dt * 1000;
+      expect(slipStep).toBeGreaterThan(0);
+      expect(slipMs).toBeGreaterThanOrEqual(150);
+      expect(slipMs).toBeLessThanOrEqual(260);
+    }
+
+    // 13. Upper-band valid clamped blocks (18L L1 #4 ~25.91 N, 24L L7 #22 ~25.32 N) resist 60 Hz & 120 Hz
+    //     solver contact oscillations without false mid-stroke slip across PhysicsWorld and GameEngine
+    for (const [layers, blkId, dt, steps] of [
+      [18, 4, 1 / 60, 35],
+      [18, 4, 1 / 120, 70],
+      [24, 22, 1 / 60, 35],
+      [24, 22, 1 / 120, 70],
+    ] as const) {
+      const pwOsc = new PhysicsWorld(wAudio, layers, { seed: 42 });
+      pwOsc.rebuildTower('solo', 2, layers, 42);
+      for (let f = 0; f < 90; f++) pwOsc.step(1 / 60);
+      const blk = pwOsc.blocks[blkId];
+      const ax = quatRotateVec3(blk.rotation, [1, 0, 0]);
+      const off = quatRotateVec3(blk.rotation, [-0.35, 0, 0]);
+      const start: Vec3 = [
+        blk.position[0] + off[0],
+        blk.position[1] + off[1],
+        blk.position[2] + off[2],
+      ];
+      const initPos: Vec3 = [...blk.position];
+      expect(pwOsc.startGrabBlock(blkId, [-0.35, 0, 0], start, 9000)).toBe(true);
+      for (let s = 1; s <= steps; s++) {
+        const dist = Math.min(0.42, s * dt * 0.72);
+        pwOsc.updateGrabTarget(
+          [start[0] + ax[0] * dist, start[1], start[2] + ax[2] * dist],
+          9000 + Math.round(s * dt * 1000)
+        );
+        expect(pwOsc.lastExtractionSlip?.slipped).toBe(false);
+        pwOsc.step(dt);
+      }
+      expect(
+        Math.hypot(blk.position[0] - initPos[0], blk.position[2] - initPos[2])
+      ).toBeGreaterThan(0.03);
+      pwOsc.dispose();
+    }
+
+    // 14. Glazier AI Oracle evaluates (18.0, 27.6923] N end-push candidates (e.g. 24L L1 #5 at ~19.45 N)
+    //     without false unpushable slip penalty
+    {
+      const geAi = new GameEngine();
+      await geAi.initHeadless();
+      geAi.physics.rebuildTower('party', 2, 24, 42);
+      for (let f = 0; f < 90; f++) geAi.stepHeadless(1 / 60);
+      const c5Clamp = geAi.physics.computeBlockClampingLoadN(5);
+      const c17Clamp = geAi.physics.computeBlockClampingLoadN(17);
+      expect(c5Clamp).toBeGreaterThan(F_PUSH_MAX);
+      expect(c5Clamp * 0.65).toBeLessThanOrEqual(F_PUSH_MAX);
+      type AiOracleTestAccessor = {
+        selectAiTargetFromOracle: (
+          candidates: Array<{
+            blockId: number;
+            safetyScore01: number;
+            predictedSlideMm: number;
+            clampingLoadN: number;
+            collapseTriggered: boolean;
+          }>,
+          difficulty: 'apprentice' | 'master'
+        ) => { blockId: number } | undefined;
+      };
+      const chosen = (geAi as unknown as AiOracleTestAccessor).selectAiTargetFromOracle(
+        [
+          {
+            blockId: 5,
+            safetyScore01: 0.92,
+            predictedSlideMm: 8.5,
+            clampingLoadN: c5Clamp,
+            collapseTriggered: false,
+          },
+          {
+            blockId: 17,
+            safetyScore01: 0.92,
+            predictedSlideMm: 8.5,
+            clampingLoadN: c17Clamp,
+            collapseTriggered: false,
+          },
+        ],
+        'master'
+      );
+      expect(chosen?.blockId).toBe(5);
+      geAi.dispose();
+    }
+
+    // 15. Exact ±21.75 mm (0.2175 dm) 2-zone grip boundary precision (no IEEE-754 1-ULP drift)
+    expect(ZONE_BOUNDARY_DM).toBe(0.2175);
+    expect(computeGripZoneFromLocalDm([-0.2175, 0, 0])).toBe(ZONE_BODY);
+    expect(computeGripZoneFromLocalDm([0.2175, 0, 0])).toBe(ZONE_BODY);
+    expect(computeGripZoneFromLocalDm([0.2176, 0, 0])).toBe(ZONE_END_TIP);
+    expect(computeGripZoneFromLocalDm([-0.2176, 0, 0])).toBe(ZONE_END_TIP);
+
+    m4Bridge.dispose();
+    m4HostHandle.dispose();
+  }, 60000);
 });

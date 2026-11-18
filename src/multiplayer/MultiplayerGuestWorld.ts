@@ -18,6 +18,16 @@ import {
   TurnPhase,
 } from '../physics/PhysicsWorld';
 import {
+  computeEffectiveGrabClampingLoadN,
+  countOtherBlocksInLayer,
+  estimateClampingLoadFromWrenchAndStack,
+  evaluateCompetitiveDragSlip,
+  isCompetitiveInwardEndPush,
+  normalizeCompetitiveSlipResult,
+  type ExtractionSlipResult,
+  updateEndPushSmoothedClampingLoadN,
+} from '../physics/extractionMechanics';
+import {
   applyDeterministicTowerPalette,
   canonicalizeQuatHemisphere,
   computeDeterministicBlockMaterial,
@@ -97,7 +107,8 @@ interface ExtendedGuestAudioHooks {
     resistance01: number,
     slipPowerMilliwatts?: number,
     torsionRadPerSec?: number,
-    clampingLoadN?: number
+    clampingLoadN?: number,
+    seamCrossingIntensity?: number
   ) => void;
 }
 
@@ -118,6 +129,7 @@ export class MultiplayerGuestWorld {
   public openTopSlots: TopPlacementSlot[] = [];
   public blockPhotoelasticStress01: Float32Array = new Float32Array(0);
   public blockPhotoelasticWrench: Float32Array = new Float32Array(0);
+  private blockClampingLoadsN: Float32Array = new Float32Array(0);
 
   public gameMode: GameMode = 'party';
   public playerCount: number = 2;
@@ -128,6 +140,7 @@ export class MultiplayerGuestWorld {
   public collapseReason: string | null = null;
 
   public hoveredBlockId: number | null = null;
+  public hoverLocalPoint: Vec3 | null = null;
   public activeBlockId: number | null = null;
   public hoveredSlotIndex: number | null = null;
 
@@ -138,6 +151,7 @@ export class MultiplayerGuestWorld {
   public grabResistance01: number = 0;
   public isPointerDraggingBlock: boolean = false;
   public isExtractionLiftReady: boolean = false;
+  public lastExtractionSlip: ExtractionSlipResult | null = null;
 
   public listenerCamPos: Vec3 = [0, 2.2, 5.2];
   public listenerCamRight: Vec3 = [1, 0, 0];
@@ -193,7 +207,20 @@ export class MultiplayerGuestWorld {
   private snapNextPose: boolean = true;
 
   private localGuestHoverBlockId: number | null = null;
+  private localGuestHoverLocalPoint: Vec3 | null = null;
   private localOptimisticPullAnchor: Vec3 | null = null;
+  private localOptimisticPullStartAnchor: Vec3 | null = null;
+  private localOptimisticGrabBlockId: number | null = null;
+  private localOptimisticGrabLocalPoint: Vec3 = [0, 0, 0];
+  private localOptimisticGrabBlockStartPos: Vec3 | null = null;
+  private localOptimisticGrabInitialClampN: number = 0;
+  private localOptimisticGrabSmoothedClampN: number = 0;
+  private localOptimisticGrabLastSmoothHostSec: number = -1;
+  private lastAcceptedHostElapsedSec: number = -1;
+  private localOptimisticGrabConfirmedByHost: boolean = false;
+  private localOptimisticGrabPreAckFrames: number = 0;
+  private localOptimisticGrabStartedAtMs: number = 0;
+  private lastEvaluatedClampingLoadN: number = 0;
   private hostHoverBlockId: number | null = null;
 
   constructor(audio: GlassAudioEngine, initialLayers: number = INITIAL_LAYERS, roomSeed: number = 0x56495452) {
@@ -225,6 +252,8 @@ export class MultiplayerGuestWorld {
       this.hasReceivedWelcome = false;
     }
     this.hasCurrentSeedStateFrame = false;
+    this.lastAcceptedHostElapsedSec = -1;
+    this.localOptimisticGrabLastSmoothHostSec = -1;
     this.snapNextPose = true;
     this.collapseReason = null;
     this.turnPhase = 'SELECT_BLOCK';
@@ -236,10 +265,15 @@ export class MultiplayerGuestWorld {
     this.liveHeightCm = layers * BLOCK_HEIGHT * 10;
     this.peakHeightCm = layers * BLOCK_HEIGHT * 10;
     this.lockedMinRow = layers;
-    this.localOptimisticPullAnchor = null;
+    this.clearOptimisticGrabState();
+    this.localGuestHoverLocalPoint = null;
+    this.hoverLocalPoint = null;
+    this.lastExtractionSlip = null;
 
     this.blockPhotoelasticStress01 = new Float32Array(total + 32);
     this.blockPhotoelasticWrench = new Float32Array((total + 32) * 4);
+    this.blockClampingLoadsN = new Float32Array(total + 32);
+    this.blockClampingLoadsN.fill(Number.NaN);
 
     for (let layer = 0; layer < layers; layer++) {
       const centerIsLoose = layer % 2 === 0;
@@ -435,6 +469,8 @@ export class MultiplayerGuestWorld {
     this.lastAcceptedSeq = frame.seq >>> 0;
     this.acceptedFrameCount++;
     this.hasCurrentSeedStateFrame = true;
+    const prevHostElapsedSec = this.lastAcceptedHostElapsedSec;
+    this.lastAcceptedHostElapsedSec = frame.hostElapsedSec;
 
     const snapImmediate = this.snapNextPose;
     this.snapNextPose = false;
@@ -462,20 +498,84 @@ export class MultiplayerGuestWorld {
     this.centerOfMassXZCm = [...frame.centerOfMassXZCm];
     this.carriedYawOffsetRad = frame.carriedYawOffsetRad;
 
-    if (this.currentPlayer !== 1 || !this.isPointerDraggingBlock) {
-      this.localOptimisticPullAnchor = null;
+    if (
+      this.currentPlayer !== 1 ||
+      this.turnPhase === 'COLLAPSED' ||
+      this.turnPhase === 'SETTLING' ||
+      this.turnPhase === 'EXTRACTED'
+    ) {
+      this.clearOptimisticGrabState();
+    } else if (this.localOptimisticGrabBlockId !== null) {
+      const hostConfirmedGrab =
+        (frame.isPointerDraggingBlock &&
+          frame.activeBlockId === this.localOptimisticGrabBlockId) ||
+        (frame.turnPhase === 'PULLING' &&
+          frame.activeBlockId === this.localOptimisticGrabBlockId);
+      if (hostConfirmedGrab) {
+        this.localOptimisticGrabConfirmedByHost = true;
+        if (!frame.isPointerDraggingBlock && frame.turnPhase !== 'PULLING') {
+          this.clearOptimisticGrabState();
+        }
+      } else if (this.localOptimisticGrabConfirmedByHost) {
+        if (!frame.isPointerDraggingBlock) {
+          this.clearOptimisticGrabState();
+        }
+      } else {
+        const targetBlk = this.blocks[this.localOptimisticGrabBlockId];
+        const invalidTarget =
+          !targetBlk ||
+          targetBlk.shattered ||
+          targetBlk.extracted ||
+          (frame.activeBlockId !== null &&
+            frame.activeBlockId !== this.localOptimisticGrabBlockId);
+        this.localOptimisticGrabPreAckFrames++;
+        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const expired =
+          this.localOptimisticGrabPreAckFrames > 15 &&
+          nowMs - this.localOptimisticGrabStartedAtMs > 1000;
+        if (invalidTarget || expired) {
+          this.clearOptimisticGrabState();
+        } else {
+          this.activeBlockId = this.localOptimisticGrabBlockId;
+          this.isPointerDraggingBlock = true;
+        }
+      }
     }
 
-    this.hoveredBlockId =
-      this.currentPlayer === 1 && this.localGuestHoverBlockId !== null
-        ? this.localGuestHoverBlockId
-        : this.hostHoverBlockId;
+    if (this.currentPlayer === 1 && this.localGuestHoverBlockId !== null) {
+      this.hoveredBlockId = this.localGuestHoverBlockId;
+      this.hoverLocalPoint = this.localGuestHoverLocalPoint
+        ? [...this.localGuestHoverLocalPoint]
+        : null;
+    } else {
+      this.hoveredBlockId = this.hostHoverBlockId;
+      this.hoverLocalPoint = null;
+    }
 
-    this.targetGrabOnBlock = [...frame.grabCurrentWorldOnBlock];
+    if (
+      this.currentPlayer === 1 &&
+      this.localOptimisticGrabBlockId !== null &&
+      (this.activeBlockId === this.localOptimisticGrabBlockId ||
+        !this.localOptimisticGrabConfirmedByHost)
+    ) {
+      this.grabLocalPoint = [...this.localOptimisticGrabLocalPoint];
+    }
+
+    const preservePreAckGrabPose =
+      this.currentPlayer === 1 &&
+      this.localOptimisticGrabBlockId !== null &&
+      !this.localOptimisticGrabConfirmedByHost;
+    this.targetGrabOnBlock =
+      preservePreAckGrabPose && this.localOptimisticPullStartAnchor
+        ? [...this.localOptimisticPullStartAnchor]
+        : [...frame.grabCurrentWorldOnBlock];
     this.targetGrabAnchor = this.localOptimisticPullAnchor
       ? [...this.localOptimisticPullAnchor]
       : [...frame.grabWorldAnchor];
-    this.grabPlaneY = frame.grabWorldAnchor[1];
+    this.grabPlaneY =
+      preservePreAckGrabPose && this.localOptimisticPullAnchor
+        ? this.localOptimisticPullAnchor[1]
+        : frame.grabWorldAnchor[1];
 
     this.targetCarriedLandingPos = [...frame.carriedLandingPos];
     this.targetCarriedQuat = [...frame.carriedTargetQuat];
@@ -522,6 +622,10 @@ export class MultiplayerGuestWorld {
     if (this.blockPhotoelasticStress01.length < neededCap) {
       this.blockPhotoelasticStress01 = new Float32Array(neededCap);
       this.blockPhotoelasticWrench = new Float32Array(neededCap * 4);
+    }
+    if (this.blockClampingLoadsN.length < neededCap) {
+      this.blockClampingLoadsN = new Float32Array(neededCap);
+      this.blockClampingLoadsN.fill(Number.NaN);
     }
 
     for (let i = 0; i < frame.blocks.length; i++) {
@@ -599,6 +703,10 @@ export class MultiplayerGuestWorld {
       this.blockPhotoelasticWrench[wBase + 1] = fb.photoelasticWrench[1];
       this.blockPhotoelasticWrench[wBase + 2] = fb.photoelasticWrench[2];
       this.blockPhotoelasticWrench[wBase + 3] = fb.photoelasticWrench[3];
+      this.blockClampingLoadsN[i] =
+        typeof fb.clampingLoadN === 'number' && Number.isFinite(fb.clampingLoadN)
+          ? fb.clampingLoadN
+          : Number.NaN;
     }
 
     for (let i = 0; i < frame.shards.length; i++) {
@@ -616,6 +724,52 @@ export class MultiplayerGuestWorld {
       }
     }
     this.rebuildShardList();
+
+    const trackedId = this.localOptimisticGrabBlockId ?? this.activeBlockId;
+    if (trackedId !== null && this.gameMode !== 'sandbox') {
+      const trackedBlk = this.blocks[trackedId];
+      if (trackedBlk && !trackedBlk.shattered) {
+        const localPt =
+          this.localOptimisticGrabBlockId === trackedId
+            ? this.localOptimisticGrabLocalPoint
+            : this.grabLocalPoint;
+        const targetPt = this.localOptimisticPullAnchor ?? this.grabWorldAnchor;
+        const curOnBlk =
+          this.grabCurrentWorldOnBlock[0] === 0 &&
+          this.grabCurrentWorldOnBlock[1] === 0 &&
+          this.grabCurrentWorldOnBlock[2] === 0 &&
+          this.localOptimisticPullStartAnchor
+            ? this.localOptimisticPullStartAnchor
+            : this.grabCurrentWorldOnBlock;
+        const isEndPush = isCompetitiveInwardEndPush({
+          gameMode: this.gameMode,
+          turnPhase:
+            this.turnPhase === 'SELECT_BLOCK' && this.localOptimisticGrabBlockId !== null
+              ? 'PULLING'
+              : this.turnPhase,
+          blockRotation: trackedBlk.rotation,
+          grabLocalPointDm: localPt,
+          grabCurrentWorldOnBlockDm: curOnBlk,
+          grabAnchorStartDm: this.localOptimisticPullStartAnchor ?? undefined,
+          targetWorldDm: targetPt,
+        });
+        if (isEndPush && frame.hostElapsedSec !== this.localOptimisticGrabLastSmoothHostSec) {
+          const dtSmooth =
+            this.localOptimisticGrabLastSmoothHostSec >= 0 &&
+            frame.hostElapsedSec > this.localOptimisticGrabLastSmoothHostSec
+              ? frame.hostElapsedSec - this.localOptimisticGrabLastSmoothHostSec
+              : prevHostElapsedSec >= 0 && frame.hostElapsedSec > prevHostElapsedSec
+                ? frame.hostElapsedSec - prevHostElapsedSec
+                : 1 / 30;
+          this.localOptimisticGrabSmoothedClampN = updateEndPushSmoothedClampingLoadN(
+            this.localOptimisticGrabSmoothedClampN,
+            this.computeBlockClampingLoadN(trackedId),
+            dtSmooth
+          );
+          this.localOptimisticGrabLastSmoothHostSec = frame.hostElapsedSec;
+        }
+      }
+    }
 
     this.splinters = frame.splinters;
     return true;
@@ -674,7 +828,7 @@ export class MultiplayerGuestWorld {
         quietSubsteps: 0,
       });
     }
-    this.shards = next;
+      this.shards = next;
   }
 
   /**
@@ -736,19 +890,215 @@ export class MultiplayerGuestWorld {
     );
   }
 
-  public setOptimisticGuestHover(blockId: number | null): void {
+  public setOptimisticGuestHover(
+    blockId: number | null,
+    localPoint: Vec3 | null = null
+  ): void {
     this.localGuestHoverBlockId = blockId;
+    this.localGuestHoverLocalPoint =
+      blockId !== null && localPoint ? [...localPoint] : null;
     if (this.currentPlayer === 1) {
       this.hoveredBlockId = blockId;
+      this.hoverLocalPoint = this.localGuestHoverLocalPoint
+        ? [...this.localGuestHoverLocalPoint]
+        : null;
+    }
+  }
+
+  private clearOptimisticGrabState(): void {
+    this.localOptimisticPullAnchor = null;
+    this.localOptimisticPullStartAnchor = null;
+    this.localOptimisticGrabBlockId = null;
+    this.localOptimisticGrabLocalPoint = [0, 0, 0];
+    this.localOptimisticGrabBlockStartPos = null;
+    this.localOptimisticGrabInitialClampN = 0;
+    this.localOptimisticGrabSmoothedClampN = 0;
+    this.localOptimisticGrabLastSmoothHostSec = -1;
+    this.localOptimisticGrabConfirmedByHost = false;
+    this.localOptimisticGrabPreAckFrames = 0;
+    this.localOptimisticGrabStartedAtMs = 0;
+  }
+
+  private getEffectiveGuestGrabClampingLoadN(
+    blkId: number,
+    blkPos: Vec3,
+    isEndPush: boolean = false
+  ): number {
+    const blk = this.blocks[blkId];
+    const liveLoadN = this.computeBlockClampingLoadN(blkId);
+    let wrenchSum = 0;
+    if (blk?.isLooseSlot) {
+      const wBase = blkId * 4;
+      wrenchSum =
+        wBase + 2 < this.blockPhotoelasticWrench.length
+          ? (this.blockPhotoelasticWrench[wBase + 0] ?? 0) +
+            (this.blockPhotoelasticWrench[wBase + 1] ?? 0) +
+            (this.blockPhotoelasticWrench[wBase + 2] ?? 0)
+          : 0;
+    }
+    return computeEffectiveGrabClampingLoadN({
+      liveLoadN,
+      isLooseSlot: Boolean(blk?.isLooseSlot),
+      wrenchSum,
+      blockPos: blkPos,
+      grabStartBlockPos: this.localOptimisticGrabBlockStartPos,
+      grabInitialClampingLoadN: this.localOptimisticGrabInitialClampN,
+      isEndPush,
+      smoothedLoadN: isEndPush ? this.localOptimisticGrabSmoothedClampN : undefined,
+    });
+  }
+
+  public setOptimisticGuestGrab(
+    blockId: number | null,
+    localPoint?: Vec3,
+    worldAnchor?: Vec3
+  ): void {
+    this.lastExtractionSlip = null;
+    if (blockId !== null && localPoint && worldAnchor) {
+      this.localOptimisticGrabBlockId = blockId;
+      this.localOptimisticGrabLocalPoint = [...localPoint];
+      this.localOptimisticPullStartAnchor = [...worldAnchor];
+      this.localOptimisticPullAnchor = [...worldAnchor];
+      this.localOptimisticGrabConfirmedByHost = false;
+      this.localOptimisticGrabPreAckFrames = 0;
+      this.localOptimisticGrabStartedAtMs =
+        typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const gBlk = this.blocks[blockId];
+      this.localOptimisticGrabBlockStartPos = null;
+      this.localOptimisticGrabInitialClampN = 0;
+      this.localOptimisticGrabInitialClampN = gBlk
+        ? this.getEffectiveGuestGrabClampingLoadN(blockId, gBlk.position)
+        : 0;
+      this.localOptimisticGrabSmoothedClampN = this.localOptimisticGrabInitialClampN;
+      this.localOptimisticGrabLastSmoothHostSec = this.lastAcceptedHostElapsedSec;
+      this.localOptimisticGrabBlockStartPos = gBlk ? [...gBlk.position] : null;
+      if (this.currentPlayer === 1) {
+        this.activeBlockId = blockId;
+        this.grabLocalPoint = [...localPoint];
+        this.grabWorldAnchor = [...worldAnchor];
+        this.grabCurrentWorldOnBlock = [...worldAnchor];
+        this.targetGrabOnBlock = [...worldAnchor];
+        this.targetGrabAnchor = [...worldAnchor];
+        this.grabPlaneY = worldAnchor[1];
+        this.isPointerDraggingBlock = true;
+      }
+    } else {
+      this.clearOptimisticGrabState();
+      if (this.currentPlayer === 1 && this.turnPhase !== 'EXTRACTED') {
+        this.targetGrabOnBlock = [0, 0, 0];
+        this.targetGrabAnchor = [0, 0, 0];
+      }
     }
   }
 
   public setOptimisticGuestPullAnchor(worldAnchor: Vec3 | null): void {
     this.localOptimisticPullAnchor = worldAnchor ? [...worldAnchor] : null;
     if (worldAnchor) {
+      if (!this.localOptimisticPullStartAnchor) {
+        this.localOptimisticPullStartAnchor = [...worldAnchor];
+      }
       this.grabWorldAnchor = [...worldAnchor];
+      this.targetGrabAnchor = [...worldAnchor];
       this.grabPlaneY = worldAnchor[1];
+    } else {
+      this.clearOptimisticGrabState();
+      if (this.currentPlayer === 1 && this.turnPhase !== 'EXTRACTED') {
+        this.isPointerDraggingBlock = false;
+        this.activeBlockId = null;
+        this.targetGrabOnBlock = [0, 0, 0];
+        this.targetGrabAnchor = [0, 0, 0];
+        if (this.turnPhase === 'PULLING') {
+          this.turnPhase = 'SELECT_BLOCK';
+        }
+      }
     }
+  }
+
+  public computeBlockClampingLoadN(blockId: number): number {
+    const blk = this.blocks[blockId];
+    if (!blk || blk.shattered || blk.extracted) return 0;
+    if (
+      this.hasCurrentSeedStateFrame &&
+      blockId >= 0 &&
+      blockId < this.blockClampingLoadsN.length
+    ) {
+      const wireLoad = this.blockClampingLoadsN[blockId];
+      if (Number.isFinite(wireLoad)) {
+        return wireLoad;
+      }
+    }
+    return estimateClampingLoadFromWrenchAndStack(
+      blockId,
+      this.blocks,
+      this.blockPhotoelasticWrench
+    );
+  }
+
+  public getLastEvaluatedClampingLoadN(): number {
+    return this.lastEvaluatedClampingLoadN;
+  }
+
+  /**
+   * Evaluates Track 4 competitive extraction slip on the Guest using identical physical
+   * thresholds (`F_SLIP = 3.42 N`, `F_PUSH_MAX = 18.0 N`) as the authoritative Host.
+   */
+  public evaluateGuestDragSlip(targetWorldOnPlane: Vec3): ExtractionSlipResult | null {
+    const blkId = this.localOptimisticGrabBlockId ?? this.activeBlockId;
+    if (blkId === null) return null;
+    const blk = this.blocks[blkId];
+    if (!blk || blk.shattered) return null;
+
+    if (this.localOptimisticGrabBlockStartPos === null) {
+      this.localOptimisticGrabInitialClampN = this.getEffectiveGuestGrabClampingLoadN(
+        blk.id,
+        blk.position
+      );
+      this.localOptimisticGrabSmoothedClampN = this.localOptimisticGrabInitialClampN;
+      this.localOptimisticGrabLastSmoothHostSec = this.lastAcceptedHostElapsedSec;
+      this.localOptimisticGrabBlockStartPos = [...blk.position];
+    }
+    const localPt =
+      this.localOptimisticGrabBlockId === blkId
+        ? this.localOptimisticGrabLocalPoint
+        : this.grabLocalPoint;
+    const currentOnBlock =
+      this.grabCurrentWorldOnBlock[0] === 0 &&
+      this.grabCurrentWorldOnBlock[1] === 0 &&
+      this.grabCurrentWorldOnBlock[2] === 0 &&
+      this.localOptimisticPullStartAnchor
+        ? this.localOptimisticPullStartAnchor
+        : this.grabCurrentWorldOnBlock;
+    const evalTurnPhase =
+      this.turnPhase === 'SELECT_BLOCK' && this.localOptimisticGrabBlockId !== null
+        ? 'PULLING'
+        : this.turnPhase;
+    const isEndPush = isCompetitiveInwardEndPush({
+      gameMode: this.gameMode,
+      turnPhase: evalTurnPhase,
+      blockRotation: blk.rotation,
+      grabLocalPointDm: localPt,
+      grabCurrentWorldOnBlockDm: currentOnBlock,
+      grabAnchorStartDm: this.localOptimisticPullStartAnchor ?? undefined,
+      targetWorldDm: targetWorldOnPlane,
+    });
+    const clampingLoadN = this.getEffectiveGuestGrabClampingLoadN(blk.id, blk.position, isEndPush);
+    this.lastEvaluatedClampingLoadN = clampingLoadN;
+
+    const res = evaluateCompetitiveDragSlip({
+      gameMode: this.gameMode,
+      turnPhase: evalTurnPhase,
+      blockRotation: blk.rotation,
+      grabLocalPointDm: localPt,
+      grabCurrentWorldOnBlockDm: currentOnBlock,
+      grabAnchorStartDm: this.localOptimisticPullStartAnchor ?? undefined,
+      targetWorldDm: targetWorldOnPlane,
+      clampingLoadN,
+      grabResistance01: this.grabResistance01,
+    });
+    const sameRowOtherCount = countOtherBlocksInLayer(this.blocks, blk);
+    const normalized = normalizeCompetitiveSlipResult(res, sameRowOtherCount);
+    this.lastExtractionSlip = normalized;
+    return normalized;
   }
 
   public getLastAcceptedSeq(): number {
@@ -824,7 +1174,8 @@ export class MultiplayerGuestWorld {
             ev.resistance01,
             ev.slipPowerMw,
             ev.torsionRadPerSec,
-            ev.clampingLoadN
+            ev.clampingLoadN,
+            ev.seamCrossingIntensity
           );
           break;
         case 'tapTest':

@@ -13,7 +13,9 @@ import {
   applyDeterministicTowerPalette,
   buildDeterministicTowerMaterials,
   canonicalizeQuatHemisphere,
+  decodeClampingLoad7Bit,
   decodeMultiplayerStateFrame,
+  encodeClampingLoad7Bit,
   encodeMultiplayerStateFrame,
   inferShardLocalCentroid,
   MP_MAX_SHARDS_PER_FRAME,
@@ -27,6 +29,7 @@ import {
   SerializedShardMeta,
   VitrailMultiplayerClient,
 } from '../src/multiplayer';
+import { F_PUSH_MAX, F_SLIP } from '../src/physics/extractionMechanics';
 
 interface MinimalHttpServer {
   listen(port: number, host: string, cb: () => void): void;
@@ -102,6 +105,7 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
       stress01: (i % 10) / 9,
       crackLocalOrigin: [0.22, -0.04, 0.08] as Vec3,
       photoelasticWrench: [0.25, 0.6, 0.85, 0.4] as [number, number, number, number],
+      clampingLoadN: i === 12 ? 3.42 : i === 14 ? 3.43 : i % 3 === 1 ? 0.4 : 8.5,
     }));
 
     const baseFrame: MultiplayerStateFrame = {
@@ -193,6 +197,43 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
     expect(Math.abs(decoded.blocks[12].photoelasticWrench[2] - 0.85)).toBeLessThan(0.01);
     expect(Math.abs(decoded.blocks[12].crackLocalOrigin[0] - 0.22)).toBeLessThan(0.006);
     expect(Math.abs(decoded.shards[17].position[0] - maxShards[17].position[0])).toBeLessThan(0.001);
+
+    // Threshold-preserving 7-bit clampingLoadN wire round-trip across F_SLIP (3.42 N),
+    // F_PUSH_MAX (18.0 N), and inward end-push slip F_PUSH_MAX / 0.65 (~27.6923 N)
+    expect(decoded.blocks[12].clampingLoadN).toBeLessThanOrEqual(F_SLIP);
+    expect(decoded.blocks[14].clampingLoadN).toBeGreaterThan(F_SLIP);
+    expect(decoded.blocks[14].clampingLoadN).toBeLessThanOrEqual(F_PUSH_MAX);
+    expect(decoded.blocks[1].clampingLoadN).toBeCloseTo(0.4, 1);
+    for (const v of [
+      0,
+      0.1,
+      1.5,
+      3.4,
+      3.42,
+      3.421,
+      3.45,
+      9.0,
+      17.99,
+      18.0,
+      18.01,
+      25.0,
+      26.4,
+      26.88,
+      27.53,
+      27.68,
+      27.69,
+      27.6923,
+      F_PUSH_MAX / 0.65,
+      27.7,
+      45.0,
+      65.0,
+    ]) {
+      const dec = decodeClampingLoad7Bit(encodeClampingLoad7Bit(v))!;
+      expect(dec > F_SLIP).toBe(v > F_SLIP);
+      expect(dec > F_PUSH_MAX).toBe(v > F_PUSH_MAX);
+      expect(dec * 0.65 > F_PUSH_MAX).toBe(v * 0.65 > F_PUSH_MAX);
+    }
+    expect(decodeClampingLoad7Bit(encodeClampingLoad7Bit(undefined))).toBeUndefined();
   });
 
   it('T-MP2: enforces antipodal quaternion hemisphere continuity (dot < 0 guard) and 36 ms 120 Hz Guest smoothing', () => {
@@ -2416,4 +2457,433 @@ describe('Vitrail Internet Multiplayer, Binary Codec, Ergonomics & Relay Integra
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it(
+    'T-MP12: achieves 0 F_SLIP (3.42 N) and inward end-push (27.69 N) threshold flips and 0 25 mm drag mismatches between Host and Guest across 12L/18L/24L/30L towers and live 18L party Turns 0-10',
+    async () => {
+      type HostInternals = {
+        mpRole: 'host' | 'guest' | null;
+        lastExtractionSlip: { slipped: boolean; maxForceN: number; slipAudio: boolean } | null;
+        buildHostStateFrame: () => MultiplayerStateFrame;
+        executeAuthoritativeGuestCommand: (cmd: {
+          kind: string;
+          blockId?: number;
+          localPoint?: Vec3;
+          worldPoint?: Vec3;
+          worldTarget?: Vec3;
+          dropIfPoisedOverTower?: boolean;
+        }) => void;
+      };
+
+      const checkHostVsGuestParity = (
+        host: GameEngine,
+        guestWorld: MultiplayerGuestWorld,
+        label: string
+      ): {
+        checkedBlocks: number;
+        flips: number;
+        inwardPushFlips: number;
+        dragMismatches: number;
+        inwardPushMismatches: number;
+        checkedLayer1Blk4: boolean;
+      } => {
+        const hostInt = host as unknown as HostInternals;
+        const frame = hostInt.buildHostStateFrame();
+        const wireBuf = encodeMultiplayerStateFrame(frame);
+        const decoded = decodeMultiplayerStateFrame(wireBuf);
+        expect(decoded, `${label}: failed to decode wire frame`).not.toBeNull();
+        if (!decoded) {
+          return {
+            checkedBlocks: 0,
+            flips: 1,
+            inwardPushFlips: 1,
+            dragMismatches: 1,
+            inwardPushMismatches: 1,
+            checkedLayer1Blk4: false,
+          };
+        }
+        expect(guestWorld.applyNetworkStateFrame(decoded)).toBe(true);
+
+        const prevRole = hostInt.mpRole;
+        const prevPlayer = host.physics.currentPlayer;
+        const prevGuestPlayer = guestWorld.currentPlayer;
+        const prevSlip = hostInt.lastExtractionSlip;
+        const prevPhysSlip = host.physics.lastExtractionSlip;
+
+        let checkedBlocks = 0;
+        let flips = 0;
+        let inwardPushFlips = 0;
+        let dragMismatches = 0;
+        let inwardPushMismatches = 0;
+        let checkedLayer1Blk4 = false;
+
+        try {
+          hostInt.mpRole = 'host';
+          host.physics.currentPlayer = 1;
+          guestWorld.currentPlayer = 1;
+
+          for (const b of host.physics.blocks) {
+            if (b.shattered || b.extracted || !b.isLegalTarget || b.isLooseSlot) continue;
+            checkedBlocks++;
+            if (b.assignedLayer === 1 && b.id === 4) {
+              checkedLayer1Blk4 = true;
+            }
+
+            const hostClamp = host.physics.computeBlockClampingLoadN(b.id);
+            const guestClamp = guestWorld.computeBlockClampingLoadN(b.id);
+            if ((hostClamp > F_SLIP) !== (guestClamp > F_SLIP)) {
+              flips++;
+            }
+            if ((hostClamp * 0.65 > F_PUSH_MAX) !== (guestClamp * 0.65 > F_PUSH_MAX)) {
+              inwardPushFlips++;
+            }
+
+            const axisX = quatRotateVec3(b.rotation, [1, 0, 0]);
+            const localSide: Vec3 = [0, 0, BLOCK_HALF_Z];
+            const worldOff = quatRotateVec3(b.rotation, localSide);
+            const worldAnchor: Vec3 = [
+              b.position[0] + worldOff[0],
+              b.position[1] + worldOff[1],
+              b.position[2] + worldOff[2],
+            ];
+            const dragTarget25mm: Vec3 = [
+              worldAnchor[0] + axisX[0] * 0.25,
+              worldAnchor[1],
+              worldAnchor[2] + axisX[2] * 0.25,
+            ];
+
+            guestWorld.setOptimisticGuestGrab(b.id, localSide, worldAnchor);
+            const guestSlip = guestWorld.evaluateGuestDragSlip(dragTarget25mm);
+            guestWorld.setOptimisticGuestPullAnchor(null);
+
+            hostInt.executeAuthoritativeGuestCommand({
+              kind: 'begin_pull',
+              blockId: b.id,
+              localPoint: localSide,
+              worldPoint: worldAnchor,
+            });
+            hostInt.executeAuthoritativeGuestCommand({
+              kind: 'update_pull',
+              worldTarget: dragTarget25mm,
+            });
+            const hostSlipped = Boolean(hostInt.lastExtractionSlip?.slipped);
+            if (host.physics.turnPhase === 'PULLING' || host.physics.turnPhase === 'EXTRACTED') {
+              hostInt.executeAuthoritativeGuestCommand({
+                kind: 'end_pull',
+                dropIfPoisedOverTower: false,
+              });
+            }
+
+            if (Boolean(guestSlip?.slipped) !== hostSlipped) {
+              dragMismatches++;
+            }
+
+            // Inward one-finger end-push (`localX = +BLOCK_HALF_X` pushed inward by 25 mm)
+            const localEnd: Vec3 = [BLOCK_HALF_X, 0, 0];
+            const worldEndOff = quatRotateVec3(b.rotation, localEnd);
+            const worldEndAnchor: Vec3 = [
+              b.position[0] + worldEndOff[0],
+              b.position[1] + worldEndOff[1],
+              b.position[2] + worldEndOff[2],
+            ];
+            const pushInwardTarget25mm: Vec3 = [
+              worldEndAnchor[0] - axisX[0] * 0.25,
+              worldEndAnchor[1],
+              worldEndAnchor[2] - axisX[2] * 0.25,
+            ];
+
+            guestWorld.setOptimisticGuestGrab(b.id, localEnd, worldEndAnchor);
+            const guestPushSlip = guestWorld.evaluateGuestDragSlip(pushInwardTarget25mm);
+            guestWorld.setOptimisticGuestPullAnchor(null);
+
+            hostInt.executeAuthoritativeGuestCommand({
+              kind: 'begin_pull',
+              blockId: b.id,
+              localPoint: localEnd,
+              worldPoint: worldEndAnchor,
+            });
+            hostInt.executeAuthoritativeGuestCommand({
+              kind: 'update_pull',
+              worldTarget: pushInwardTarget25mm,
+            });
+            const hostPushSlipped = Boolean(hostInt.lastExtractionSlip?.slipped);
+            if (host.physics.turnPhase === 'PULLING' || host.physics.turnPhase === 'EXTRACTED') {
+              hostInt.executeAuthoritativeGuestCommand({
+                kind: 'end_pull',
+                dropIfPoisedOverTower: false,
+              });
+            }
+
+            if (Boolean(guestPushSlip?.slipped) !== hostPushSlipped) {
+              inwardPushMismatches++;
+            }
+          }
+        } finally {
+          hostInt.mpRole = prevRole;
+          host.physics.currentPlayer = prevPlayer;
+          guestWorld.currentPlayer = prevGuestPlayer;
+          hostInt.lastExtractionSlip = prevSlip;
+          host.physics.lastExtractionSlip = prevPhysSlip;
+        }
+
+        return {
+          checkedBlocks,
+          flips,
+          inwardPushFlips,
+          dragMismatches,
+          inwardPushMismatches,
+          checkedLayer1Blk4,
+        };
+      };
+
+      // 1. Static 90-frame settled 18L (8 seeds), 12L (seed=42), 24L (seed=42), and 30L (seed=42)
+      const staticCases: Array<{ layers: number; seed: number }> = [
+        ...[1, 7, 13, 42, 77, 101, 256, 999].map((seed) => ({ layers: 18, seed })),
+        { layers: 12, seed: 42 },
+        { layers: 24, seed: 42 },
+        { layers: 30, seed: 42 },
+      ];
+
+      for (const { layers, seed } of staticCases) {
+        const host = new GameEngine();
+        await host.initHeadless();
+        host.physics.rebuildTower('party', 2, layers, seed);
+        for (let f = 0; f < 90; f++) {
+          host.stepHeadless(1 / 60);
+        }
+        const guestWorld = new MultiplayerGuestWorld(host.audio, layers, seed);
+        const res = checkHostVsGuestParity(host, guestWorld, `${layers}L-seed${seed}`);
+        expect(res.checkedBlocks).toBeGreaterThan(0);
+        expect(res.flips, `${layers}L seed=${seed} flips`).toBe(0);
+        expect(res.inwardPushFlips, `${layers}L seed=${seed} inwardPushFlips`).toBe(0);
+        expect(res.dragMismatches, `${layers}L seed=${seed} dragMismatches`).toBe(0);
+        expect(res.inwardPushMismatches, `${layers}L seed=${seed} inwardPushMismatches`).toBe(0);
+        guestWorld.dispose();
+        host.dispose();
+      }
+
+      // 2. Live 18L party gameplay Turns 0-10 (`GameEngine.resetGame('party', 2)` + `setAiVsAiMode`)
+      const liveHost = new GameEngine();
+      await liveHost.initHeadless();
+      liveHost.resetGame('party', 2);
+      liveHost.setAiVsAiMode(true, {
+        fastCadence: true,
+        p0Difficulty: 'master',
+        p1Difficulty: 'master',
+      });
+      const liveGuest = new MultiplayerGuestWorld(liveHost.audio, 18, 42);
+
+      let lastCheckedTurn = -1;
+      let totalLiveChecks = 0;
+      let liveFlips = 0;
+      let liveInwardPushFlips = 0;
+      let liveDragMismatches = 0;
+      let liveInwardPushMismatches = 0;
+      let turn2And3CheckedL1Blk4 = 0;
+
+      for (let step = 0; step < 3600 && lastCheckedTurn < 10; step++) {
+        if (
+          liveHost.physics.turnPhase === 'SELECT_BLOCK' &&
+          liveHost.physics.blocksStacked > lastCheckedTurn &&
+          liveHost.physics.blocksStacked <= 10
+        ) {
+          lastCheckedTurn = liveHost.physics.blocksStacked;
+          const res = checkHostVsGuestParity(
+            liveHost,
+            liveGuest,
+            `live-turn-${lastCheckedTurn}`
+          );
+          totalLiveChecks += res.checkedBlocks;
+          liveFlips += res.flips;
+          liveInwardPushFlips += res.inwardPushFlips;
+          liveDragMismatches += res.dragMismatches;
+          liveInwardPushMismatches += res.inwardPushMismatches;
+          if ((lastCheckedTurn === 2 || lastCheckedTurn === 3) && res.checkedLayer1Blk4) {
+            turn2And3CheckedL1Blk4++;
+          }
+        }
+        liveHost.stepHeadless(1 / 60);
+        if (liveHost.physics.turnPhase === 'COLLAPSED') break;
+      }
+
+      expect(lastCheckedTurn).toBeGreaterThanOrEqual(8);
+      expect(turn2And3CheckedL1Blk4).toBe(2);
+      expect(totalLiveChecks).toBeGreaterThan(100);
+      expect(liveFlips).toBe(0);
+      expect(liveInwardPushFlips).toBe(0);
+      expect(liveDragMismatches).toBe(0);
+      expect(liveInwardPushMismatches).toBe(0);
+
+      liveGuest.dispose();
+      liveHost.dispose();
+    },
+    60000
+  );
+
+  it(
+    'T-MP13: preserves optimistic guest grab anchors across 60 Hz step() interpolation and achieves multi-frame Host-vs-Guest parity',
+    async () => {
+      type HostInternals = {
+        mpRole: 'host' | 'guest' | null;
+        lastExtractionSlip: { slipped: boolean; maxForceN: number; slipAudio: boolean } | null;
+        buildHostStateFrame: () => MultiplayerStateFrame;
+        executeAuthoritativeGuestCommand: (cmd: {
+          kind: string;
+          blockId?: number;
+          localPoint?: Vec3;
+          worldPoint?: Vec3;
+          worldTarget?: Vec3;
+          dropIfPoisedOverTower?: boolean;
+        }) => void;
+      };
+
+      // 1. Pre-ack 60 Hz step() must NOT pull grabCurrentWorldOnBlock toward [0, 0, 0]
+      {
+        const host = new GameEngine();
+        await host.initHeadless();
+        host.physics.rebuildTower('party', 2, 18, 42);
+        for (let f = 0; f < 90; f++) host.stepHeadless(1 / 60);
+        const guest = new MultiplayerGuestWorld(host.audio, 18, 42);
+        const hostInt = host as unknown as HostInternals;
+        hostInt.mpRole = 'host';
+        host.physics.currentPlayer = 1;
+        guest.currentPlayer = 1;
+        guest.applyNetworkStateFrame(
+          decodeMultiplayerStateFrame(encodeMultiplayerStateFrame(hostInt.buildHostStateFrame()))!
+        );
+
+        const b5 = host.physics.blocks[5];
+        const ax = quatRotateVec3(b5.rotation, [1, 0, 0]);
+        const localEnd: Vec3 = [BLOCK_HALF_X, 0, 0];
+        const off = quatRotateVec3(b5.rotation, localEnd);
+        const startAnchor: Vec3 = [
+          b5.position[0] + off[0],
+          b5.position[1] + off[1],
+          b5.position[2] + off[2],
+        ];
+        guest.setOptimisticGuestGrab(5, localEnd, startAnchor);
+        // Step 3 frames at 60 Hz before any Host ack arrives
+        for (let f = 0; f < 3; f++) {
+          guest.step(1 / 60);
+          expect(Math.hypot(
+            guest.grabCurrentWorldOnBlock[0] - startAnchor[0],
+            guest.grabCurrentWorldOnBlock[1] - startAnchor[1],
+            guest.grabCurrentWorldOnBlock[2] - startAnchor[2]
+          )).toBeLessThan(1e-6);
+        }
+        const inwardTarget: Vec3 = [
+          startAnchor[0] - ax[0] * 0.12,
+          startAnchor[1],
+          startAnchor[2] - ax[2] * 0.12,
+        ];
+        guest.setOptimisticGuestPullAnchor(inwardTarget);
+        const slip = guest.evaluateGuestDragSlip(inwardTarget);
+        expect(slip?.slipped).toBe(false);
+        expect(slip?.maxForceN).toBe(F_PUSH_MAX);
+
+        guest.dispose();
+        host.dispose();
+      }
+
+      // 2. Multi-frame 60 Hz step()-interleaved Host-vs-Guest parity over 30 Hz snapshots
+      let checked = 0;
+      let mismatches = 0;
+      for (const [layers, blkIds] of [
+        [18, [4, 5, 12]],
+        [24, [4, 5, 12, 22]],
+      ] as const) {
+        for (const blkId of blkIds) {
+          for (const gesture of ['side_pinch', 'inward_push', 'outward_end'] as const) {
+            const host = new GameEngine();
+            await host.initHeadless();
+            host.physics.rebuildTower('party', 2, layers, 42);
+            for (let f = 0; f < 90; f++) host.stepHeadless(1 / 60);
+            const guest = new MultiplayerGuestWorld(host.audio, layers, 42);
+            const hostInt = host as unknown as HostInternals;
+            hostInt.mpRole = 'host';
+            host.physics.currentPlayer = 1;
+            guest.currentPlayer = 1;
+            guest.applyNetworkStateFrame(
+              decodeMultiplayerStateFrame(encodeMultiplayerStateFrame(hostInt.buildHostStateFrame()))!
+            );
+
+            const b = host.physics.blocks[blkId];
+            const ax = quatRotateVec3(b.rotation, [1, 0, 0]);
+            const localPt: Vec3 =
+              gesture === 'side_pinch' ? [0, 0, BLOCK_HALF_Z] : [BLOCK_HALF_X, 0, 0];
+            const off = quatRotateVec3(b.rotation, localPt);
+            const start: Vec3 = [
+              b.position[0] + off[0],
+              b.position[1] + off[1],
+              b.position[2] + off[2],
+            ];
+            const dirSign = gesture === 'inward_push' ? -1 : 1;
+
+            guest.setOptimisticGuestGrab(blkId, localPt, start);
+            hostInt.executeAuthoritativeGuestCommand({
+              kind: 'begin_pull',
+              blockId: blkId,
+              localPoint: localPt,
+              worldPoint: start,
+            });
+
+            let gSlippedOrReleased = false;
+            let hSlipped = false;
+            let gFrame = -1;
+            let hFrame = -1;
+            for (let f = 1; f <= 30; f++) {
+              const dist = Math.min(0.42, f * (1 / 60) * 0.72);
+              const tgt: Vec3 = [
+                start[0] + ax[0] * dist * dirSign,
+                start[1],
+                start[2] + ax[2] * dist * dirSign,
+              ];
+              if (!gSlippedOrReleased) {
+                guest.setOptimisticGuestPullAnchor(tgt);
+                const gs = guest.evaluateGuestDragSlip(tgt);
+                if (gs?.slipped) {
+                  gSlippedOrReleased = true;
+                  gFrame = f;
+                  guest.setOptimisticGuestPullAnchor(null);
+                }
+              }
+              if (!hSlipped) {
+                hostInt.executeAuthoritativeGuestCommand({ kind: 'update_pull', worldTarget: tgt });
+                if (hostInt.lastExtractionSlip?.slipped) {
+                  hSlipped = true;
+                  hFrame = f;
+                }
+              }
+              host.stepHeadless(1 / 60);
+              if (!hSlipped && hostInt.lastExtractionSlip?.slipped) {
+                hSlipped = true;
+                hFrame = f;
+              }
+              guest.step(1 / 60);
+              if (f % 2 === 0) {
+                const fr = decodeMultiplayerStateFrame(
+                  encodeMultiplayerStateFrame(hostInt.buildHostStateFrame())
+                )!;
+                guest.applyNetworkStateFrame(fr);
+                if (!gSlippedOrReleased && guest.activeBlockId === null) {
+                  gSlippedOrReleased = true;
+                  gFrame = f;
+                }
+              }
+              if (gSlippedOrReleased && hSlipped) break;
+            }
+            checked++;
+            if (gSlippedOrReleased !== hSlipped || Math.abs(gFrame - hFrame) > 1) {
+              mismatches++;
+            }
+            guest.dispose();
+            host.dispose();
+          }
+        }
+      }
+      expect(checked).toBe(21);
+      expect(mismatches).toBe(0);
+    },
+    60000
+  );
 });

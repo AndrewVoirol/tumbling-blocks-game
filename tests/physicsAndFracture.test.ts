@@ -880,17 +880,18 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     for (let i = 0; i < 60; i++) pw.step(1 / 60);
 
     const l8Left = pw.blocks.find((b) => b.assignedLayer === 8 && b.assignedSlot === 0)!;
-    pw.startGrabBlock(l8Left.id, [0.35, 0, 0], [
-      l8Left.position[0] + 0.35,
+    const pushStartX = l8Left.position[0] - 0.35;
+    pw.startGrabBlock(l8Left.id, [-0.35, 0, 0], [
+      pushStartX,
       l8Left.position[1],
       l8Left.position[2],
     ]);
 
     for (let f = 1; f <= 240; f++) {
       if (pw.turnPhase === 'PULLING') {
-        const pull = Math.min(1.25, (f / 35) * 1.25);
+        const push = Math.min(1.25, (f / 60) * 1.25);
         pw.updateGrabTarget([
-          l8Left.position[0] + 0.35 + pull,
+          pushStartX + push,
           l8Left.position[1],
           l8Left.position[2],
         ]);

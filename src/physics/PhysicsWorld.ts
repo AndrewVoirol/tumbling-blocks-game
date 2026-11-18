@@ -9,12 +9,38 @@ import {
 import { INITIAL_LAYERS, TraceryMotif } from './constants';
 import { Quat, Vec3 } from '../math/vecMat';
 import { GlassAudioEngine } from '../audio/GlassAudioEngine';
+import {
+  applyAssistiveEndPushImpulse,
+  computeEffectiveGrabClampingLoadN,
+  countOtherBlocksInLayer,
+  estimateClampingLoadFromWrenchAndStack,
+  evaluateCompetitiveDragSlip,
+  evaluateExtractionSlip,
+  type ExtractionSlipResult,
+  F_PINCH,
+  F_PUSH_MAX,
+  F_SLIP,
+  isCompetitiveInwardEndPush,
+  MU_FINGER,
+  normalizeCompetitiveSlipResult,
+  shouldReleaseCompetitiveSlip,
+  updateEndPushSmoothedClampingLoadN,
+} from './extractionMechanics';
 
 export type {
   AdversarialPlacementPlan,
   BlockCriticalityCandidate,
+  ExtractionSlipResult,
   SceneRaycastHit,
   SceneRaycastOptions,
+};
+
+export {
+  evaluateExtractionSlip,
+  F_PINCH,
+  F_PUSH_MAX,
+  F_SLIP,
+  MU_FINGER,
 };
 
 export {
@@ -264,7 +290,11 @@ export async function ensureRapierInitialized(): Promise<void> {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-export interface PhysicsWorld extends MujocoPhysicsEngine {}
+export interface PhysicsWorld extends MujocoPhysicsEngine {
+  hoverLocalPoint?: Vec3 | null;
+  lastExtractionSlip?: ExtractionSlipResult | null;
+  evaluateActiveExtractionSlip?: (targetWorldOnPlane?: Vec3) => ExtractionSlipResult | null;
+}
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class PhysicsWorld {
@@ -273,11 +303,256 @@ export class PhysicsWorld {
     initialLayers: number = INITIAL_LAYERS,
     options?: PhysicsWorldOptions
   ) {
-    return new MujocoPhysicsEngine(
+    const engine = new MujocoPhysicsEngine(
       audio,
       initialLayers,
       undefined,
       options?.seed
     ) as unknown as PhysicsWorld;
+
+    engine.hoverLocalPoint = null;
+    engine.lastExtractionSlip = null;
+
+    let grabStartAnchor: Vec3 | null = null;
+    let grabStartBlockPos: Vec3 | null = null;
+    let grabInitialClampingLoadN = 0;
+    let grabSmoothedClampingLoadN = 0;
+    let slipAudioClearTicks = 0;
+
+    const wrenchScratch = new Float32Array(4);
+    const getEffectiveGrabClampingLoadN = (
+      blkId: number,
+      blkPos: Vec3,
+      useEngineDirect: boolean = true,
+      isEndPush: boolean = false
+    ): number => {
+      const blk = engine.blocks[blkId];
+      const liveLoadN = useEngineDirect
+        ? engine.computeBlockClampingLoadN(blkId)
+        : estimateClampingLoadFromWrenchAndStack(
+            blkId,
+            engine.blocks,
+            engine.blockPhotoelasticWrench
+          );
+      let wrenchSum = 0;
+      if (blk?.isLooseSlot) {
+        wrenchScratch.fill(0);
+        engine.writeBlockPhotoelasticWrench(blkId, wrenchScratch, 0);
+        wrenchSum = wrenchScratch[0] + wrenchScratch[1] + wrenchScratch[2];
+      }
+      return computeEffectiveGrabClampingLoadN({
+        liveLoadN,
+        isLooseSlot: Boolean(blk?.isLooseSlot),
+        wrenchSum,
+        blockPos: blkPos,
+        grabStartBlockPos,
+        grabInitialClampingLoadN,
+        isEndPush,
+        smoothedLoadN: isEndPush ? grabSmoothedClampingLoadN : undefined,
+      });
+    };
+
+    const evaluateActiveSlip = (targetWorldOnPlane?: Vec3): ExtractionSlipResult | null => {
+      if (engine.activeBlockId === null) return null;
+      const blk = engine.blocks[engine.activeBlockId];
+      if (!blk || blk.shattered) return null;
+      const target = targetWorldOnPlane ?? engine.grabWorldAnchor;
+      const isEndPush = isCompetitiveInwardEndPush({
+        gameMode: engine.gameMode,
+        turnPhase: engine.turnPhase,
+        blockRotation: blk.rotation,
+        grabLocalPointDm: engine.grabLocalPoint,
+        grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+        grabAnchorStartDm: grabStartAnchor ?? undefined,
+        targetWorldDm: target,
+      });
+      const clampingLoadN = getEffectiveGrabClampingLoadN(blk.id, blk.position, true, isEndPush);
+      const res = evaluateCompetitiveDragSlip({
+        gameMode: engine.gameMode,
+        turnPhase: engine.turnPhase,
+        blockRotation: blk.rotation,
+        grabLocalPointDm: engine.grabLocalPoint,
+        grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+        grabAnchorStartDm: grabStartAnchor ?? undefined,
+        targetWorldDm: target,
+        clampingLoadN,
+        grabResistance01: engine.grabResistance01,
+      });
+      const sameRowOtherCount = countOtherBlocksInLayer(engine.blocks, blk);
+      const normalized = normalizeCompetitiveSlipResult(res, sameRowOtherCount);
+      engine.lastExtractionSlip = normalized;
+      return normalized;
+    };
+
+    engine.evaluateActiveExtractionSlip = evaluateActiveSlip;
+
+    const origRebuild = engine.rebuildTower.bind(engine);
+    engine.rebuildTower = (
+      mode?: GameMode,
+      players?: number,
+      layers?: number,
+      seed?: number
+    ): void => {
+      engine.hoverLocalPoint = null;
+      engine.lastExtractionSlip = null;
+      grabStartAnchor = null;
+      grabStartBlockPos = null;
+      grabInitialClampingLoadN = 0;
+      grabSmoothedClampingLoadN = 0;
+      slipAudioClearTicks = 0;
+      origRebuild(mode, players, layers, seed);
+    };
+
+    const origStartGrab = engine.startGrabBlock.bind(engine);
+    engine.startGrabBlock = (
+      blockId: number,
+      localPoint: Vec3,
+      worldPoint: Vec3,
+      timestampMs?: number
+    ): boolean => {
+      const ok = origStartGrab(blockId, localPoint, worldPoint, timestampMs);
+      if (ok) {
+        engine.lastExtractionSlip = null;
+        grabStartAnchor = [...worldPoint];
+        const blk = engine.blocks[blockId];
+        grabStartBlockPos = null;
+        grabInitialClampingLoadN = 0;
+        grabInitialClampingLoadN = blk
+          ? getEffectiveGrabClampingLoadN(blockId, blk.position)
+          : 0;
+        grabSmoothedClampingLoadN = grabInitialClampingLoadN;
+        grabStartBlockPos = blk ? [...blk.position] : null;
+      }
+      return ok;
+    };
+
+    const origEndGrab = engine.endGrab.bind(engine);
+    engine.endGrab = (dropIfPoisedOverTower: boolean = false, timestampMs?: number): void => {
+      grabStartAnchor = null;
+      grabStartBlockPos = null;
+      grabInitialClampingLoadN = 0;
+      grabSmoothedClampingLoadN = 0;
+      slipAudioClearTicks = 0;
+      origEndGrab(dropIfPoisedOverTower, timestampMs);
+    };
+
+    const origUpdateGrabTarget = engine.updateGrabTarget.bind(engine);
+    engine.updateGrabTarget = (worldTargetOnPlane: Vec3, timestampMs?: number): void => {
+      origUpdateGrabTarget(worldTargetOnPlane, timestampMs);
+      if (
+        engine.gameMode !== 'sandbox' &&
+        engine.turnPhase === 'PULLING' &&
+        engine.activeBlockId !== null
+      ) {
+        const blk = engine.blocks[engine.activeBlockId];
+        if (!blk || blk.shattered) return;
+        const isEndPush = isCompetitiveInwardEndPush({
+          gameMode: engine.gameMode,
+          turnPhase: engine.turnPhase,
+          blockRotation: blk.rotation,
+          grabLocalPointDm: engine.grabLocalPoint,
+          grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+          grabAnchorStartDm: grabStartAnchor ?? undefined,
+          targetWorldDm: worldTargetOnPlane,
+        });
+        const clampingLoadN = getEffectiveGrabClampingLoadN(blk.id, blk.position, true, isEndPush);
+        const evalRes = evaluateCompetitiveDragSlip({
+          gameMode: engine.gameMode,
+          turnPhase: engine.turnPhase,
+          blockRotation: blk.rotation,
+          grabLocalPointDm: engine.grabLocalPoint,
+          grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+          grabAnchorStartDm: grabStartAnchor ?? undefined,
+          targetWorldDm: worldTargetOnPlane,
+          clampingLoadN,
+          grabResistance01: engine.grabResistance01,
+        });
+        const sameRowOtherCount = countOtherBlocksInLayer(engine.blocks, blk);
+        const normalizedSlip = normalizeCompetitiveSlipResult(evalRes, sameRowOtherCount);
+        engine.lastExtractionSlip = normalizedSlip;
+
+        if (shouldReleaseCompetitiveSlip(evalRes, sameRowOtherCount)) {
+          grabStartAnchor = null;
+          grabStartBlockPos = null;
+          grabInitialClampingLoadN = 0;
+          grabSmoothedClampingLoadN = 0;
+          origEndGrab(false, timestampMs);
+          audio.updateSlideFriction(
+            1.25,
+            0.35,
+            16.0,
+            0,
+            Math.min(F_SLIP, clampingLoadN),
+            0.38
+          );
+          audio.playUiKeyUp?.('step');
+          slipAudioClearTicks = 3;
+        }
+      }
+    };
+
+    const origStep = engine.step.bind(engine);
+    engine.step = (dt: number): PhysicsStepResult => {
+      if (slipAudioClearTicks > 0 && !engine.isPointerDraggingBlock) {
+        slipAudioClearTicks--;
+        if (slipAudioClearTicks === 0) {
+          audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
+        }
+      }
+
+      if (
+        engine.gameMode !== 'sandbox' &&
+        engine.turnPhase === 'PULLING' &&
+        engine.isPointerDraggingBlock &&
+        engine.activeBlockId !== null
+      ) {
+        const blk = engine.blocks[engine.activeBlockId];
+        if (blk && !blk.shattered && !blk.extracted) {
+          const isEndPush = isCompetitiveInwardEndPush({
+            gameMode: engine.gameMode,
+            turnPhase: engine.turnPhase,
+            blockRotation: blk.rotation,
+            grabLocalPointDm: engine.grabLocalPoint,
+            grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+            grabAnchorStartDm: grabStartAnchor ?? undefined,
+            targetWorldDm: engine.grabWorldAnchor,
+          });
+          if (isEndPush) {
+            grabSmoothedClampingLoadN = updateEndPushSmoothedClampingLoadN(
+              grabSmoothedClampingLoadN,
+              engine.computeBlockClampingLoadN(blk.id),
+              dt
+            );
+          }
+          const clampingLoadN = getEffectiveGrabClampingLoadN(blk.id, blk.position, true, isEndPush);
+          const rb = engine.getWorld()?.getRigidBody(blk.bodyHandle);
+          const evalRes = applyAssistiveEndPushImpulse({
+            gameMode: engine.gameMode,
+            turnPhase: engine.turnPhase,
+            isPointerDraggingBlock: engine.isPointerDraggingBlock,
+            blockPos: blk.position,
+            blockRotation: blk.rotation,
+            blockLinVel: blk.linVel,
+            grabLocalPointDm: engine.grabLocalPoint,
+            grabCurrentWorldOnBlockDm: engine.grabCurrentWorldOnBlock,
+            grabWorldAnchorDm: engine.grabWorldAnchor,
+            grabAnchorStartDm: grabStartAnchor ?? undefined,
+            grabStartBlockPos,
+            clampingLoadN,
+            grabResistance01: engine.grabResistance01,
+            dt,
+            applyImpulseAtPoint: (impulseSim, pointDm) => {
+              rb?.applyImpulseAtPoint(impulseSim, pointDm, true);
+            },
+          });
+          const sameRowOtherCount = countOtherBlocksInLayer(engine.blocks, blk);
+          engine.lastExtractionSlip = normalizeCompetitiveSlipResult(evalRes, sameRowOtherCount);
+        }
+      }
+
+      return origStep(dt);
+    };
+
+    return engine;
   }
 }

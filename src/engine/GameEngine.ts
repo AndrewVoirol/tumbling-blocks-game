@@ -20,6 +20,21 @@ import {
   TurnPhase,
 } from '../physics/PhysicsWorld';
 import { MujocoWorkerBridge } from '../physics/MujocoWorkerBridge';
+import {
+  computeEffectiveGrabClampingLoadN,
+  computeGripZoneFromLocalDm,
+  countOtherBlocksInLayer,
+  evaluateCompetitiveDragSlip,
+  evaluateExtractionSlip,
+  type ExtractionSlipResult,
+  F_PUSH_MAX,
+  F_SLIP,
+  isCompetitiveInwardEndPush,
+  localDmToMeters,
+  normalizeCompetitiveSlipResult,
+  shouldReleaseCompetitiveSlip,
+  updateEndPushSmoothedClampingLoadN,
+} from '../physics/extractionMechanics';
 import { WebGPURenderer } from '../renderer/WebGPURenderer';
 import { intersectRayOBB, quatRotateVec3, RayOBBHit, Vec3 } from '../math/vecMat';
 import { OrbitCamera } from './OrbitCamera';
@@ -60,6 +75,9 @@ export interface TouchExtractionPlan {
   localGrab: Vec3;
   startWorld: Vec3;
   minNeighborClearanceDm: number;
+  extractionMode?: 'end_push' | 'pinch_pull';
+  clampingLoadN?: number;
+  maxForceN?: number;
 }
 
 export interface AdversarialPlacementPlan {
@@ -251,6 +269,8 @@ export class GameEngine {
   private aiHoverTargetXZ: [number, number] = [0, 0];
   private aiHoverCurrentXZ: [number, number] = [0, 0];
   private aiTargetYawOffsetRad: number = 0;
+  private aiPullMode: 'end_push' | 'pinch_pull' = 'pinch_pull';
+  private aiPullDirSign: 1 | -1 = 1;
   private aiAbortedBlockIds: Set<number> = new Set();
   private aiLastBlocksStacked: number = -1;
 
@@ -318,6 +338,14 @@ export class GameEngine {
   private mpLastTransientPriority: number = -1;
   private mpTabStorageOverride: TabSessionStorageLike | null = null;
   private scratchWrench4 = new Float32Array(4);
+  private lastExtractionSlip: ExtractionSlipResult | null = null;
+  private slipAudioClearTicks: number = 0;
+  private mpGuestGrabAnchorStart: Vec3 | null = null;
+  private activeGrabStartBlockPos: Vec3 | null = null;
+  private activeGrabInitialClampingN: number | null = null;
+  private activeGrabSmoothedClampingN: number | null = null;
+  private activeGrabLastSmoothSimTime: number = -1;
+  private activeGrabTrackedBlockId: number | null = null;
 
   constructor(canvas?: HTMLCanvasElement, onTelemetry?: TelemetryListener) {
     this.canvas = canvas ?? ({ style: {} } as HTMLCanvasElement);
@@ -531,8 +559,35 @@ export class GameEngine {
       this.emitTelemetry(true);
     }
 
+    if (this.slipAudioClearTicks > 0 && !this.physics.isPointerDraggingBlock) {
+      this.slipAudioClearTicks--;
+      if (this.slipAudioClearTicks === 0) {
+        this.audio.updateSlideFriction(0, 0);
+      }
+    }
+
     if ((this.physics as unknown as { isRemoteGuestMirror?: boolean }).isRemoteGuestMirror) {
       return;
+    }
+
+    const hasEngineManagedPull =
+      this.interactionMode === 'block' ||
+      this.aiStage === 'pulling' ||
+      (this.mpRole === 'host' && this.physics.currentPlayer === 1);
+    if (
+      hasEngineManagedPull &&
+      this.physics.gameMode !== 'sandbox' &&
+      this.physics.turnPhase === 'PULLING' &&
+      this.physics.isPointerDraggingBlock &&
+      this.physics.activeBlockId !== null
+    ) {
+      this.evaluateAndApplyCompetitiveExtractionSlip(this.physics.grabWorldAnchor, undefined, dt);
+    } else if (this.activeGrabTrackedBlockId !== null) {
+      this.activeGrabTrackedBlockId = null;
+      this.activeGrabStartBlockPos = null;
+      this.activeGrabInitialClampingN = null;
+      this.activeGrabSmoothedClampingN = null;
+      this.activeGrabLastSmoothSimTime = -1;
     }
 
     const physHooks = this.physics as unknown as OptionalPhysicsHooks;
@@ -1369,7 +1424,8 @@ export class GameEngine {
         res: number,
         power?: number,
         torsion?: number,
-        loadN?: number
+        loadN?: number,
+        seamCrossingIntensity?: number
       ) => void;
       playTapTestResonance: (
         pinch01: number,
@@ -1423,9 +1479,16 @@ export class GameEngine {
     };
 
     const origSlide = audioAny.updateSlideFriction.bind(this.audio);
-    audioAny.updateSlideFriction = (speed, res, power = 0, torsion = 0, loadN) => {
+    audioAny.updateSlideFriction = (
+      speed,
+      res,
+      power = 0,
+      torsion = 0,
+      loadN,
+      seamCrossingIntensity
+    ) => {
       runTopLevelGuarded(
-        () => origSlide(speed, res, power, torsion, loadN),
+        () => origSlide(speed, res, power, torsion, loadN, seamCrossingIntensity),
         () => {
           if (this.mpRole !== 'host' || !this.mpStatus.peerConnected) return;
           const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -1440,6 +1503,7 @@ export class GameEngine {
               slipPowerMw: 0,
               torsionRadPerSec: 0,
               clampingLoadN: loadN,
+              seamCrossingIntensity: 0,
             });
           } else if (!isZero && now - this.mpLastSlideAudioSentMs >= 48) {
             this.mpLastSlideWasNonZero = true;
@@ -1451,6 +1515,7 @@ export class GameEngine {
               slipPowerMw: power,
               torsionRadPerSec: torsion,
               clampingLoadN: loadN,
+              seamCrossingIntensity,
             });
           }
         }
@@ -2015,6 +2080,10 @@ export class GameEngine {
     for (let i = 0; i < blocksLen; i++) {
       const b = this.physics.blocks[i];
       this.physics.writeBlockPhotoelasticWrench(i, wScratch, 0);
+      const clampingLoadN =
+        typeof this.physics.computeBlockClampingLoadN === 'function'
+          ? this.physics.computeBlockClampingLoadN(b.id)
+          : undefined;
       blocks[i] = {
         position: [b.position[0], b.position[1], b.position[2]],
         rotation: [b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]],
@@ -2034,6 +2103,7 @@ export class GameEngine {
           b.crackLocalOrigin[2],
         ],
         photoelasticWrench: [wScratch[0], wScratch[1], wScratch[2], wScratch[3]],
+        clampingLoadN,
       };
     }
 
@@ -2263,7 +2333,11 @@ export class GameEngine {
       case 'hover_block': {
         if (this.physics.turnPhase === 'SELECT_BLOCK') {
           const blk = cmd.blockId !== null ? this.physics.blocks[cmd.blockId] : undefined;
-          this.physics.hoveredBlockId = blk && !blk.shattered ? blk.id : null;
+          const nextHoveredId = blk && !blk.shattered ? blk.id : null;
+          if (!blk || blk.shattered || this.physics.hoveredBlockId !== nextHoveredId) {
+            this.physics.hoverLocalPoint = null;
+          }
+          this.physics.hoveredBlockId = nextHoveredId;
         }
         break;
       }
@@ -2291,6 +2365,8 @@ export class GameEngine {
             cmd.worldPoint
           );
           if (started) {
+            this.mpGuestGrabAnchorStart = [...cmd.worldPoint];
+            this.lastExtractionSlip = null;
             this.mpForceImmediateSnapshot = true;
             this.emitTelemetry(true);
           }
@@ -2299,11 +2375,16 @@ export class GameEngine {
       }
       case 'update_pull': {
         if (this.physics.turnPhase === 'PULLING') {
-          this.physics.updateGrabTarget(cmd.worldTarget);
+          const slippedBefore = this.evaluateAndApplyCompetitiveExtractionSlip(cmd.worldTarget);
+          if (!slippedBefore) {
+            this.physics.updateGrabTarget(cmd.worldTarget);
+            this.syncPhysicsTriggeredExtractionSlip();
+          }
         }
         break;
       }
       case 'end_pull': {
+        this.mpGuestGrabAnchorStart = null;
         if (
           this.physics.turnPhase === 'PULLING' ||
           this.physics.turnPhase === 'EXTRACTED'
@@ -2358,10 +2439,12 @@ export class GameEngine {
     this.guestWorld?.setOptimisticGuestHover(null);
     this.guestWorld?.setOptimisticGuestPullAnchor(null);
     if (this.interactionMode !== 'orbit' && this.interactionMode !== 'none') {
+      this.safeReleasePointerCapture(this.activePointerId);
       this.interactionMode = 'none';
       this.pendingTapHit = null;
       this.pendingForegroundShardHit = null;
       this.activePointerId = null;
+      this.updateCursorStyle();
     }
   }
 
@@ -2437,7 +2520,12 @@ export class GameEngine {
       prevShards !== this.guestWorld.shards.length ||
       prevShattered !== this.guestWorld.shatteredCount
     ) {
-      if (this.guestWorld.currentPlayer !== 1) {
+      if (
+        this.guestWorld.currentPlayer !== 1 ||
+        (prevPhase === 'PULLING' &&
+          this.guestWorld.turnPhase === 'SELECT_BLOCK' &&
+          !this.guestWorld.isPointerDraggingBlock)
+      ) {
         this.clearGuestLocalBlockInteraction();
       }
       this.updateCursorStyle();
@@ -2877,12 +2965,27 @@ export class GameEngine {
       layerCenterZ /= sameLayerNeighbors.length + 1;
     }
 
+    const clampingLoadN =
+      typeof this.physics.computeBlockClampingLoadN === 'function'
+        ? this.physics.computeBlockClampingLoadN(blk.id)
+        : 0;
+    this.scratchWrench4.fill(0);
+    if (typeof this.physics.writeBlockPhotoelasticWrench === 'function') {
+      this.physics.writeBlockPhotoelasticWrench(blk.id, this.scratchWrench4, 0);
+    }
+    const preWrenchSum =
+      this.scratchWrench4[0] + this.scratchWrench4[1] + this.scratchWrench4[2];
+    const requiresEndPush =
+      clampingLoadN > F_SLIP && (!blk.isLooseSlot || preWrenchSum > 0.18);
+
     if (difficulty === 'apprentice') {
       const dirSign: 1 | -1 =
         blk.position[0] * ux + blk.position[2] * uz >= 0 ? 1 : -1;
       const pullX = ux * dirSign;
       const pullZ = uz * dirSign;
-      const localGrab: Vec3 = [BLOCK_HALF_X * 0.84 * dirSign, 0, 0];
+      const localGrab: Vec3 = requiresEndPush
+        ? [-BLOCK_HALF_X * 0.94 * dirSign, 0, 0]
+        : [BLOCK_HALF_X * 0.84 * dirSign, 0, 0];
       const grabOffset = quatRotateVec3(blk.rotation, localGrab);
       return {
         blockId: blk.id,
@@ -2897,6 +3000,9 @@ export class GameEngine {
           blk.position[2] + grabOffset[2],
         ],
         minNeighborClearanceDm: 0.02,
+        extractionMode: requiresEndPush ? 'end_push' : 'pinch_pull',
+        clampingLoadN,
+        maxForceN: requiresEndPush ? F_PUSH_MAX : F_SLIP,
       };
     }
 
@@ -3012,7 +3118,11 @@ export class GameEngine {
     }
 
     const pullDirXZ: [number, number] = [Math.cos(bestAzimuthRad), Math.sin(bestAzimuthRad)];
-    const localGrab: Vec3 = [BLOCK_HALF_X * 0.84 * bestSign, 0, 0];
+    // Track 4: When clamping load exceeds F_SLIP (3.42 N), outward pinch/pull would slip off;
+    // prioritize firm one-finger compressive end push on the rear end face (|localX| >= 32.5 mm, up to 18.0 N).
+    const localGrab: Vec3 = requiresEndPush
+      ? [-BLOCK_HALF_X * 0.94 * bestSign, 0, 0]
+      : [BLOCK_HALF_X * 0.84 * bestSign, 0, 0];
     const grabOffset = quatRotateVec3(blk.rotation, localGrab);
     return {
       blockId: blk.id,
@@ -3027,6 +3137,9 @@ export class GameEngine {
         blk.position[2] + grabOffset[2],
       ],
       minNeighborClearanceDm: +bestMinClearance.toFixed(4),
+      extractionMode: requiresEndPush ? 'end_push' : 'pinch_pull',
+      clampingLoadN,
+      maxForceN: requiresEndPush ? F_PUSH_MAX : F_SLIP,
     };
   }
 
@@ -3351,9 +3464,23 @@ export class GameEngine {
           surv.minMarginDm < minExtractMarginDm ||
           c.safetyScore01 < 0.45 ||
           c.predictedSlideMm < 0.35;
+        const endPushRequired = c.clampingLoadN > F_SLIP;
+        const endPushSlip = evaluateExtractionSlip(
+          endPushRequired ? [BLOCK_HALF_X * 0.1 * 0.94, 0, 0] : [0, 0, 0.0125],
+          endPushRequired ? c.clampingLoadN * 0.65 : c.clampingLoadN,
+          endPushRequired
+        );
+        const pushVsPinchBias = endPushSlip.slipped
+          ? -2.8
+          : endPushRequired
+            ? jammedOrUnsafe
+              ? -2.4
+              : -0.85
+            : 0.20;
         const safeGatePenalty = jammedOrUnsafe ? -3.2 : 0;
         const s =
           safeGatePenalty +
+          pushVsPinchBias +
           underClampedTopPen +
           Math.min(0.36, surv.minMarginDm) * 2.8 +
           c.safetyScore01 * 0.95 -
@@ -3406,9 +3533,31 @@ export class GameEngine {
           ? -0.35
           : (cand.twoPlyMasterScore01 ?? cand.safetyScore01) * 0.05;
 
+      const candEndPush = extractPlan
+        ? extractPlan.extractionMode === 'end_push'
+        : cand.clampingLoadN > F_SLIP;
+      const candEvalLoadN = extractPlan
+        ? Math.max(cand.clampingLoadN, extractPlan.clampingLoadN ?? 0)
+        : cand.clampingLoadN;
+      const candSlipCheck = evaluateExtractionSlip(
+        extractPlan
+          ? localDmToMeters(extractPlan.localGrab)
+          : candEndPush
+            ? [0.035, 0, 0]
+            : [0, 0, 0.0125],
+        candEndPush ? candEvalLoadN * 0.65 : candEvalLoadN,
+        candEndPush
+      );
+      const extractionThresholdBias = candSlipCheck.slipped
+        ? -2.8
+        : candEndPush
+          ? -0.18
+          : 0.06;
+
       const score2Ply =
         eccReward +
         underClampedTopPen +
+        extractionThresholdBias +
         cand.safetyScore01 * 0.92 +
         Math.min(0.32, midExtract.minMarginDm) * 1.65 +
         channelBonus +
@@ -3434,10 +3583,18 @@ export class GameEngine {
         (blk.assignedLayer >= topClampFloorLayer ? -1.4 : 0) -
         countCrossHingesBelow(blk.assignedLayer) * 0.45;
       const jamPen = cand.predictedSlideMm < 0.25 ? -1.8 : 0;
+      const fbPushReq = cand.clampingLoadN > F_SLIP;
+      const fbSlip = evaluateExtractionSlip(
+        fbPushReq ? [0.035, 0, 0] : [0, 0, 0.0125],
+        fbPushReq ? cand.clampingLoadN * 0.65 : cand.clampingLoadN,
+        fbPushReq
+      );
+      const fbExtractionBias = fbSlip.slipped ? -2.8 : fbPushReq ? -0.15 : 0.12;
       const s =
         (cand.collapseTriggered ? -2.5 : 0) +
         (surv.valid ? 0 : -1.8) +
         jamPen +
+        fbExtractionBias +
         underClampedTopPen +
         surv.minMarginDm * 3.5 +
         cand.safetyScore01 * 1.3 -
@@ -3474,6 +3631,7 @@ export class GameEngine {
       );
       if (tighterProbe) {
         this.physics.hoveredBlockId = tighterProbe.blockId;
+        this.physics.hoverLocalPoint = [BLOCK_HALF_X * 0.82, 0, 0];
         this.physics.tapNudgeBlock(tighterProbe.blockId, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
         this.aiStage = 'probe_tight';
         this.aiTimerSec = 0;
@@ -3484,6 +3642,7 @@ export class GameEngine {
     }
 
     this.physics.hoveredBlockId = blk.id;
+    this.physics.hoverLocalPoint = [BLOCK_HALF_X * 0.82, 0, 0];
     if (!this.aiFastCadence) {
       this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
     }
@@ -3536,8 +3695,15 @@ export class GameEngine {
         (b.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
         (b.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
         crossHinges * 0.48;
+      const clampN =
+        typeof this.physics.computeBlockClampingLoadN === 'function'
+          ? this.physics.computeBlockClampingLoadN(b.id)
+          : 0;
+      const clampSlipPen =
+        clampN * 0.65 > F_PUSH_MAX ? -4.0 : clampN > F_SLIP ? -2.8 : 0.25;
       const rankScore =
         underClampedTopPen +
+        clampSlipPen +
         Math.min(0.36, surv.minMarginDm) * 2.4 -
         survEccDm * 2.0 -
         clampStress * 0.45;
@@ -3641,6 +3807,7 @@ export class GameEngine {
           return;
         }
         this.physics.hoveredBlockId = blk.id;
+        this.physics.hoverLocalPoint = [BLOCK_HALF_X * 0.82, 0, 0];
         this.physics.tapNudgeBlock(blk.id, [1, 0, 0], [BLOCK_HALF_X * 0.82, 0, 0]);
         this.aiStage = 'post_tap';
         this.aiTimerSec = 0;
@@ -3660,14 +3827,20 @@ export class GameEngine {
         }
         const blkRef = this.physics.blocks[plan.blockId];
         if (blkRef && this.physics.startGrabBlock(plan.blockId, plan.localGrab, plan.startWorld)) {
+          this.physics.hoverLocalPoint = [...plan.localGrab];
           this.aiPullStartWorld = plan.startWorld;
           this.aiPullBlockInitXZ = [blkRef.position[0], blkRef.position[2]];
           this.aiPullDirXZ = plan.pullDirXZ;
+          this.aiPullMode = plan.extractionMode ?? 'pinch_pull';
+          this.aiPullDirSign = plan.dirSign;
           this.aiStage = 'pulling';
           this.aiTimerSec = 0;
           this.aiPullProgressSec = 0;
           this.aiThinking = false;
-          this.aiActionLabel = `${labelPrefix} Drawing…`;
+          this.aiActionLabel =
+            plan.extractionMode === 'end_push'
+              ? `${labelPrefix} End-Pushing…`
+              : `${labelPrefix} Drawing…`;
           this.emitTelemetry(true);
         } else {
           this.resetAiController();
@@ -3697,10 +3870,55 @@ export class GameEngine {
         return;
       }
 
+      if (this.physics.turnPhase !== 'PULLING') {
+        if (this.aiTargetBlockId !== null) {
+          this.aiAbortedBlockIds.add(this.aiTargetBlockId);
+        }
+        this.resetAiController();
+        return;
+      }
+
       // Bind-and-release tactician reflex: if a grabbed prism binds hard (< 8 mm slide after 0.14 s)
       // while tension or tower sway rises, release gently before clearing the channel and pick a looser prism
       const pulledBlk =
         this.aiTargetBlockId !== null ? this.physics.blocks[this.aiTargetBlockId] : undefined;
+      // If end-pushing a clamped block has poked the far nose out (>= 4.2 cm) AND relieved clamping load below F_SLIP,
+      // transition grip to the exposed nose so the overhanging front tip is supported during full extraction.
+      if (pulledBlk && this.aiPullMode === 'end_push' && this.physics.turnPhase === 'PULLING') {
+        const pushedDm = Math.hypot(
+          pulledBlk.position[0] - this.aiPullBlockInitXZ[0],
+          pulledBlk.position[2] - this.aiPullBlockInitXZ[1]
+        );
+        const curClampN =
+          typeof this.physics.computeBlockClampingLoadN === 'function'
+            ? this.physics.computeBlockClampingLoadN(pulledBlk.id)
+            : 0;
+        if (
+          pushedDm >= 0.44 &&
+          curClampN <= F_SLIP * 0.85 &&
+          this.physics.grabResistance01 < 0.35
+        ) {
+          const noseLocal: Vec3 = [BLOCK_HALF_X * 0.84 * this.aiPullDirSign, 0, 0];
+          const noseOff = quatRotateVec3(pulledBlk.rotation, noseLocal);
+          const noseWorld: Vec3 = [
+            pulledBlk.position[0] + noseOff[0],
+            pulledBlk.position[1] + noseOff[1],
+            pulledBlk.position[2] + noseOff[2],
+          ];
+          this.physics.endGrab(false);
+          this.activeGrabTrackedBlockId = null;
+          this.activeGrabStartBlockPos = null;
+          this.activeGrabInitialClampingN = null;
+          this.activeGrabSmoothedClampingN = null;
+          this.activeGrabLastSmoothSimTime = -1;
+          if (this.physics.startGrabBlock(pulledBlk.id, noseLocal, noseWorld)) {
+            this.aiPullMode = 'pinch_pull';
+            this.aiPullStartWorld = noseWorld;
+            this.aiPullProgressSec = 0;
+            this.aiActionLabel = `${labelPrefix} Drawing…`;
+          }
+        }
+      }
       if (pulledBlk && this.aiTimerSec >= 0.14 && this.physics.turnPhase === 'PULLING') {
         const movedDm = Math.hypot(
           pulledBlk.position[0] - this.aiPullBlockInitXZ[0],
@@ -3708,7 +3926,10 @@ export class GameEngine {
         );
         const liveLeanDeg = this.physics.getTelemetry().leanAngleDeg;
         const jammedEarly =
-          movedDm < 0.08 && (this.physics.grabResistance01 > 0.72 || liveLeanDeg > 0.90);
+          (movedDm < 0.08 && (this.physics.grabResistance01 > 0.72 || liveLeanDeg > 0.90)) ||
+          (this.aiPullMode === 'end_push' &&
+            movedDm < 0.16 &&
+            (this.physics.grabResistance01 > 0.68 || liveLeanDeg > 0.55));
         const jammedMidChannel =
           this.aiTimerSec >= 0.30 &&
           movedDm < 0.32 &&
@@ -3734,11 +3955,36 @@ export class GameEngine {
           ? Math.min(0.45, (this.aiPullProgressSec - nominalPullDur) * 0.35)
           : 0;
       const pullDistDm = 1.62 * easePull + extraReach;
-      const targetWorld: Vec3 = [
+      let targetWorld: Vec3 = [
         this.aiPullStartWorld[0] + this.aiPullDirXZ[0] * pullDistDm,
         this.aiPullStartWorld[1],
         this.aiPullStartWorld[2] + this.aiPullDirXZ[1] * pullDistDm,
       ];
+      if (this.aiPullMode === 'end_push' && pulledBlk) {
+        const pushedDmNow = Math.hypot(
+          pulledBlk.position[0] - this.aiPullBlockInitXZ[0],
+          pulledBlk.position[2] - this.aiPullBlockInitXZ[1]
+        );
+        if (pushedDmNow >= 0.20) {
+          const endSign = this.physics.grabLocalPoint[0] >= 0 ? -1 : 1;
+          const curAxis = quatRotateVec3(pulledBlk.rotation, [endSign, 0, 0]);
+          const hLen = Math.hypot(curAxis[0], curAxis[2]);
+          if (hLen > 0.35) {
+            const ax = curAxis[0] / hLen;
+            const az = curAxis[2] / hLen;
+            if (ax * this.aiPullDirXZ[0] + az * this.aiPullDirXZ[1] > 0.25) {
+              this.aiPullDirXZ = [ax, az];
+              const gOnBlk = this.physics.grabCurrentWorldOnBlock;
+              const aheadDm = Math.min(0.45, Math.max(0.22, pullDistDm - pushedDmNow));
+              targetWorld = [
+                gOnBlk[0] + ax * aheadDm,
+                this.aiPullStartWorld[1],
+                gOnBlk[2] + az * aheadDm,
+              ];
+            }
+          }
+        }
+      }
       this.physics.updateGrabTarget(targetWorld);
       if (this.aiTimerSec > (this.aiFastCadence ? 2.4 : 4.2) && this.physics.turnPhase === 'PULLING') {
         if (this.aiTargetBlockId !== null) {
@@ -3835,6 +4081,15 @@ export class GameEngine {
     this.touchInspect = null;
     this.pendingLockedTouchBlockId = null;
     this.audio.updateSlideFriction(0, 0);
+    this.lastExtractionSlip = null;
+    this.slipAudioClearTicks = 0;
+    this.mpGuestGrabAnchorStart = null;
+    this.activeGrabTrackedBlockId = null;
+    this.activeGrabStartBlockPos = null;
+    this.activeGrabInitialClampingN = null;
+    this.activeGrabSmoothedClampingN = null;
+    this.activeGrabLastSmoothSimTime = -1;
+    this.physics.hoverLocalPoint = null;
     this.physics.rebuildTower(mode, players);
     this.lastObservedTurnPhase = this.physics.turnPhase;
     this.resetSandboxCameraHoldState(27.0);
@@ -3939,6 +4194,7 @@ export class GameEngine {
         }
       }
       this.physics.hoveredBlockId = null;
+      this.physics.hoverLocalPoint = null;
       this.physics.activeBlockId = null;
       this.physics.openTopSlots = [];
 
@@ -4373,6 +4629,215 @@ export class GameEngine {
     return this.activeTouches.size;
   }
 
+  /**
+   * Returns Gap B 2-zone hover enum (`0` none, `1.0` Body/Broadside, `2.0` End-Tip)
+   * matching `WebGPURenderer` `stateFlags.x`.
+   */
+  public getHoveredZone(): 0 | 1 | 2 {
+    if (!this.physics || this.physics.hoveredBlockId === null) return 0;
+    return computeGripZoneFromLocalDm(this.physics.hoverLocalPoint);
+  }
+
+  /**
+   * Returns Gap B 2-zone grab enum (`0` none, `1.0` Body/Broadside, `2.0` End-Tip)
+   * matching `WebGPURenderer` `stateFlags.y`.
+   */
+  public getGrabZone(): 0 | 1 | 2 {
+    if (!this.physics || this.physics.activeBlockId === null) return 0;
+    return computeGripZoneFromLocalDm(this.physics.grabLocalPoint);
+  }
+
+  public getLastExtractionSlip(): ExtractionSlipResult | null {
+    return this.lastExtractionSlip;
+  }
+
+  private triggerCompetitiveSlipFeedback(clampingLoadN: number): void {
+    this.audio.updateSlideFriction(
+      1.25,
+      0.35,
+      16.0,
+      0,
+      Math.min(F_SLIP, Math.max(0, clampingLoadN)),
+      0.38
+    );
+    this.audio.playUiKeyUp?.('step');
+    this.slipAudioClearTicks = 3;
+  }
+
+  private cleanupAfterCompetitiveSlip(slippedBlockId: number | null): void {
+    this.activeGrabTrackedBlockId = null;
+    this.activeGrabStartBlockPos = null;
+    this.activeGrabInitialClampingN = null;
+    this.activeGrabSmoothedClampingN = null;
+    this.activeGrabLastSmoothSimTime = -1;
+
+    if (
+      slippedBlockId !== null &&
+      this.aiStage === 'pulling' &&
+      this.aiTargetBlockId === slippedBlockId
+    ) {
+      this.aiAbortedBlockIds.add(slippedBlockId);
+      this.resetAiController();
+    }
+    if (this.interactionMode === 'block') {
+      this.safeReleasePointerCapture(this.activePointerId);
+      this.interactionMode = 'none';
+      this.activePointerId = null;
+      this.pendingTapHit = null;
+      this.pendingForegroundShardHit = null;
+      this.updateCursorStyle();
+    }
+    if (this.mpRole === 'host') {
+      this.mpGuestGrabAnchorStart = null;
+      this.mpForceImmediateSnapshot = true;
+    }
+    this.emitTelemetry(true);
+  }
+
+  private syncPhysicsTriggeredExtractionSlip(): boolean {
+    if (!this.physics || this.physics.gameMode === 'sandbox') return false;
+    const physSlip = this.physics.lastExtractionSlip;
+    if (
+      !physSlip?.slipped ||
+      this.physics.turnPhase === 'PULLING' ||
+      this.physics.activeBlockId !== null
+    ) {
+      return false;
+    }
+    const needsCleanup =
+      this.interactionMode === 'block' ||
+      this.lastExtractionSlip?.slipped !== true ||
+      this.mpGuestGrabAnchorStart !== null ||
+      this.aiStage === 'pulling';
+    if (!needsCleanup) return false;
+
+    const prevTrackedId = this.activeGrabTrackedBlockId;
+    this.lastExtractionSlip = physSlip;
+    this.slipAudioClearTicks = 3;
+    this.cleanupAfterCompetitiveSlip(prevTrackedId);
+    return true;
+  }
+
+  private evaluateAndApplyCompetitiveExtractionSlip(
+    targetWorldDm: Vec3,
+    timestampMs?: number,
+    stepDt?: number
+  ): boolean {
+    if (
+      !this.physics ||
+      this.physics.gameMode === 'sandbox' ||
+      this.physics.turnPhase !== 'PULLING' ||
+      this.physics.activeBlockId === null
+    ) {
+      this.activeGrabTrackedBlockId = null;
+      this.activeGrabStartBlockPos = null;
+      this.activeGrabInitialClampingN = null;
+      this.activeGrabSmoothedClampingN = null;
+      this.activeGrabLastSmoothSimTime = -1;
+      return false;
+    }
+    const blk = this.physics.blocks[this.physics.activeBlockId];
+    if (!blk || blk.shattered) return false;
+
+    const liveClampingN =
+      typeof this.physics.computeBlockClampingLoadN === 'function'
+        ? this.physics.computeBlockClampingLoadN(blk.id)
+        : 0;
+    let wrenchSum = 0;
+    if (blk.isLooseSlot && typeof this.physics.writeBlockPhotoelasticWrench === 'function') {
+      this.scratchWrench4.fill(0);
+      this.physics.writeBlockPhotoelasticWrench(blk.id, this.scratchWrench4, 0);
+      wrenchSum =
+        this.scratchWrench4[0] + this.scratchWrench4[1] + this.scratchWrench4[2];
+    }
+    if (this.activeGrabTrackedBlockId !== blk.id) {
+      this.activeGrabTrackedBlockId = blk.id;
+      this.activeGrabStartBlockPos = [...blk.position];
+      this.activeGrabInitialClampingN = computeEffectiveGrabClampingLoadN({
+        liveLoadN: liveClampingN,
+        isLooseSlot: blk.isLooseSlot,
+        wrenchSum,
+        blockPos: blk.position,
+        grabStartBlockPos: null,
+        grabInitialClampingLoadN: 0,
+      });
+      this.activeGrabSmoothedClampingN = this.activeGrabInitialClampingN;
+      this.activeGrabLastSmoothSimTime =
+        typeof this.physics.getSimTime === 'function' ? this.physics.getSimTime() : -1;
+    }
+    const anchorStart =
+      this.mpRole === 'host' && this.physics.currentPlayer === 1
+        ? this.mpGuestGrabAnchorStart ?? undefined
+        : this.interactionMode === 'block'
+          ? this.grabAnchorOrigin
+          : this.aiStage === 'pulling'
+            ? this.aiPullStartWorld
+            : undefined;
+    const isEndPush = isCompetitiveInwardEndPush({
+      gameMode: this.physics.gameMode,
+      turnPhase: this.physics.turnPhase,
+      blockRotation: blk.rotation,
+      grabLocalPointDm: this.physics.grabLocalPoint,
+      grabCurrentWorldOnBlockDm: this.physics.grabCurrentWorldOnBlock,
+      grabAnchorStartDm: anchorStart,
+      targetWorldDm,
+    });
+    if (isEndPush) {
+      const curSimTime =
+        typeof this.physics.getSimTime === 'function' ? this.physics.getSimTime() : -1;
+      if (curSimTime !== this.activeGrabLastSmoothSimTime) {
+        const dtSmooth =
+          this.activeGrabLastSmoothSimTime >= 0 && curSimTime > this.activeGrabLastSmoothSimTime
+            ? curSimTime - this.activeGrabLastSmoothSimTime
+            : (stepDt ?? 1 / 60);
+        this.activeGrabSmoothedClampingN = updateEndPushSmoothedClampingLoadN(
+          this.activeGrabSmoothedClampingN ?? liveClampingN,
+          liveClampingN,
+          dtSmooth
+        );
+        this.activeGrabLastSmoothSimTime = curSimTime;
+      }
+    }
+    const clampingLoadN = computeEffectiveGrabClampingLoadN({
+      liveLoadN: liveClampingN,
+      isLooseSlot: blk.isLooseSlot,
+      wrenchSum,
+      blockPos: blk.position,
+      grabStartBlockPos: this.activeGrabStartBlockPos,
+      grabInitialClampingLoadN: this.activeGrabInitialClampingN ?? liveClampingN,
+      isEndPush,
+      smoothedLoadN: isEndPush
+        ? (this.activeGrabSmoothedClampingN ?? liveClampingN)
+        : undefined,
+    });
+
+    const evalRes = evaluateCompetitiveDragSlip({
+      gameMode: this.physics.gameMode,
+      turnPhase: this.physics.turnPhase,
+      blockRotation: blk.rotation,
+      grabLocalPointDm: this.physics.grabLocalPoint,
+      grabCurrentWorldOnBlockDm: this.physics.grabCurrentWorldOnBlock,
+      grabAnchorStartDm: anchorStart,
+      targetWorldDm,
+      clampingLoadN,
+      grabResistance01: this.physics.grabResistance01,
+    });
+    const sameRowOtherCount = countOtherBlocksInLayer(this.physics.blocks, blk);
+    const normalizedSlip = normalizeCompetitiveSlipResult(evalRes, sameRowOtherCount);
+    this.lastExtractionSlip = normalizedSlip;
+    this.physics.lastExtractionSlip = normalizedSlip;
+
+    if (!shouldReleaseCompetitiveSlip(evalRes, sameRowOtherCount)) {
+      return false;
+    }
+
+    // Fingers slipped cleanly off clamped block: release without disturbing tower and play slip audio
+    this.physics.endGrab(false, timestampMs);
+    this.triggerCompetitiveSlipFeedback(clampingLoadN);
+    this.cleanupAfterCompetitiveSlip(blk.id);
+    return true;
+  }
+
   private safeReleasePointerCapture(pointerId: number | null | undefined): void {
     if (pointerId === null || pointerId === undefined || !this.canvas) return;
     if (typeof this.canvas.releasePointerCapture !== 'function') return;
@@ -4397,6 +4862,7 @@ export class GameEngine {
     }
     if (this.physics) {
       this.physics.hoveredBlockId = null;
+      this.physics.hoverLocalPoint = null;
     }
     this.camera.isUserOrbiting = false;
     this.activePointerId = null;
@@ -4496,6 +4962,12 @@ export class GameEngine {
     const pick = this.raycastIntactBlocks(origin, dir);
     if (pick) {
       const blk = this.physics.blocks[pick.blockId];
+      if (this.mpRole === 'guest') {
+        this.guestWorld?.setOptimisticGuestHover(pick.blockId, [...pick.hit.localPoint]);
+      } else {
+        this.physics.hoveredBlockId = pick.blockId;
+        this.physics.hoverLocalPoint = [...pick.hit.localPoint];
+      }
       if (
         blk &&
         ((blk.isLegalTarget && this.physics.turnPhase === 'SELECT_BLOCK') ||
@@ -4640,7 +5112,10 @@ export class GameEngine {
     if (this.activePointerId === null || pointerId !== this.activePointerId) {
       if (!this.canLocalPlayerManipulateBlocks()) {
         if (this.mpRole === 'guest') {
-          this.guestWorld?.setOptimisticGuestHover(null);
+          this.guestWorld?.setOptimisticGuestHover(null, null);
+        } else {
+          this.physics.hoveredBlockId = null;
+          this.physics.hoverLocalPoint = null;
         }
         this.updateCursorStyle();
         return;
@@ -4648,6 +5123,7 @@ export class GameEngine {
 
       if (this.mpRole === 'guest') {
         if (this.physics.turnPhase === 'EXTRACTED') {
+          this.guestWorld?.setOptimisticGuestHover(null, null);
           if (
             now - this.mpLastGuestCmdSentMs >= 15 &&
             this.isRayNearTopPlacementZone(origin, dir, 0.80)
@@ -4660,13 +5136,14 @@ export class GameEngine {
         } else if (this.physics.turnPhase === 'SELECT_BLOCK') {
           const pick = this.raycastIntactBlocks(origin, dir);
           const pickId = pick ? pick.blockId : null;
-          this.guestWorld?.setOptimisticGuestHover(pickId);
+          const pickLocal: Vec3 | null = pick ? [...pick.hit.localPoint] : null;
+          this.guestWorld?.setOptimisticGuestHover(pickId, pickLocal);
           if (pickId !== this.mpLastSentGuestHoverId && now - this.mpLastGuestCmdSentMs >= 15) {
             this.mpLastSentGuestHoverId = pickId;
             this.sendGuestRemoteCommand({ kind: 'hover_block', blockId: pickId }, now);
           }
         } else {
-          this.guestWorld?.setOptimisticGuestHover(null);
+          this.guestWorld?.setOptimisticGuestHover(null, null);
         }
         this.updateCursorStyle();
         return;
@@ -4681,8 +5158,10 @@ export class GameEngine {
       if (this.physics.turnPhase === 'SELECT_BLOCK' || this.physics.gameMode === 'sandbox') {
         const pick = this.raycastIntactBlocks(origin, dir);
         this.physics.hoveredBlockId = pick ? pick.blockId : null;
+        this.physics.hoverLocalPoint = pick ? [...pick.hit.localPoint] : null;
       } else {
         this.physics.hoveredBlockId = null;
+        this.physics.hoverLocalPoint = null;
       }
       this.updateCursorStyle();
       return;
@@ -4749,7 +5228,12 @@ export class GameEngine {
           },
           now
         );
-        this.guestWorld?.setOptimisticGuestPullAnchor(worldPt);
+        this.guestWorld?.setOptimisticGuestGrab(
+          this.pendingTapHit.blockId,
+          localPt,
+          worldPt
+        );
+        this.lastExtractionSlip = null;
         this.interactionMode = 'block';
         this.emitTelemetry(true);
       } else if (
@@ -4769,6 +5253,7 @@ export class GameEngine {
           this.pointerDownExplicitTs ?? timestampMs
         );
         if (started) {
+          this.lastExtractionSlip = null;
           this.interactionMode = 'block';
           this.mpForceImmediateSnapshot = true;
           this.emitTelemetry(true);
@@ -4806,14 +5291,31 @@ export class GameEngine {
         if (planePt) {
           if (this.mpRole === 'guest') {
             this.guestWorld?.setOptimisticGuestPullAnchor(planePt);
-            if (this.mpStatus.peerConnected && now - this.mpLastGuestCmdSentMs >= 15) {
+            const guestSlip = this.guestWorld?.evaluateGuestDragSlip(planePt);
+            if (guestSlip?.slipped) {
+              this.lastExtractionSlip = guestSlip;
+              this.mpPendingPullTarget = null;
+              this.sendGuestRemoteCommand({ kind: 'end_pull', dropIfPoisedOverTower: false }, now);
+              this.clearGuestLocalBlockInteraction();
+              this.triggerCompetitiveSlipFeedback(
+                this.guestWorld?.getLastEvaluatedClampingLoadN() ?? F_SLIP
+              );
+              this.emitTelemetry(true);
+            } else if (this.mpStatus.peerConnected && now - this.mpLastGuestCmdSentMs >= 15) {
               this.mpPendingPullTarget = null;
               this.sendGuestRemoteCommand({ kind: 'update_pull', worldTarget: planePt }, now);
             } else {
               this.mpPendingPullTarget = planePt;
             }
           } else {
-            this.physics.updateGrabTarget(planePt, timestampMs);
+            const slippedBefore = this.evaluateAndApplyCompetitiveExtractionSlip(
+              planePt,
+              timestampMs
+            );
+            if (!slippedBefore) {
+              this.physics.updateGrabTarget(planePt, timestampMs);
+              this.syncPhysicsTriggeredExtractionSlip();
+            }
           }
         }
       }

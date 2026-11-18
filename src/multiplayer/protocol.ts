@@ -1,4 +1,5 @@
 import { Quat, Vec3 } from '../math/vecMat';
+import { F_PUSH_MAX, F_SLIP } from '../physics/extractionMechanics';
 import {
   BLOCK_HALF_X,
   BLOCK_HALF_Y,
@@ -75,6 +76,7 @@ export type NetworkAudioEvent =
       slipPowerMw: number;
       torsionRadPerSec: number;
       clampingLoadN?: number;
+      seamCrossingIntensity?: number;
     }
   | {
       kind: 'tapTest';
@@ -240,6 +242,8 @@ export interface DecodedBlockFrameState {
   stress01: number;
   crackLocalOrigin: Vec3;
   photoelasticWrench: [number, number, number, number];
+  /** Authoritative Host per-block clamping load (N), encoded threshold-preservingly in 7 unused block bits. */
+  clampingLoadN?: number;
 }
 
 export interface DecodedShardFrameState {
@@ -544,6 +548,45 @@ function readQuatI16(view: DataView, byteOffset: number): Quat {
 }
 
 /**
+ * Quantizes authoritative clamping load (N) into 7 bits (`0..127`) with exact threshold
+ * preservation across `F_SLIP` (`3.42 N`), `F_PUSH_MAX` (`18.0 N`), and the inward end-push
+ * slip threshold `F_PUSH_MAX / 0.65` (`~27.6923 N`):
+ * - `0`: omitted (`undefined`)
+ * - `1`: `0.0 N`
+ * - `2..69`: `0.05..3.40 N` (`<= F_SLIP`)
+ * - `70..118`: `3.45..17.85 N` (`> F_SLIP` and `<= F_PUSH_MAX`)
+ * - `119..122`: `19.21..26.47 N` (`> F_PUSH_MAX` and `clampingLoadN * 0.65 <= F_PUSH_MAX`)
+ * - `123..127`: `27.85..62.25 N` (`clampingLoadN * 0.65 > F_PUSH_MAX`)
+ */
+export function encodeClampingLoad7Bit(clampingLoadN: number | undefined): number {
+  if (clampingLoadN === undefined || !Number.isFinite(clampingLoadN)) {
+    return 0;
+  }
+  const x = Math.max(0, clampingLoadN);
+  if (x <= 0.025) return 1;
+  if (x <= F_SLIP) {
+    return Math.max(2, Math.min(69, 1 + Math.round(x / 0.05)));
+  }
+  if (x <= F_PUSH_MAX) {
+    return 70 + Math.max(0, Math.min(48, Math.round((x - 3.45) / 0.30)));
+  }
+  if (x * 0.65 <= F_PUSH_MAX) {
+    return 119 + Math.max(0, Math.min(3, Math.round((x - 19.21) / 2.42)));
+  }
+  return 123 + Math.max(0, Math.min(4, Math.round((x - 27.85) / 8.6)));
+}
+
+export function decodeClampingLoad7Bit(q: number): number | undefined {
+  const code = q & 0x7f;
+  if (code === 0) return undefined;
+  if (code === 1) return 0;
+  if (code <= 69) return +((code - 1) * 0.05).toFixed(2);
+  if (code <= 118) return +(3.45 + (code - 70) * 0.30).toFixed(2);
+  if (code <= 122) return +(19.21 + (code - 119) * 2.42).toFixed(2);
+  return +(27.85 + (code - 123) * 8.6).toFixed(2);
+}
+
+/**
  * Encodes the authoritative Host simulation snapshot into a compact `< 4 KB` binary `ArrayBuffer`
  * (`~1,868 B` for a 54-block tower; `<= 3,908 B` even during a 120-shard collapse burst).
  */
@@ -639,12 +682,14 @@ export function encodeMultiplayerStateFrame(frame: MultiplayerStateFrame): Array
     writeQuatI16(view, offset + 12, b.rotation);
 
     view.setUint8(offset + 20, Math.round(clamp01(b.damage) * 255));
+    const clampQ = encodeClampingLoad7Bit(b.clampingLoadN);
     const stateBits =
       (b.shattered ? 1 : 0) |
       (b.extracted ? 2 : 0) |
       (b.isLegalTarget ? 4 : 0) |
       (b.isLooseSlot ? 8 : 0) |
-      ((b.swatchId & 0x07) << 4);
+      ((b.swatchId & 0x07) << 4) |
+      ((clampQ & 0x01) << 7);
     view.setUint8(offset + 21, stateBits);
     view.setUint8(
       offset + 22,
@@ -658,7 +703,7 @@ export function encodeMultiplayerStateFrame(frame: MultiplayerStateFrame): Array
     view.setInt8(offset + 24, Math.round(cx * 127));
     view.setInt8(offset + 25, Math.round(cy * 127));
     view.setInt8(offset + 26, Math.round(cz * 127));
-    view.setUint8(offset + 27, b.motif & 0x03);
+    view.setUint8(offset + 27, (b.motif & 0x03) | (((clampQ >> 1) & 0x3f) << 2));
 
     view.setUint8(offset + 28, Math.round(clamp01(b.photoelasticWrench[0]) * 255));
     view.setUint8(offset + 29, Math.round(clamp01(b.photoelasticWrench[1]) * 255));
@@ -788,7 +833,10 @@ export function decodeMultiplayerStateFrame(buffer: ArrayBuffer): MultiplayerSta
     const cx = (view.getInt8(offset + 24) / 127) * BLOCK_HALF_X;
     const cy = (view.getInt8(offset + 25) / 127) * BLOCK_HALF_Y;
     const cz = (view.getInt8(offset + 26) / 127) * BLOCK_HALF_Z;
-    const motif = (view.getUint8(offset + 27) & 0x03) as TraceryMotif;
+    const motifByte = view.getUint8(offset + 27);
+    const motif = (motifByte & 0x03) as TraceryMotif;
+    const clampQ = ((stateBits >>> 7) & 0x01) | ((motifByte & 0xfc) >>> 1);
+    const clampingLoadN = decodeClampingLoad7Bit(clampQ);
 
     blocks[i] = {
       position: [px, py, pz],
@@ -810,6 +858,7 @@ export function decodeMultiplayerStateFrame(buffer: ArrayBuffer): MultiplayerSta
         view.getUint8(offset + 30) / 255,
         view.getUint8(offset + 31) / 255,
       ],
+      clampingLoadN,
     };
     offset += MP_BLOCK_STRIDE_BYTES;
   }
