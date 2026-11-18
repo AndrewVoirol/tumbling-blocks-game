@@ -216,7 +216,10 @@ fn vs_table_depth(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f3
 fn evalTransmittedBaseFromTau(tauRGB: vec3<f32>) -> vec3<f32> {
   let tauPeak = max(tauRGB.r, max(tauRGB.g, tauRGB.b));
   let casterMask = smoothstep(0.005, 0.075, tauPeak);
-  let shadowBase = 0.38 * exp(-tauRGB * 0.52) + 0.17 * exp(-tauRGB * 0.18);
+  let excessTau = max(vec3<f32>(0.0), tauRGB - vec3<f32>(3.2));
+  let softTau = min(tauRGB, vec3<f32>(3.2)) + excessTau / (vec3<f32>(1.0) + excessTau * 0.30);
+  let specTrans = integrateSpectralTau8ToRGB(evalSwatchSpectralSigma8(softTau * 0.44));
+  let shadowBase = 0.27 * specTrans + 0.13 * exp(-softTau * 0.22);
   return mix(vec3<f32>(1.0), shadowBase, casterMask);
 }
 
@@ -299,7 +302,7 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
     baseFiltered = baseAccum / baseWeight;
 
     // Sub-millimeter (0.47 mm/texel) 2048x2048 depth-map contact silhouette for resting Layer-0 blocks/shards
-    contactSharpWeight = 1.0 - smoothstep(0.015, 0.14, liftedHeightDm);
+    contactSharpWeight = 1.0 - smoothstep(0.025, 0.19, liftedHeightDm);
     if (contactSharpWeight > 0.01) {
       let depthDims = vec2<i32>(textureDimensions(uSunDepthTex));
       let depthMax = depthDims - vec2<i32>(1);
@@ -311,7 +314,7 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
       let v10 = select(0.0, 1.0, refZ <= textureLoad(uSunDepthTex, clamp(dBase + vec2<i32>(1, 0), vec2<i32>(0), depthMax), 0));
       let v01 = select(0.0, 1.0, refZ <= textureLoad(uSunDepthTex, clamp(dBase + vec2<i32>(0, 1), vec2<i32>(0), depthMax), 0));
       let v11 = select(0.0, 1.0, refZ <= textureLoad(uSunDepthTex, clamp(dBase + vec2<i32>(1, 1), vec2<i32>(0), depthMax), 0));
-      sharpLit01 = smoothstep(0.15, 0.85, mix(mix(v00, v10, dFrac.x), mix(v01, v11, dFrac.x), dFrac.y));
+      sharpLit01 = smoothstep(0.32, 0.68, mix(mix(v00, v10, dFrac.x), mix(v01, v11, dFrac.x), dFrac.y));
 
       var bestTau = centerTau;
       var bestPeak = max(bestTau.r, max(bestTau.g, bestTau.b));
@@ -360,11 +363,11 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
   //    outside their un-deflected shadow silhouette while Layer-0 intact blocks keep 0.0 rectangular halo bleed!
   let sunClipDelta = uScene.sunViewProj * vec4<f32>(-sunDir.x, 0.0, -sunDir.z, 0.0);
   let sunProjDir = normalize(vec2<f32>(sunClipDelta.x, -sunClipDelta.y) + vec2<f32>(1e-5, 1e-5));
-  let dispMag = UV_REF * (0.04 + pow(liftedHeightDm, 1.10) * 0.66);
+  let dispMag = UV_REF * (0.015 + pow(liftedHeightDm, 1.10) * 0.15);
   let dispVec = sunProjDir * dispMag;
 
   let isShardCausticCenter = smoothstep(0.001, 0.025, c0Full.a);
-  let causticRadiusUV = UV_REF * (mix(0.46, 0.14, isShardCausticCenter) + pow(liftedHeightDm, 1.15) * 1.56);
+  let causticRadiusUV = UV_REF * (mix(0.32, 0.12, isShardCausticCenter) + pow(liftedHeightDm, 1.15) * 1.48);
   let centerR = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv + dispVec, vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).r;
   let centerG = c0.g;
   let centerB = textureSampleLevel(uCausticTex, uLinearSampler, clamp(uv - dispVec, vec2<f32>(0.002), vec2<f32>(0.998)), 0.0).b;
@@ -392,6 +395,141 @@ fn sampleContactHardeningCaustics(worldPos: vec3<f32>, sunDir: vec3<f32>) -> vec
   let dispersedFlux = (fluxAccum / fluxWeight) * (1.0 - contactHaloSuppress);
 
   return baseFiltered + dispersedFlux;
+}
+
+/**
+ * Raytraced Glossy Wood Reflection of Intact Glass Bricks (uBlocks) & Voronoi Shards (uShards):
+ * Grounds bricks and shattered crystal pieces onto the satin walnut table with true colored reflections.
+ */
+fn traceSingleTableGlassRay(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  roughness: f32,
+  blockCount: u32,
+  shardCount: u32,
+  shardStride: u32,
+  L: vec3<f32>,
+  sunColor: vec3<f32>,
+  skyTint: vec3<f32>,
+  atelierMix: f32
+) -> vec4<f32> {
+  if (rd.y <= 0.006) {
+    return vec4<f32>(0.0);
+  }
+  let aoB = uScene.tableAoBounds;
+  let tCheck = min(2.4, 2.6 / max(0.05, rd.y));
+  let endXZ = ro.xz + rd.xz * tCheck;
+  let rMin = min(ro.xz, endXZ);
+  let rMax = max(ro.xz, endXZ);
+  if (rMax.x < aoB.x - 0.80 || rMin.x > aoB.z + 0.80 || rMax.y < aoB.y - 0.80 || rMin.y > aoB.w + 0.80) {
+    return vec4<f32>(0.0);
+  }
+
+  var bestT: f32 = 2.6;
+  var bestChord: f32 = 0.18;
+  var bestSigma = vec3<f32>(1.0);
+  var bestNWorld = vec3<f32>(0.0, 1.0, 0.0);
+  var found: bool = false;
+
+  for (var i: u32 = 0u; i < blockCount; i = i + 1u) {
+    let pBlk = &uBlocks[i];
+    let bCenter = (*pBlk).localToWorld[3].xyz;
+    if (bCenter.y - 0.16 > ro.y + rd.y * (bestT + 0.40)) {
+      break;
+    }
+    let rel = bCenter - ro;
+    let tProj = dot(rel, rd);
+    if (tProj > -0.40 && tProj < bestT + 0.40) {
+      let perpSq = dot(rel, rel) - tProj * tProj;
+      if (perpSq < 0.165) {
+        let w0 = (*pBlk).worldToLocal[0].xyz;
+        let w1 = (*pBlk).worldToLocal[1].xyz;
+        let w2 = (*pBlk).worldToLocal[2].xyz;
+        let w3 = (*pBlk).worldToLocal[3].xyz;
+        let roL = w0 * ro.x + w1 * ro.y + w2 * ro.z + w3;
+        let rdL = w0 * rd.x + w1 * rd.y + w2 * rd.z;
+        let ch = intersectChamferedPrismInterval(roL, rdL);
+        if (ch.hit && ch.tEnter > 0.002 && ch.tEnter < bestT) {
+          bestT = ch.tEnter;
+          bestChord = clamp(ch.tExit - ch.tEnter, 0.04, 0.46);
+          bestSigma = (*pBlk).absorptionAndMotif.xyz + SODA_LIME_IRON_SIGMA;
+          bestNWorld = safeNormalize(((*pBlk).localToWorld * vec4<f32>(ch.enterNormalLocal, 0.0)).xyz, -rd);
+          found = true;
+        }
+      }
+    }
+  }
+
+  for (var s: u32 = 0u; s < shardCount; s = s + shardStride) {
+    let pSh = &uShards[s];
+    let sCenter = (*pSh).localToWorld[3].xyz;
+    if (sCenter.y < 1.35) {
+      let rel = sCenter - ro;
+      let tProj = dot(rel, rd);
+      if (tProj > -0.20 && tProj < bestT + 0.20) {
+        let perpSq = dot(rel, rel) - tProj * tProj;
+        if (perpSq < 0.038) {
+          let r0 = (*pSh).localToWorld[0].xyz;
+          let r1 = (*pSh).localToWorld[1].xyz;
+          let r2 = (*pSh).localToWorld[2].xyz;
+          let relO = ro - sCenter;
+          let roS = vec3<f32>(dot(r0, relO), dot(r1, relO), dot(r2, relO));
+          let rdS = vec3<f32>(dot(r0, rd), dot(r1, rd), dot(r2, rd));
+          let pCount = min(MAX_SHARD_PLANES, u32(round((*pSh).originAndPlaneCount.w)));
+          var tEn: f32 = 0.002;
+          var tEx: f32 = bestT;
+          var nEnL = vec3<f32>(0.0, 1.0, 0.0);
+          var ok: bool = pCount > 0u;
+          for (var k: u32 = 0u; k < pCount; k = k + 1u) {
+            let pl = (*pSh).planes[k];
+            let num = abs(pl.w) - dot(pl.xyz, roS);
+            let den = dot(pl.xyz, rdS);
+            if (abs(den) < 1e-6) {
+              if (num < 0.0) { ok = false; break; }
+            } else {
+              let t = num / den;
+              if (den > 0.0) {
+                tEx = min(tEx, t);
+              } else if (t > tEn) {
+                tEn = t;
+                nEnL = pl.xyz;
+              }
+              if (tEn > tEx) { ok = false; break; }
+            }
+          }
+          if (ok && tEn < bestT) {
+            bestT = tEn;
+            bestChord = clamp(tEx - tEn, 0.035, 0.30);
+            bestSigma = (*pSh).absorption + SODA_LIME_IRON_SIGMA;
+            bestNWorld = safeNormalize(((*pSh).localToWorld * vec4<f32>(nEnL, 0.0)).xyz, -rd);
+            found = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (!found) {
+    return vec4<f32>(0.0);
+  }
+
+  let hitPos = ro + rd * bestT;
+  let sunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, hitPos, bestNWorld, L, 0.020);
+  let spSig = evalSwatchSpectralSigma8(bestSigma);
+  var spTau: SpectralTau8;
+  spTau.lo = spSig.lo * (bestChord * 1.12);
+  spTau.hi = spSig.hi * (bestChord * 1.12);
+  let glassTrans = integrateSpectralTau8ToRGB(spTau);
+  let bgBehind = sampleStudioBackdrop(rd, L, sunColor, skyTint, atelierMix);
+  let cosHit = clamp(abs(dot(rd, bestNWorld)), 0.0, 1.0);
+  let fHit = dielectricFresnel(cosHit, 1.0, GLASS_IOR_G);
+  let envHit = sampleCathedralEnvironment(reflect(rd, bestNWorld), L, sunColor, skyTint, atelierMix);
+  let minG = min(glassTrans.r, min(glassTrans.g, glassTrans.b));
+  let pureChroma = max(vec3<f32>(0.0), glassTrans - vec3<f32>(minG * 0.80));
+  let sunlitJewel = pureChroma * sunColor * (0.12 + 0.28 * sunVis);
+  let hitRad = bgBehind * glassTrans * (1.0 - fHit) + sunlitJewel + envHit * fHit * 0.48;
+  let distFade = exp(-bestT * roughness * 2.0);
+  return vec4<f32>(hitRad, distFade);
 }
 
 @fragment
@@ -523,9 +661,40 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   let ggx = evalGGXSpecular(N, V, L, mat.roughness);
   let specDirect = fresnel * ggx * sunColor * causticRGB * windowGobo * mix(0.45, 1.35, mat.metallic);
 
-  // Soft glossy environment reflection attenuated by surface roughness & contact AO
-  let envRoughScale = (1.0 - mat.roughness * 0.72) * mix(0.32, 0.85, mat.metallic);
-  let envRefl = sampleCathedralEnvironment(reflect(-V, N), L, sunColor, skyTint, atelierMix) * fresnel * envRoughScale * aoBounce * aoCrevice;
+  // Glossy wood reflection: combines ambient studio sky (occluded by nearby bricks) + raytraced colored brick/shard reflections!
+  let reflBaseDir = reflect(-V, N);
+  let envRoughScale = (1.0 - mat.roughness * 0.65) * mix(0.46, 0.88, mat.metallic);
+  let skyEnvRefl = sampleCathedralEnvironment(reflBaseDir, L, sunColor, skyTint, atelierMix) * aoBounce * aoCrevice;
+  var glassRefl = vec4<f32>(0.0);
+  if (!isUnderStructure && input.worldPos.y > -0.008) {
+    let roRefl = vec3<f32>(input.worldPos.x, 0.002, input.worldPos.z);
+    let rA = traceSingleTableGlassRay(
+      roRefl,
+      safeNormalize(reflBaseDir + vec3<f32>(0.0, mat.roughness * 0.05, 0.0), vec3<f32>(0.0, 1.0, 0.0)),
+      mat.roughness,
+      blockCount,
+      shardCount,
+      shardStride,
+      L,
+      sunColor,
+      skyTint,
+      atelierMix
+    );
+    let rB = traceSingleTableGlassRay(
+      roRefl,
+      safeNormalize(reflBaseDir + vec3<f32>(0.0, mat.roughness * 0.22, 0.0), vec3<f32>(0.0, 1.0, 0.0)),
+      mat.roughness,
+      blockCount,
+      shardCount,
+      shardStride,
+      L,
+      sunColor,
+      skyTint,
+      atelierMix
+    );
+    glassRefl = rA * 0.58 + rB * 0.42;
+  }
+  let envRefl = mix(skyEnvRefl, glassRefl.rgb, clamp(glassRefl.a * mix(0.25, 1.0, aoCrevice), 0.0, 0.92)) * fresnel * envRoughScale;
 
   // Concentrated HDR jewel caustics illuminate the wood fibers while colored refractive shadows ground the silhouettes!
   let directIrradiance = sunColor * nDotL * causticRGB * windowGobo;
@@ -541,7 +710,7 @@ fn fs_table(input: TableOut) -> @location(0) vec4<f32> {
   let woodSssTint = mix(vec3<f32>(1.18, 0.86, 0.56), vec3<f32>(1.12, 0.92, 0.68), atelierMix);
   let woodCausticScatter = diffuseAlbedo * woodSssTint * (focalExcess * 0.20 + chromaExcess * 0.065) * sunColor * nDotL * windowGobo;
 
-  let edgeVignette = 1.0 - smoothstep(3.45, 4.30, length(input.worldPos.xz)) * mix(0.32, 0.14, atelierMix);
+  let edgeVignette = 1.0 - smoothstep(3.65, 4.30, length(input.worldPos.xz)) * mix(0.10, 0.05, atelierMix);
   let finalColor = (diffuseAlbedo * (directIrradiance + ambientIrradiance) + woodCausticScatter + specDirect + envRefl) * edgeVignette
                  + vec3<f32>(_keepShards + _keepDepth + _keepOpt);
 

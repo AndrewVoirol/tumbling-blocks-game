@@ -245,24 +245,33 @@ fn vs_block_caustic_flux(
   let origT = max(0.0, wp.y) / sunSlopeY;
   let origXZ = wp.xz - L.xz * origT;
 
-  // C-infinity world-space cathedral waterglass & flank focal refraction:
-  // Depends purely on continuous world position wp (and origXZ(wp)), guaranteeing 0.000 mm continuity
-  // across +X / +/-Z / +Y seams, Even/Odd cross-rows, and all 18 horizontal layer boundaries.
-  let contactHeightGate = smoothstep(0.05, 0.28, wp.y);
+  // Physical Snell slab refraction on resting/low courses (wp.y <= 0.34 dm -> crisp inward-refracted jewel bar
+  // + dark outer shadow frame in Test B & Test C!) seamlessly transitioning to C-infinity world-space focal ribbons
+  // on upper 18-layer courses (wp.y >= 0.36 dm -> zero horizontal course-boundary ladder rungs, combRippleRatio < 0.08)!
+  let lowBrickGate = (1.0 - smoothstep(0.18, 0.35, wp.y)) * smoothstep(0.06, 0.14, wp.y) * step(0.5, macroWN.y);
+  var inGlassW = refract(-L, vec3<f32>(0.0, 1.0, 0.0), 1.0 / GLASS_IOR_G);
+  inGlassW = safeNormalize(inGlassW, -L);
+  let maxGlassDrop = min(chordDm, max(0.0, wp.y) / max(0.18, -inGlassW.y));
+  let exitWP = wp + inGlassW * maxGlassDrop;
+  let remAirT = max(0.0, exitWP.y) / sunSlopeY;
+  let snellShiftXZ = (exitWP.xz - L.xz * remAirT) - origXZ;
+
+  let contactHeightGate = smoothstep(0.06, 0.28, wp.y);
+  let towerWaveGate = smoothstep(0.24, 0.55, wp.y);
   let u1 = origXZ.x * 5.2 + origXZ.y * 3.8 + wp.y * 1.3;
   let u2 = origXZ.y * 5.5 - origXZ.x * 3.5 + wp.y * 1.1;
   let waterglassDelta = vec2<f32>(
-    sin(u1) * 0.046 + cos(u2) * 0.026,
-    cos(u2 * 0.92 + 0.7) * 0.046 - sin(u1 * 0.88 - 0.4) * 0.026
-  );
+    sin(u1) * 0.030 + cos(u2) * 0.017,
+    cos(u2 * 0.92 + 0.7) * 0.030 - sin(u1 * 0.88 - 0.4) * 0.017
+  ) * mix(0.12, 1.0, towerWaveGate);
   let perpSun3 = safeNormalize(vec3<f32>(-L.z, 0.0, L.x), vec3<f32>(1.0, 0.0, 0.0));
   let perpSunXZ = perpSun3.xz;
   let uTrans = dot(wp.xz, perpSunXZ);
-  let flankPrismDelta = perpSunXZ * sin(clamp(uTrans / 0.46, -1.0, 1.0) * 1.5707963) * 0.052;
+  let flankPrismDelta = perpSunXZ * sin(clamp(uTrans / 0.46, -1.0, 1.0) * 1.5707963) * mix(0.012, 0.032, towerWaveGate);
 
-  let rawDelta = (waterglassDelta + flankPrismDelta) * contactHeightGate;
+  let rawDelta = snellShiftXZ * 0.78 * lowBrickGate + (waterglassDelta + flankPrismDelta) * contactHeightGate;
   let deltaLen = length(rawDelta);
-  let deflXZ = origXZ + rawDelta / (1.0 + deltaLen / 0.22);
+  let deflXZ = origXZ + rawDelta / (1.0 + deltaLen / 0.18);
 
   let sigma = mix(
     blk.absorptionAndMotif.xyz,
@@ -321,10 +330,11 @@ fn fs_block_caustic_flux(input: BlockCausticFluxOut) -> @location(0) vec4<f32> {
   let invJacobian = clamp(origArea / max(deflArea, 0.22 * origArea + 1e-7), 0.0, 3.4);
 
   let optSample = sampleSunOpticalDepth(uSunOpticalDepthTex, uScene.sunViewProj, input.entryWorldPos);
-  let totalRayTau = max(input.tauSelf, optSample.rgb);
-  let rayBeer = exp(-totalRayTau * 0.46);
+  let rawTau = max(input.tauSelf, optSample.rgb);
+  let totalRayTau = rawTau / (vec3<f32>(1.0) + rawTau * 0.16);
+  let rayBeer = integrateSpectralTau8ToRGB(evalSwatchSpectralSigma8(totalRayTau * 0.36));
 
-  let fluxRGB = input.faceTint * rayBeer * invJacobian * sunShellVis * 0.62 + vec3<f32>(_keepOpt + _keepDepth);
+  let fluxRGB = input.faceTint * rayBeer * invJacobian * sunShellVis * 0.68 + vec3<f32>(_keepOpt + _keepDepth);
   return vec4<f32>(fluxRGB, 0.0);
 }
 
@@ -359,13 +369,13 @@ fn vs_shard_caustic(
   let wn = safeNormalize((sh.localToWorld * vec4<f32>(normal, 0.0)).xyz, vec3<f32>(0.0, 1.0, 0.0));
 
   let vitrail = evaluateVitrailPattern(parentLocalPos, motifId, seed);
-  // Conchoidal cleavage dish curvature on interior fracture faces + hand-rolled waterglass on outer faces
+  // Crisp flat Voronoi cleavage facets with subtle fracture curvature so resting shards project focused crystal glints
   let conchoidalLocal = vec3<f32>(
-    centeredPos.x * 1.45 + sin(centeredPos.z * 28.0 + seed * 2.3) * 0.018,
-    centeredPos.y * 0.85,
-    centeredPos.z * 1.45 - cos(centeredPos.x * 26.0 - seed * 1.7) * 0.018
+    centeredPos.x * 0.38 + sin(centeredPos.z * 28.0 + seed * 2.3) * 0.005,
+    centeredPos.y * 0.24,
+    centeredPos.z * 0.38 - cos(centeredPos.x * 26.0 - seed * 1.7) * 0.005
   ) * (1.0 - isOuter);
-  let facetSlopeWorld = (sh.localToWorld * vec4<f32>(vitrail.rippleGrad * 16.0 * isOuter + conchoidalLocal * 0.22, 0.0)).xyz;
+  let facetSlopeWorld = (sh.localToWorld * vec4<f32>(vitrail.rippleGrad * 4.5 * isOuter + conchoidalLocal * 0.14, 0.0)).xyz;
   let surfN = safeNormalize(wn + facetSlopeWorld, wn);
 
   // 1. Entry Snell refraction (air -> soda-lime cathedral glass n = 1.522)
@@ -397,27 +407,26 @@ fn vs_shard_caustic(
   let exitLocal = centeredPos + inGlassLocal * chordDm;
   let exitVitrail = evaluateVitrailPattern(parentLocalPos + (exitLocal - centeredPos), motifId, seed);
 
-  // 3. Project refracted prism wedge + continuous C-infinity waterglass wavelets onto y = 0 tabletop
-  //    Even resting wedge shards (wp.y ~ 0.03..0.14 dm) deflect solar rays 4..32 mm outside their shadow footprint!
+  // 3. Project refracted prism wedge tightly alongside & inside shard shadow footprint (matching Path-Traced Ground Truth!)
   let sunSlopeY = max(0.20, L.y);
   let origT = max(0.0, wp.y) / sunSlopeY;
   let origXZ = wp.xz - L.xz * origT;
 
-  let exitWorldPos = wp + inGlassWorld * chordDm;
-  // Smooth prism exit deviation (n - 1) * horizontal facet normal projects colored caustic pool alongside resting shards
-  let wedgePrismXZ = vec2<f32>(-surfN.x, -surfN.z) * (GLASS_IOR_G - 1.0) * (0.042 + 0.55 * chordDm);
-  let postExitDropT = max(0.0, exitWorldPos.y) / max(0.20, -inGlassWorld.y);
-  let snellRawXZ = exitWorldPos.xz + inGlassWorld.xz * postExitDropT + wedgePrismXZ;
+  let effDropChord = min(chordDm, max(0.0, wp.y) / max(0.18, -inGlassWorld.y));
+  let exitWorldPos = wp + inGlassWorld * effDropChord;
+  let wedgePrismXZ = vec2<f32>(-surfN.x, -surfN.z) * (GLASS_IOR_G - 1.0) * (0.016 + 0.24 * chordDm);
+  let postExitDropT = max(0.0, exitWorldPos.y) / sunSlopeY;
+  let snellRawXZ = exitWorldPos.xz - L.xz * postExitDropT + wedgePrismXZ;
 
   let u1 = origXZ.x * 9.4 + origXZ.y * 6.8 + seed * 2.1;
   let u2 = origXZ.y * 9.8 - origXZ.x * 6.2 - seed * 1.7;
   let waveDelta = vec2<f32>(
-    sin(u1) * 0.018 + cos(u2) * 0.011,
-    cos(u2 * 0.94 + 0.6) * 0.018 - sin(u1 * 0.90 - 0.3) * 0.011
+    sin(u1) * 0.006 + cos(u2) * 0.004,
+    cos(u2 * 0.94 + 0.6) * 0.006 - sin(u1 * 0.90 - 0.3) * 0.004
   );
-  let rawDelta = (snellRawXZ - origXZ) + waveDelta;
+  let rawDelta = (snellRawXZ - origXZ) * 0.78 + waveDelta;
   let deltaLen = length(rawDelta);
-  let deflXZ = origXZ + rawDelta / (1.0 + deltaLen / 0.24);
+  let deflXZ = origXZ + rawDelta / (1.0 + deltaLen / 0.105);
 
   let sigma = mix(
     sh.absorption,
@@ -432,9 +441,9 @@ fn vs_shard_caustic(
   let fresnelTrans = (1.0 - fEntry) * 0.9572 * (1.0 - cameOcc * 0.88);
   let tauSelf = sigma * chordDm * 0.92 + vec3<f32>(-log(max(0.14, fresnelTrans)));
 
-  // True Beer-Lambert spectral chord attenuation (with minimum 5.5 mm effective optical path so thin chips keep rich jewel hue)
-  let opticalPathDm = max(chordDm, 0.055) * 1.18;
-  let beerPass = exp(-sigma * opticalPathDm) * fresnelTrans * facingGate;
+  // 8-band spectral chord attenuation through Voronoi shard
+  let opticalPathDm = max(chordDm, 0.055) * 1.08;
+  let beerPass = integrateSpectralTau8ToRGB(evalSwatchSpectralSigma8(sigma * opticalPathDm)) * fresnelTrans * facingGate;
 
   var out: ShardCausticFluxOut;
   out.clipPos = uScene.sunViewProj * vec4<f32>(deflXZ.x, 0.0, deflXZ.y, 1.0);

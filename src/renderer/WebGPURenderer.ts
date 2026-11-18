@@ -1582,8 +1582,18 @@ export class WebGPURenderer {
     );
     this.compositeUniformData[0] = 1 / this.bloomW;
     this.compositeUniformData[1] = 1 / this.bloomH;
+    let presetExposure = 1.26;
+    if (this.polariscopeMode) {
+      presetExposure = 1.32;
+    } else if (this.lightingPreset.id === 'daylight-atelier') {
+      presetExposure = 1.16;
+    } else if (this.lightingPreset.id === 'high-clerestory') {
+      presetExposure = 1.32;
+    } else if (this.lightingPreset.id === 'golden-vespers') {
+      presetExposure = 1.30;
+    }
     this.compositeUniformData[2] = 0.085; // Tight physical optical glare
-    this.compositeUniformData[3] = 1.18;  // Calibrated exposure for low-key dark walnut stage
+    this.compositeUniformData[3] = presetExposure; // Mode-calibrated exposure so every lighting preset reads clearly through stacked glass
     this.compositeUniformData[4] = focusDistDm;
     this.compositeUniformData[5] = Math.max(1.65, towerTopDm * 0.58); // +/- 16.5 cm tack-sharp zone (expands automatically on tall >18-row stacks)
     this.compositeUniformData[6] = 4.2;   // Subtle natural f/2.8 bokeh blur on far table rim & backdrop

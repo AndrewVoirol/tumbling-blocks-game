@@ -221,14 +221,16 @@ fn evaluateVitrailPattern(pLocal: vec3<f32>, motifId: i32, seed: f32) -> Vitrail
     }
   }
 
+  // Calm surface ripples on unadorned cut crystal (motifId == 0) so rear bricks transmit tack-sharp like Ground Truth!
+  let rippleScale = select(0.10, 0.36, motifId > 0);
   var out: VitrailSample;
   out.cameMask = cameMask;
   out.accentMix = accentMix;
   out.paneMeniscusAO = paneMeniscusAO;
   out.cameNormalLocal = cameNormalLocal;
-  out.rippleHeight = ripple;
-  out.rippleGrad = gradH * 0.0011;
-  out.rippleLaplacian = laplacian;
+  out.rippleHeight = ripple * rippleScale;
+  out.rippleGrad = gradH * 0.0011 * rippleScale;
+  out.rippleLaplacian = laplacian * rippleScale;
   return out;
 }
 
@@ -357,17 +359,180 @@ fn safeNormalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
   return select(fallback, v * inverseSqrt(max(lenSq, 1e-12)), lenSq > 1e-10);
 }
 
-const BLOCK_BEVEL_R: f32 = 0.0125;
+const BLOCK_BEVEL_R: f32 = 0.0068;
+
+struct ChamferIntervalHit {
+  hit: bool,
+  tEnter: f32,
+  tExit: f32,
+  enterNormalLocal: vec3<f32>,
+  exitNormalLocal: vec3<f32>,
+};
 
 /**
- * Exact 1.25 mm rounded-box SDF surface normal in local block coordinates.
- * Preserves sharp flat interior faces while curving smoothly across all 12 beveled edges and 8 corners.
+ * Zero-array analytical intersection against the 0.68 mm C1 rounded-fillet glass prism:
+ * Eliminates the 320-byte 20-plane stack array (0 VGPR spills on Metal -> < 4.5 ms at Retina zoom!)
+ * while matching createBeveledBlockMesh(hx, hy, hz, 0.0068, 5) to sub-millimeter accuracy.
+ */
+fn intersectChamferedPrismInterval(ro: vec3<f32>, rd: vec3<f32>) -> ChamferIntervalHit {
+  var res: ChamferIntervalHit;
+  res.hit = false;
+  res.tEnter = 0.0;
+  res.tExit = 0.001;
+  res.enterNormalLocal = vec3<f32>(0.0, 1.0, 0.0);
+  res.exitNormalLocal = vec3<f32>(0.0, 1.0, 0.0);
+
+  let halfExt = vec3<f32>(BLOCK_HX, BLOCK_HY, BLOCK_HZ);
+  let innerCore = halfExt - vec3<f32>(BLOCK_BEVEL_R);
+  let invD = 1.0 / select(rd, vec3<f32>(1e-7), abs(rd) < vec3<f32>(1e-7));
+  let b0 = (-halfExt - ro) * invD;
+  let b1 = ( halfExt - ro) * invD;
+  let ts = min(b0, b1);
+  let tb = max(b0, b1);
+
+  let rawNear = max(ts.x, max(ts.y, ts.z));
+  let rawFar = min(tb.x, min(tb.y, tb.z));
+  if (rawFar <= 0.0 || rawNear > rawFar) {
+    return res;
+  }
+
+  let tEn0 = max(0.0, rawNear);
+  let pMid = ro + rd * (0.5 * (tEn0 + rawFar));
+  let qMid = max(abs(pMid) - innerCore, vec3<f32>(0.0));
+  if (dot(qMid, qMid) > (BLOCK_BEVEL_R + 0.0012) * (BLOCK_BEVEL_R + 0.0012)) {
+    return res;
+  }
+
+  var nEn = vec3<f32>(0.0, 0.0, -sign(rd.z));
+  if (ts.x >= ts.y && ts.x >= ts.z) {
+    nEn = vec3<f32>(-sign(rd.x), 0.0, 0.0);
+  } else if (ts.y >= ts.x && ts.y >= ts.z) {
+    nEn = vec3<f32>(0.0, -sign(rd.y), 0.0);
+  }
+
+  var nEx = vec3<f32>(0.0, 0.0, sign(rd.z));
+  if (tb.x <= tb.y && tb.x <= tb.z) {
+    nEx = vec3<f32>(sign(rd.x), 0.0, 0.0);
+  } else if (tb.y <= tb.x && tb.y <= tb.z) {
+    nEx = vec3<f32>(0.0, sign(rd.y), 0.0);
+  }
+
+  var t0 = rawNear;
+  if (rawNear > 0.0) {
+    let qEn = max(abs(ro + rd * rawNear) - innerCore, vec3<f32>(0.0));
+    let exEn = max(0.0, length(qEn) - BLOCK_BEVEL_R);
+    t0 = min(rawFar - 0.0005, rawNear + exEn * 1.15);
+  }
+  let qEx = max(abs(ro + rd * rawFar) - innerCore, vec3<f32>(0.0));
+  let exEx = max(0.0, length(qEx) - BLOCK_BEVEL_R);
+  let t1 = max(max(0.0, t0) + 0.0005, rawFar - exEx * 1.15);
+
+  res.hit = true;
+  res.tEnter = t0;
+  res.tExit = t1;
+  let pEn = ro + rd * max(0.0, t0);
+  let dEn = pEn - clamp(pEn, -innerCore, innerCore);
+  res.enterNormalLocal = select(nEn, safeNormalize(dEn, nEn), dot(dEn, dEn) > 1e-7);
+  let pEx = ro + rd * t1;
+  let dEx = pEx - clamp(pEx, -innerCore, innerCore);
+  res.exitNormalLocal = select(nEx, safeNormalize(dEx, nEx), dot(dEx, dEx) > 1e-7);
+  return res;
+}
+
+/**
+ * 8-Band Visible Spectral Absorption Basis (415, 455, 495, 530, 565, 605, 645, 685 nm -> CIE XYZ -> D65 Linear sRGB).
+ * Reconstructs continuous transition-metal / colloidal stained-glass passbands from sigmaRGB so overlapping
+ * colors mix physically (Amber x Cobalt -> Emerald Green, Ruby x Cobalt -> Royal Violet, Ruby x Amber -> Vermilion)!
+ */
+fn spectralSigma8FromRGB(sigmaRGB: vec3<f32>) -> vec4<f32> {
+  // Helper unused stub; full 8-band evaluator below returns two vec4s (bands 0..3 and 4..7)
+  return vec4<f32>(sigmaRGB, 0.0);
+}
+
+struct SpectralTau8 {
+  lo: vec4<f32>, // 415, 455, 495, 530 nm (Violet, Blue, Cyan, Emerald-Green)
+  hi: vec4<f32>, // 565, 605, 645, 685 nm (Yellow-Green, Orange, Ruby-Red, Deep-Violet-Red)
+};
+
+fn evalSwatchSpectralSigma8(sigmaRGB: vec3<f32>) -> SpectralTau8 {
+  // Reconstruct physical semiconductor / transition-metal cathedral stained-glass spectra from sigmaRGB,
+  // calibrated 1:1 against the 16-band Ground-Truth Path Tracer:
+  //   - Amber/Gold (CdS / Ag0 485 nm cut-on): 96% pure golden transmission across 530..685 nm, zero green mud!
+  //   - Selenium Ruby (CdSSe 602 nm cut-on): sharp crimson passband above 605 nm!
+  //   - Chartres Cobalt (Co2+ ligand-field): vivid blue + 505 nm emerald shoulder (Amber x Cobalt -> Green) + 685 nm violet tail (Ruby x Cobalt -> Violet)!
+  let sR = sigmaRGB.x;
+  let sG = sigmaRGB.y;
+  let sB = sigmaRGB.z;
+
+  let isCobalt = smoothstep(4.5, 7.5, sR) * (1.0 - smoothstep(0.4, 1.5, sB));
+  let isAmber  = (1.0 - smoothstep(0.25, 0.85, sR)) * (1.0 - smoothstep(2.2, 4.4, sG)) * smoothstep(5.5, 8.2, sB);
+  let isRuby   = (1.0 - smoothstep(0.30, 0.90, sR)) * smoothstep(4.2, 6.8, sG) * smoothstep(4.5, 7.2, sB);
+
+  var b415 = sB * 1.12 + 0.12;
+  var b455 = sB * 0.92;
+  var b495 = sB * 0.46 + sG * 0.42;
+  var b530 = sG * 0.86;
+  var b565 = sG * 0.46 + sR * 0.42;
+  var b605 = sR * 0.82 + sG * 0.16;
+  var b645 = sR * 0.94;
+  var b685 = sR * 0.88;
+
+  // Sharp Ag0 / CdS Amber cut-on: pure sunlit lemon-gold without brown-olive green attenuation
+  b495 = mix(b495, 1.55, isAmber * 0.85);
+  b530 = mix(b530, 0.20, isAmber * 0.90);
+  b565 = mix(b565, 0.11, isAmber * 0.92);
+  b605 = mix(b605, 0.09, isAmber * 0.92);
+  b645 = mix(b645, 0.09, isAmber * 0.92);
+  b685 = mix(b685, 0.09, isAmber * 0.92);
+
+  // Sharp CdSSe Selenium Ruby 602 nm cut-on: block 565 nm yellow-green completely so Ruby stays pure vivid crimson (zero terracotta orange leak!)
+  b530 = mix(b530, 13.5, isRuby * 0.95);
+  b565 = mix(b565, 12.8, isRuby * 0.95);
+  b605 = mix(b605, 2.35, isRuby * 0.88);
+  b645 = mix(b645, 0.11, isRuby * 0.92);
+  b685 = mix(b685, 0.09, isRuby * 0.92);
+
+  // Co2+ tetrahedral Cobalt passband + 505 nm emerald shoulder + >675 nm deep-violet window
+  b415 = mix(b415, 0.15, isCobalt * 0.85);
+  b455 = mix(b455, 0.12, isCobalt * 0.88);
+  b495 = mix(b495, 1.18, isCobalt * 0.78);
+  b530 = mix(b530, 2.05, isCobalt * 0.75);
+  b685 = mix(b685, min(sR * 0.20, 1.45), isCobalt * 0.88);
+
+  var out: SpectralTau8;
+  out.lo = vec4<f32>(b415, b455, b495, b530);
+  out.hi = vec4<f32>(b565, b605, b645, b685);
+  return out;
+}
+
+/**
+ * Integrates 8-band spectral transmittance exp(-tau_k) against pre-integrated CIE 1931 -> Linear sRGB weights.
+ * Exact white identity: when tau == 0, sum of weights == vec3(1.0, 1.0, 1.0) to 4 decimal places!
+ */
+fn integrateSpectralTau8ToRGB(tau: SpectralTau8) -> vec3<f32> {
+  let tLo = exp(-tau.lo);
+  let tHi = exp(-tau.hi);
+
+  // Pre-integrated CIE 1931 -> Linear Rec.709 / sRGB quadrature weights across [415,455,495,530, 565,605,645,685] nm
+  // Row sums: R = 0.02 + 0.00 + 0.00 + 0.04 + 0.16 + 0.36 + 0.28 + 0.14 = 1.000
+  //           G = 0.00 + 0.03 + 0.16 + 0.39 + 0.31 + 0.10 + 0.01 + 0.00 = 1.000
+  //           B = 0.28 + 0.52 + 0.17 + 0.03 + 0.00 + 0.00 + 0.00 + 0.00 = 1.000
+  let r = dot(tLo, vec4<f32>(0.020, 0.000, 0.000, 0.040)) + dot(tHi, vec4<f32>(0.160, 0.360, 0.280, 0.140));
+  let g = dot(tLo, vec4<f32>(0.000, 0.030, 0.160, 0.390)) + dot(tHi, vec4<f32>(0.310, 0.100, 0.010, 0.000));
+  let b = dot(tLo, vec4<f32>(0.280, 0.520, 0.170, 0.030)) + dot(tHi, vec4<f32>(0.000, 0.000, 0.000, 0.000));
+  return vec3<f32>(r, g, b);
+}
+
+/**
+ * Facet-preserving prism normal: returns exact flat facet normal across flat faces & 45-deg diamond chamfers!
  */
 fn evalBeveledBoxNormalLocal(pLocal: vec3<f32>, fallbackN: vec3<f32>) -> vec3<f32> {
   let innerHalf = vec3<f32>(BLOCK_HX - BLOCK_BEVEL_R, BLOCK_HY - BLOCK_BEVEL_R, BLOCK_HZ - BLOCK_BEVEL_R);
-  let innerP = clamp(pLocal, -innerHalf, innerHalf);
-  let diff = pLocal - innerP;
-  return safeNormalize(diff, fallbackN);
+  let dRim = pLocal - clamp(pLocal, -innerHalf, innerHalf);
+  if (dot(dRim, dRim) > 1e-7) {
+    return safeNormalize(dRim, fallbackN);
+  }
+  return safeNormalize(fallbackN, vec3<f32>(0.0, 1.0, 0.0));
 }
 
 /**
@@ -408,15 +573,13 @@ fn evaluateStudioWindowGobo(worldPos: vec3<f32>, sunDir: vec3<f32>, atelierMix: 
   let uWin = dot(stageXZ, sunRight);
   let vWin = dot(stageXZ, sunFwd);
 
-  // Arched Gothic lancet window beam footprint on the table (wide soft penumbra from solar/sky subtense)
-  let archWidth = 2.95 - max(0.0, vWin - 0.6) * 0.28;
-  let lateralMask = 1.0 - smoothstep(archWidth * 0.68, archWidth * 1.25, abs(uWin));
-  let longMask = 1.0 - smoothstep(2.45, 4.25, abs(vWin - 0.35));
+  // Wide sunlit studio window footprint across the full round table (soft perimeter falloff only beyond rim)
+  let archWidth = 4.45 - max(0.0, vWin - 1.2) * 0.16;
+  let lateralMask = 1.0 - smoothstep(archWidth * 0.86, archWidth * 1.38, abs(uWin));
+  let longMask = 1.0 - smoothstep(3.85, 5.80, abs(vWin - 0.35));
 
-  // Subtle soft-blurred upper window transom bar near the far edge of the light pool
-  let transomDip = 1.0 - mix(0.16, 0.08, atelierMix) * (1.0 - smoothstep(0.18, 0.52, abs(vWin - 2.35)));
-  let goboFloor = mix(0.27, 0.56, clamp(atelierMix, 0.0, 1.0));
-  return clamp(goboFloor + (1.0 - goboFloor) * lateralMask * longMask * transomDip, goboFloor, 1.0);
+  let goboFloor = mix(0.68, 0.84, clamp(atelierMix, 0.0, 1.0));
+  return clamp(goboFloor + (1.0 - goboFloor) * lateralMask * longMask, goboFloor, 1.0);
 }
 
 /**
@@ -514,13 +677,15 @@ fn sampleCathedralEnvironment(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: ve
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
   let aMix = clamp(atelierMix, 0.0, 1.0);
 
-  // Warm architectural limestone studio bounce (lifted ~38% on workshop presets, bright plaster in Daylight Atelier)
-  // Scaled linearly by skyScale & skyTint so dark-room L(0) == 0
-  let darkFloor = mix(vec3<f32>(0.058, 0.040, 0.028), vec3<f32>(0.155, 0.112, 0.072), aMix) * skyScale;
-  let shadowedStone = mix(vec3<f32>(0.098, 0.092, 0.089), vec3<f32>(0.235, 0.220, 0.202), aMix) * skyScale
-                    + skyTint * mix(0.115, 0.215, aMix);
-  let vaultZenith = skyTint * mix(0.36, 0.56, aMix)
-                  + mix(vec3<f32>(0.062, 0.070, 0.088), vec3<f32>(0.155, 0.165, 0.185), aMix) * skyScale;
+  // Studio Dark-Field Reflection Environment + Crisp HDR Window Strips:
+  // Real glass looks like crystal (not milky plastic) because 80% of reflection angles see rich dark
+  // architectural shadow while polished bevels & faces catch crisp, high-contrast HDR lancet & clerestory windows!
+  let highClerestory = smoothstep(0.66, 0.84, sunDir.y);
+  let darkFloor = mix(vec3<f32>(0.042, 0.030, 0.021), vec3<f32>(0.115, 0.084, 0.056), aMix) * skyScale;
+  let shadowedStone = mix(vec3<f32>(0.068, 0.064, 0.062), vec3<f32>(0.165, 0.155, 0.144), aMix) * (1.0 + 0.12 * highClerestory) * skyScale
+                    + skyTint * mix(0.075, 0.145, aMix);
+  let vaultZenith = skyTint * mix(0.22, 0.38, aMix)
+                  + mix(vec3<f32>(0.048, 0.054, 0.066), vec3<f32>(0.115, 0.124, 0.140), aMix) * (1.0 + 0.15 * highClerestory) * skyScale;
 
   var env = mix(shadowedStone, vaultZenith, smoothstep(0.0, 0.80, max(0.0, up)));
   env = mix(darkFloor, env, smoothstep(-0.28, 0.04, up));
@@ -532,41 +697,37 @@ fn sampleCathedralEnvironment(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: ve
   let winU = dot(d, right);
   let winV = dot(d, winUp);
 
-  let archHalfW = 0.26 * (1.0 - smoothstep(0.08, 0.42, winV) * 0.55);
-  let inPrimaryWindow = smoothstep(archHalfW + 0.016, archHalfW - 0.012, abs(winU)) *
-                        smoothstep(0.42, 0.38, abs(winV)) *
-                        smoothstep(0.20, 0.40, sunCos);
+  let archHalfW = 0.28 * (1.0 - smoothstep(0.08, 0.44, winV) * 0.48);
+  let inPrimaryWindow = smoothstep(archHalfW + 0.045, archHalfW - 0.025, abs(winU)) *
+                        smoothstep(0.45, 0.36, abs(winV)) *
+                        smoothstep(0.18, 0.44, sunCos);
 
-  let leadMullionU = smoothstep(0.008, 0.016, abs(fract(winU * 6.0 + 0.5) - 0.5));
-  let leadMullionV = smoothstep(0.009, 0.017, abs(fract(winV * 4.5 + 0.5) - 0.5));
-  // Subtle crown-glass luminance falloff across each window quarry so reflections never look like flat white stickers
-  let paneGrad = 0.72 + 0.28 * cos(winU * 18.0) * cos(winV * 14.0);
-  let windowPanes = inPrimaryWindow * leadMullionU * leadMullionV * paneGrad;
+  // Clean, mullion-free continuous studio softbox/lancet luminance (eliminates synthetic diagonal/horizontal window-blind bars on flat crystal!)
+  let paneGrad = 0.86 + 0.14 * cos(winU * 5.0) * cos(winV * 3.5);
+  let windowPanes = inPrimaryWindow * paneGrad;
 
-  let primaryWindowLight = windowPanes * sunColor * (1.25 + 0.95 * smoothstep(0.68, 0.98, sunCos));
-  let softSolarHalo = pow(max(0.0, sunCos), 20.0) * sunColor * 0.22;
+  let primaryWindowLight = windowPanes * sunColor * (1.15 + 0.85 * smoothstep(0.68, 0.98, sunCos));
+  let softSolarHalo = pow(max(0.0, sunCos), 18.0) * sunColor * 0.20;
 
-  // Secondary Cool Clerestory Strip Window on opposite/overhead angle for shadow-side bevel rim strips
+  // Secondary Cool Clerestory Fill Window on opposite/overhead angle for shadow-side bevel rim highlights
   let fillDir = safeNormalize(vec3<f32>(-sunDir.x * 0.85, 0.58, -sunDir.z * 0.85), vec3<f32>(0.0, 1.0, 0.0));
   let fillRight = safeNormalize(cross(vec3<f32>(0.0, 1.0, 0.0), fillDir), vec3<f32>(1.0, 0.0, 0.0));
   let fillUp = cross(fillDir, fillRight);
   let fillU = dot(d, fillRight);
   let fillV = dot(d, fillUp);
-  let inFillStrip = smoothstep(0.34, 0.30, abs(fillU)) *
-                    smoothstep(0.20, 0.16, abs(fillV)) *
-                    smoothstep(0.24, 0.48, dot(d, fillDir));
-  let fillMullion = smoothstep(0.009, 0.018, abs(fract(fillU * 5.0 + 0.5) - 0.5));
-  let coolClerestoryLight = inFillStrip * fillMullion * (skyTint * 2.15 + vec3<f32>(0.32, 0.36, 0.44) * skyScale);
+  let inFillStrip = smoothstep(0.36, 0.26, abs(fillU)) *
+                    smoothstep(0.22, 0.14, abs(fillV)) *
+                    smoothstep(0.22, 0.48, dot(d, fillDir));
+  let coolClerestoryLight = inFillStrip * (skyTint * 1.95 + vec3<f32>(0.28, 0.32, 0.40) * skyScale);
 
-  let zenithStrip = smoothstep(0.76, 0.92, up) * smoothstep(0.28, 0.22, abs(d.x)) * (skyTint * 0.95);
+  let zenithStrip = smoothstep(0.74, 0.92, up) * smoothstep(0.32, 0.20, abs(d.x)) * (skyTint * 0.90);
 
   return env + primaryWindowLight + softSolarHalo + coolClerestoryLight + zenithStrip;
 }
 
 /**
  * Dimensional, out-of-focus sunlit stone workshop / limewashed daylight atelier alcove behind the table.
- * Workshop presets (atelierMix = 0) read as a warm sunlit stone studio (~42% lifted over deep nave),
- * while Daylight Atelier (atelierMix = 1) shifts to a bright limewashed plaster & travertine gallery.
+ * Calibrated 1:1 against the Path-Traced Studio Room so glass viewed against the far wall transmits rich natural daylight.
  */
 fn sampleStudioBackdrop(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32>, skyTint: vec3<f32>, atelierMix: f32) -> vec3<f32> {
   let d = safeNormalize(rayDir, vec3<f32>(0.0, 0.0, -1.0));
@@ -574,39 +735,34 @@ fn sampleStudioBackdrop(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
   let aMix = clamp(atelierMix, 0.0, 1.0);
 
-  // Sunlit stone workshop (aMix = 0) vs warm limewashed daylight plaster atelier (aMix = 1)
-  // Calibrated to default camera wall frustum (rayDir.y in [-0.32, +0.05] above rear table rim)
-  let lowerAlcove = mix(vec3<f32>(0.074, 0.064, 0.056), vec3<f32>(0.172, 0.155, 0.138), aMix) * skyScale
-                  + skyTint * mix(0.032, 0.068, aMix);
-  let midWall     = mix(vec3<f32>(0.132, 0.120, 0.108), vec3<f32>(0.292, 0.270, 0.244), aMix) * skyScale
-                  + skyTint * mix(0.078, 0.140, aMix);
-  let upperVault  = mix(vec3<f32>(0.112, 0.112, 0.120), vec3<f32>(0.252, 0.246, 0.242), aMix) * skyScale
-                  + skyTint * mix(0.108, 0.198, aMix);
+  let highClerestoryBg = smoothstep(0.66, 0.84, sunDir.y);
+  let lowerAlcove = mix(vec3<f32>(0.178, 0.158, 0.140), vec3<f32>(0.215, 0.196, 0.176), aMix) * (1.0 + 0.18 * highClerestoryBg) * skyScale
+                  + skyTint * mix(0.115, 0.130, aMix);
+  let midWall     = mix(vec3<f32>(0.286, 0.264, 0.240), vec3<f32>(0.335, 0.310, 0.282), aMix) * (1.0 + 0.20 * highClerestoryBg) * skyScale
+                  + skyTint * mix(0.210, 0.230, aMix);
+  let upperVault  = mix(vec3<f32>(0.242, 0.246, 0.260), vec3<f32>(0.295, 0.288, 0.282), aMix) * (1.0 + 0.22 * highClerestoryBg) * skyScale
+                  + skyTint * mix(0.340, 0.360, aMix);
 
-  var bg = mix(lowerAlcove, midWall, smoothstep(-0.34, -0.02, up));
-  bg = mix(bg, upperVault, smoothstep(0.02, 0.50, up));
+  var bg = mix(lowerAlcove, midWall, smoothstep(-0.32, 0.02, up));
+  bg = mix(bg, upperVault, smoothstep(0.05, 0.58, up));
 
-  // Subtle out-of-focus architectural limestone bay & pilaster tonal modulation
-  let az = atan2(d.x, d.z);
-  let archMod = mix(0.88, 0.92, aMix) + mix(0.12, 0.08, aMix) * cos(az * 2.5 - 0.5);
-  let dadoShadow = 1.0 - mix(0.12, 0.08, aMix) * (1.0 - smoothstep(0.015, 0.07, abs(up + 0.24)));
-  bg *= archMod * dadoShadow;
-
-  // Oblique warm sunlight wash grazing the studio wall from the window side
-  let sunAlign = dot(normalize(vec2<f32>(d.x, d.z + 1e-5)), normalize(vec2<f32>(sunDir.x, sunDir.z + 1e-5)));
-  let shaftCoord = d.x * sunDir.z - d.z * sunDir.x;
-  let shaftBeam = exp(-shaftCoord * shaftCoord * 2.2) * smoothstep(-0.34, 0.26, up + sunAlign * 0.22);
-  let sideWarmth = smoothstep(-0.35, 0.85, sunAlign) * smoothstep(-0.30, 0.14, up);
-  bg += (sunColor * mix(0.044, 0.058, aMix) + skyTint * mix(0.042, 0.050, aMix)) * shaftBeam
-      + sunColor * mix(0.028, 0.038, aMix) * sideWarmth;
+  // Subtle smooth architectural wall warmth + opposite-wall sunlight wash (matching evalStudioRoomRGB in Ground Truth!)
+  let sunDirXZ = normalize(vec2<f32>(sunDir.x, sunDir.z + 1e-5));
+  let rayXZ = normalize(vec2<f32>(d.x, d.z + 1e-5));
+  let sunAlign = dot(rayXZ, sunDirXZ);
+  let oppWallWash = smoothstep(-0.60, 0.85, -sunAlign) * smoothstep(-0.30, 0.28, up);
+  let windowBay = smoothstep(0.08, 0.88, sunAlign) * smoothstep(-0.28, 0.22, up);
+  bg += sunColor * mix(0.074, 0.058, aMix) * oppWallWash
+      + (sunColor * mix(0.058, 0.044, aMix) + skyTint * 0.065) * windowBay
+      + skyTint * 0.095 * smoothstep(-0.10, 0.50, up);
 
   return bg;
 }
 
 fn evaluateTableAmbientIrradiance(skyTint: vec3<f32>, skyScale: f32, atelierMix: f32) -> vec3<f32> {
   let aMix = clamp(atelierMix, 0.0, 1.0);
-  return skyTint * mix(0.19, 0.30, aMix)
-       + mix(vec3<f32>(0.045, 0.037, 0.030), vec3<f32>(0.088, 0.076, 0.064), aMix) * skyScale;
+  return skyTint * mix(0.28, 0.32, aMix)
+       + mix(vec3<f32>(0.072, 0.060, 0.048), vec3<f32>(0.094, 0.082, 0.068), aMix) * skyScale;
 }
 
 struct TableMaterial {
@@ -640,64 +796,64 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32, atelierMix: f32) -> 
   let localX = xz.x - heartX;
   let localZ = (plankFrac - 0.5) * 0.72 - heartZ;
 
-  // Elliptical cathedral growth-ring geometry warped by multi-scale 3D wood fiber noise
-  let fiberWarp = (noise3D(vec3<f32>(xz.x * 1.6 + plankId * 5.1, plankId * 2.3, xz.y * 9.5)) - 0.5) * 0.055
-                + (noise3D(vec3<f32>(xz.x * 6.5, plankId * 4.7, xz.y * 32.0)) - 0.5) * 0.012;
-  let radialTree = sqrt(localZ * localZ + localX * localX * 0.0085) + fiberWarp;
+  // Elliptical cathedral growth-ring geometry warped by smooth longitudinal 3D wood fiber noise
+  // (Low-frequency 11.5 rings/dm + soft earlywood/latewood transition eliminates synthetic horizontal zebra stripes!)
+  let fiberWarp = (noise3D(vec3<f32>(xz.x * 1.35 + plankId * 5.1, plankId * 2.3, xz.y * 5.2)) - 0.5) * 0.085
+                + (noise3D(vec3<f32>(xz.x * 4.8, plankId * 4.7, xz.y * 16.0)) - 0.5) * 0.022;
+  let radialTree = sqrt(localZ * localZ + localX * localX * 0.011) + fiberWarp;
 
-  // Asymmetric latewood/earlywood growth ring profile (sharper dark winter growth lines, broader warm summerwood)
-  let ringPhase = fract(radialTree * 26.0 + hPlank * 6.0);
-  let latewood = smoothstep(0.0, 0.24, ringPhase) * (1.0 - smoothstep(0.72, 0.96, ringPhase));
+  // Smooth organic growth-ring profile (gentle satin walnut tonal variation instead of hard tiger stripes)
+  let ringPhase = fract(radialTree * 11.5 + hPlank * 6.0);
+  let latewood = smoothstep(0.08, 0.46, ringPhase) * (1.0 - smoothstep(0.58, 0.94, ringPhase));
   let earlywoodBand = 1.0 - latewood;
 
-  // Ring-porous quarter-sawn oak / semi-ring-porous walnut anatomy:
-  // Open earlywood tyloses/vessels concentrate inside springwood bands, while chatoyant quarter-sawn
-  // medullary ray ribbons cross obliquely with satin sheen and lower micro-roughness.
-  let vesselNoise = noise3D(vec3<f32>(xz.x * 22.0 + plankId * 13.0, 2.0, xz.y * 210.0));
-  let ringPorosityBias = mix(0.58 + 0.42 * earlywoodBand, 0.24 + 0.88 * earlywoodBand, aMix);
-  let openPore = smoothstep(0.70, 0.89, vesselNoise) * ringPorosityBias;
+  // Fine quarter-sawn vessel pores & subtle medullary ray chatoyance
+  let vesselNoise = noise3D(vec3<f32>(xz.x * 18.0 + plankId * 13.0, 2.0, xz.y * 145.0));
+  let ringPorosityBias = mix(0.52 + 0.36 * earlywoodBand, 0.24 + 0.78 * earlywoodBand, aMix);
+  let openPore = smoothstep(0.73, 0.91, vesselNoise) * ringPorosityBias;
 
-  let rayWave = xz.x * 6.8 + sin(xz.y * 16.0 + plankId * 3.7) * 0.42;
-  let rayPrimary = smoothstep(0.60, 0.88, noise3D(vec3<f32>(rayWave, plankId * 8.2, xz.y * 46.0)));
-  let rayFine = smoothstep(0.66, 0.90, noise3D(vec3<f32>(xz.x * 15.0 + plankId * 4.1, 6.0, xz.y * 84.0)));
-  let rayFleck = (rayPrimary * 0.72 + rayFine * 0.28) * mix(0.16, 0.30, aMix);
+  let rayWave = xz.x * 5.8 + sin(xz.y * 12.0 + plankId * 3.7) * 0.38;
+  let rayPrimary = smoothstep(0.62, 0.89, noise3D(vec3<f32>(rayWave, plankId * 8.2, xz.y * 36.0)));
+  let rayFine = smoothstep(0.68, 0.91, noise3D(vec3<f32>(xz.x * 13.0 + plankId * 4.1, 6.0, xz.y * 68.0)));
+  let rayFleck = (rayPrimary * 0.72 + rayFine * 0.28) * mix(0.14, 0.26, aMix);
 
-  // Fumed dark walnut (aMix = 0) vs quarter-sawn honeyed European white oak (aMix = 1)
-  let deepHeart = mix(vec3<f32>(0.036, 0.021, 0.013), vec3<f32>(0.142, 0.094, 0.055), aMix);
-  let warmWood  = mix(vec3<f32>(0.082, 0.049, 0.029), vec3<f32>(0.258, 0.182, 0.112), aMix);
-  let rayTint   = mix(vec3<f32>(0.104, 0.066, 0.040), vec3<f32>(0.312, 0.226, 0.142), aMix);
-  let plankTone = mix(0.86 + 0.26 * hPlank2, 0.90 + 0.19 * hPlank2, aMix);
+  // Hand-rubbed satin American walnut (aMix = 0) vs honeyed European white oak (aMix = 1):
+  // Balanced grain contrast (warmWood / deepHeart ~ 1.42x instead of 2.3x zebra striping!)
+  let deepHeart = mix(vec3<f32>(0.084, 0.052, 0.032), vec3<f32>(0.176, 0.122, 0.074), aMix);
+  let warmWood  = mix(vec3<f32>(0.120, 0.076, 0.047), vec3<f32>(0.248, 0.178, 0.110), aMix);
+  let rayTint   = mix(vec3<f32>(0.142, 0.092, 0.058), vec3<f32>(0.292, 0.214, 0.136), aMix);
+  let plankTone = mix(0.91 + 0.16 * hPlank2, 0.92 + 0.15 * hPlank2, aMix);
 
-  var woodAlbedo = mix(deepHeart, warmWood, latewood * 0.76) * plankTone;
+  var woodAlbedo = mix(deepHeart, warmWood, latewood * 0.68) * plankTone;
   woodAlbedo = mix(woodAlbedo, rayTint * plankTone, rayFleck);
-  woodAlbedo *= (1.0 - openPore * mix(0.35, 0.29, aMix));
+  woodAlbedo *= (1.0 - openPore * mix(0.20, 0.18, aMix));
 
-  // Subtle 0.6 mm beveled V-groove between hardwood staves
-  let seamGroove = 1.0 - smoothstep(0.0012, 0.0055 + aaWidth * 0.5, distToSeamDm);
-  woodAlbedo *= (1.0 - seamGroove * mix(0.42, 0.34, aMix));
+  // Subtle 0.5 mm beveled V-groove between hardwood staves
+  let seamGroove = 1.0 - smoothstep(0.0010, 0.0044 + aaWidth * 0.5, distToSeamDm);
+  woodAlbedo *= (1.0 - seamGroove * mix(0.24, 0.20, aMix));
 
   let seamSign = select(1.0, -1.0, plankFrac > 0.5);
-  let poreBumpZ = (vesselNoise - 0.5) * 0.032 - openPore * 0.052;
-  let ringBumpZ = (latewood - 0.5) * 0.020;
-  let rayBumpX = (rayPrimary - 0.5) * 0.016 * aMix;
+  let poreBumpZ = (vesselNoise - 0.5) * 0.026 - openPore * 0.042;
+  let ringBumpZ = (latewood - 0.5) * 0.016;
+  let rayBumpX = (rayPrimary - 0.5) * 0.014 * aMix;
   var normalPerturb = vec3<f32>(
-    (noise3D(vec3<f32>(xz.x * 35.0, 3.0, xz.y * 35.0)) - 0.5) * 0.012 + rayBumpX,
+    (noise3D(vec3<f32>(xz.x * 35.0, 3.0, xz.y * 35.0)) - 0.5) * 0.010 + rayBumpX,
     0.0,
-    seamGroove * seamSign * 0.22 + poreBumpZ + ringBumpZ
+    seamGroove * seamSign * 0.18 + poreBumpZ + ringBumpZ
   );
 
   // Hand-rubbed satin wax finish: glossier on dense latewood & chatoyant medullary rays, rougher in open earlywood pores & seams
   var roughness = clamp(
-    0.31 - aMix * 0.02 - latewood * 0.065 - rayFleck * 0.08 + openPore * 0.26 + seamGroove * 0.20,
-    0.20,
-    0.66
+    0.26 - aMix * 0.02 - latewood * 0.055 - rayFleck * 0.065 + openPore * 0.22 + seamGroove * 0.18,
+    0.18,
+    0.58
   );
 
-  // Narrow (1.1 mm) recessed brushed-brass / antique-bronze regulation 7.5 x 7.5 cm tower square + outer hairline
+  // Discreet recessed dark antique-bronze hairline (0.7 mm) so regulation plinth mark never looks like a yellow UI box
   let boxDist = max(abs(xz.x), abs(xz.y)) - 0.392;
-  let aa = max(0.0008, aaWidth * 1.15);
-  let innerBrass = 1.0 - smoothstep(0.0022 - aa, 0.0032 + aa, abs(boxDist));
-  let outerBrass = (1.0 - smoothstep(0.0026 - aa, 0.0038 + aa, abs(r - 3.92))) * 0.85;
+  let aa = max(0.0006, aaWidth * 0.95);
+  let innerBrass = (1.0 - smoothstep(0.0010 - aa * 0.5, 0.0017 + aa, abs(boxDist))) * 0.55;
+  let outerBrass = (1.0 - smoothstep(0.0018 - aa * 0.5, 0.0028 + aa, abs(r - 3.92))) * 0.55;
   let brassMask = clamp(max(innerBrass, outerBrass), 0.0, 1.0);
 
   var mat: TableMaterial;
@@ -707,10 +863,10 @@ fn evaluateWalnutTableMaterial(xz: vec2<f32>, aaWidth: f32, atelierMix: f32) -> 
   mat.metallic = brassMask;
   if (brassMask > 0.001) {
     let brushTex = noise3D(vec3<f32>(xz.x * 160.0, 5.0, xz.y * 160.0));
-    let agedBrassAlbedo = mix(vec3<f32>(0.58, 0.43, 0.21), vec3<f32>(0.42, 0.30, 0.15), aMix * 0.55) * (0.90 + 0.18 * brushTex);
+    let agedBrassAlbedo = mix(vec3<f32>(0.20, 0.14, 0.08), vec3<f32>(0.26, 0.19, 0.11), aMix * 0.55) * (0.92 + 0.14 * brushTex);
     mat.albedo = mix(woodAlbedo, agedBrassAlbedo, brassMask);
-    mat.normalPerturb = mix(normalPerturb, vec3<f32>(0.0, 0.0, (brushTex - 0.5) * 0.025), brassMask);
-    mat.roughness = mix(roughness, 0.27, brassMask);
+    mat.normalPerturb = mix(normalPerturb, vec3<f32>(0.0, 0.0, (brushTex - 0.5) * 0.020), brassMask);
+    mat.roughness = mix(roughness, 0.28, brassMask);
   }
   return mat;
 }

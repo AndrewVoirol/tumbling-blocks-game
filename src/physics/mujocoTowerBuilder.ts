@@ -164,7 +164,7 @@ export function buildNominalGlassBlocks(
       motif = (Math.floor(seedRng() * 4) & 3) as TraceryMotif;
       rippleSeed = +(0.25 + seedRng() * 96.0).toFixed(5);
     } else {
-      swatchId = (spec.layer * 3 + spec.slot * 2 + Math.floor(spec.layer / 2)) % paletteLen;
+      swatchId = (spec.layer * 5 + spec.slot * 3 + 5) % paletteLen;
       motif = 0;
       rippleSeed = (spec.id + 1) * 1.6180339;
     }

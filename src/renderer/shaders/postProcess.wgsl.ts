@@ -243,15 +243,15 @@ fn fs_composite(input: FullscreenOut) -> @location(0) vec4<f32> {
   let srgb = pow(mapped, vec3<f32>(1.0 / 2.2));
 
   if (HDR_EXTENDED != 0u) {
-    // Match exact SDR display luminance across [0, 1] dark walnut/velvet while opening
-    // linear extended-sRGB XDR headroom (> 1.0..4.0x) on caustics, TIR glints, and stained glass
-    let baseLinear = srgbToLinear(srgb);
-    let excess = max(combined - vec3<f32>(0.70), vec3<f32>(0.0));
+    // WebGPU rgba16float swapchains default to colorSpace: 'srgb' (kCGColorSpaceExtendedSRGB),
+    // which expects non-linear sRGB in [0, 1] and values > 1.0 for XDR specular/caustic headroom.
+    // Never call srgbToLinear(srgb) here (which double-gammas [0, 1] by x^2.4 into pitch-black shadows!).
+    let excess = max(combined - vec3<f32>(0.85), vec3<f32>(0.0));
     let excessPeak = max(excess.r, max(excess.g, excess.b));
-    let maxHeadroom = 3.0;
-    let boostPeak = (excessPeak * maxHeadroom) / (excessPeak + maxHeadroom * 1.35 + 1e-4);
+    let maxHeadroom = 1.65;
+    let boostPeak = (excessPeak * maxHeadroom) / (excessPeak + maxHeadroom * 1.45 + 1e-4);
     let edrBoost = select(vec3<f32>(0.0), excess * (boostPeak / max(excessPeak, 1e-4)), excessPeak > 1e-4);
-    return vec4<f32>(baseLinear + edrBoost, 1.0);
+    return vec4<f32>(srgb + edrBoost * 0.42, 1.0);
   }
 
   // Sub-LSB interleaved gradient dither eliminates 8-bit Mach banding across dark limestone/walnut gradients

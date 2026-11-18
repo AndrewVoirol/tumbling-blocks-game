@@ -148,17 +148,18 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let tauSelfApprox = sigmaSelf * 0.09 + vec3<f32>(0.088);
   let tauUpstream = max(vec3<f32>(0.0), optSample.rgb - tauSelfApprox) * (1.0 - rawSunVis);
 
-  let sunClip = uScene.sunViewProj * vec4<f32>(input.worldPos, 1.0);
+  let shardTableGate = 1.0 - smoothstep(0.02, 0.18, input.worldPos.y);
+  let sunClip = uScene.sunViewProj * vec4<f32>(input.worldPos.x, 0.0, input.worldPos.z, 1.0);
   let sunNdc = sunClip.xyz / max(sunClip.w, 1e-6);
   let sunUV = vec2<f32>(sunNdc.x * 0.5 + 0.5, 0.5 - sunNdc.y * 0.5);
   var causticFlux = vec3<f32>(0.0);
-  if (sunUV.x >= 0.002 && sunUV.x <= 0.998 && sunUV.y >= 0.002 && sunUV.y <= 0.998) {
-    causticFlux = textureSampleLevel(uCausticTex, uLinearSampler, sunUV, 0.0).rgb;
+  if (shardTableGate > 0.005 && sunUV.x >= 0.002 && sunUV.x <= 0.998 && sunUV.y >= 0.002 && sunUV.y <= 0.998) {
+    causticFlux = textureSampleLevel(uCausticTex, uLinearSampler, sunUV, 0.0).rgb * shardTableGate;
   }
 
   let polariscopeMod = 1.0 - 0.75 * polariscope;
   let rawSunTrans = mix(exp(-tauUpstream * 0.80), vec3<f32>(1.0), rawSunVis) * windowGobo;
-  let sunTransRGB = (rawSunTrans + causticFlux * (1.0 - rawSunVis * 0.45) * windowGobo) * polariscopeMod;
+  let sunTransRGB = (rawSunTrans + causticFlux * 0.28 * windowGobo) * polariscopeMod;
   let directSunVis = rawSunVis * windowGobo * polariscopeMod;
 
   // Measure exact 3D distance & ridge normal along this facet to nearest snapped dihedral glass edge
@@ -177,8 +178,8 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
     }
   }
 
-  // Per-facet 3D conchoidal glass fracture shell curvature (~10-15 deg across shard) + radial Wallner arcs
-  // + marginal twist hackle so Voronoi cleavage facets sweep reflections organically instead of flat white cutouts!
+  // Crisp brittle glass cleavage facets (~1-2 deg mirror-smooth shell relief + subtle Wallner & edge hackle)
+  // so Voronoi shards flash sharp diamond-like reflections & refractions instead of warped fishbowl lenses!
   let planeHash = hash31(floor(localN * 14.0 + vec3<f32>(0.5)) + vec3<f32>(seed * 3.7));
   let planeSeed = seed + planeHash * 6.28318;
   let dishRef = safeNormalize(vec3<f32>(0.37 + 0.42 * planeHash, 0.86, -0.35 - 0.38 * planeHash), vec3<f32>(0.0, 1.0, 0.0));
@@ -188,26 +189,26 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let cV = dot(input.centeredPos, dishAxisB);
   let shellSign = select(-1.0, 1.0, fract(planeHash * 7.13 + seed * 1.9) > 0.5);
   let conchoidalDish = (
-    dishAxisA * (cU * 4.65 + cV * 1.15 + sin(cV * 34.0 + planeSeed * 2.1) * 0.042) +
-    dishAxisB * (cV * 3.85 - cU * 1.15 - cos(cU * 29.0 - planeSeed * 1.7) * 0.042)
+    dishAxisA * (cU * 0.42 + cV * 0.11 + sin(cV * 34.0 + planeSeed * 2.1) * 0.008) +
+    dishAxisB * (cV * 0.36 - cU * 0.11 - cos(cU * 29.0 - planeSeed * 1.7) * 0.008)
   ) * shellSign;
 
   let impactRel = input.parentLocalPos - impactOrigin;
   let rWallner = length(impactRel);
   let wallnerZone = smoothstep(0.014, 0.11, rWallner);
-  let wallnerArc = sin(rWallner * 145.0 - planeSeed * 5.0) * 0.032 * wallnerZone;
+  let wallnerArc = sin(rWallner * 145.0 - planeSeed * 5.0) * 0.009 * wallnerZone;
   let hackleAng = atan2(impactRel.z + impactRel.y * 0.35, impactRel.x - impactRel.y * 0.2);
-  let edgeProximity = 1.0 - smoothstep(0.0, 0.028, minCleavageEdgeDist);
-  let twistHackle = sin(hackleAng * 26.0 + planeSeed * 4.3) * 0.022 * edgeProximity;
+  let edgeProximity = 1.0 - smoothstep(0.0, 0.022, minCleavageEdgeDist);
+  let twistHackle = sin(hackleAng * 26.0 + planeSeed * 4.3) * 0.008 * edgeProximity;
 
   let cleavagePerturbLocal = conchoidalDish
                            + safeNormalize(impactRel, localN) * wallnerArc
-                           + vec3<f32>(-impactRel.z, impactRel.x * 0.3, impactRel.x) * twistHackle * 2.6;
+                           + vec3<f32>(-impactRel.z, impactRel.x * 0.3, impactRel.x) * twistHackle * 1.2;
   let cleavagePerturbWorld = (shL2W * vec4<f32>(cleavagePerturbLocal, 0.0)).xyz;
-  // Chipped fracture-rim roll-off + cast waterglass curvature on outer shard faces
+  // Crisp outer face with subtle fracture-rim chip roll
   let outerChipRoll = safeNormalize(closestEdgePlaneN - localN * dot(closestEdgePlaneN, localN), dishAxisA)
-                    * (1.0 - smoothstep(0.0, 0.032, minCleavageEdgeDist)) * 0.11;
-  let outerPerturbLocal = vitrail.rippleGrad * 1.95 + outerChipRoll + conchoidalDish * 0.28;
+                    * (1.0 - smoothstep(0.0, 0.018, minCleavageEdgeDist)) * 0.045;
+  let outerPerturbLocal = vitrail.rippleGrad * 0.85 + outerChipRoll + conchoidalDish * 0.15;
   let outerPerturbWorld = (shL2W * vec4<f32>(outerPerturbLocal, 0.0)).xyz;
 
   let N = safeNormalize(geomN + select(cleavagePerturbWorld, outerPerturbWorld, input.isOuter > 0.5), geomN);
@@ -240,18 +241,18 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
 
   var exitNWorld = safeNormalize((shL2W * vec4<f32>(exitHit.normalLocal, 0.0)).xyz, -N);
   if (exitHit.isOuter) {
-    exitNWorld = safeNormalize(exitNWorld + (shL2W * vec4<f32>(exitVitrail.rippleGrad, 0.0)).xyz * 1.25, exitNWorld);
+    exitNWorld = safeNormalize(exitNWorld + (shL2W * vec4<f32>(exitVitrail.rippleGrad, 0.0)).xyz * 0.75, exitNWorld);
   }
 
-  // 3. Refract out of back facet — with exact dielectric Fresnel transition into Total Internal Reflection (TIR)!
-  let reflSunColor = sunColor * mix(0.14 + 0.86 * sunTransRGB, vec3<f32>(1.0), directSunVis);
+  // 3. Refract out of back facet — un-clamped dielectric Fresnel + Total Internal Reflection crystal diamond fire!
+  let reflSunColor = sunColor * mix(0.24 + 0.76 * sunTransRGB, vec3<f32>(1.0), directSunVis);
 
   let internalExitCos = clamp(abs(dot(internalWorld, exitNWorld)), 0.0, 1.0);
   let internalExitF = dielectricFresnel(internalExitCos, ior, 1.0);
   var outWorldDir = refract(internalWorld, -exitNWorld, ior);
   var tirGlow = vec3<f32>(0.0);
   var tirWeight: f32 = 0.0;
-  var dualInterfaceTrans: f32 = 0.9572 * (1.0 - internalExitF);
+  var dualInterfaceTrans: f32 = 0.960 * (1.0 - internalExitF);
 
   if (length(outWorldDir) < 1e-4) {
     let bouncedLocal = reflect(rdLocal, -exitHit.normalLocal);
@@ -261,45 +262,126 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
       input.shardIdx,
       planeCount
     );
-    totalGlassPath += bounceHit.t * 0.88;
+    totalGlassPath += bounceHit.t * 0.72;
     exitCentered = exitCentered + bouncedLocal * bounceHit.t;
     exitParentPos = input.parentLocalPos + (exitCentered - input.centeredPos);
 
     let bouncedWorld = safeNormalize((shL2W * vec4<f32>(bouncedLocal, 0.0)).xyz, internalWorld);
     let finalExitNWorld = safeNormalize((shL2W * vec4<f32>(bounceHit.normalLocal, 0.0)).xyz, exitNWorld);
     let cosBounceExit = clamp(abs(dot(bouncedWorld, finalExitNWorld)), 0.0, 1.0);
-    dualInterfaceTrans = 0.9572 * max(0.22, 1.0 - dielectricFresnel(cosBounceExit, ior, 1.0));
+    dualInterfaceTrans = 0.960 * max(0.55, 1.0 - dielectricFresnel(cosBounceExit, ior, 1.0));
     outWorldDir = refract(bouncedWorld, -finalExitNWorld, ior);
     if (length(outWorldDir) < 1e-4) {
       outWorldDir = reflect(bouncedWorld, -finalExitNWorld);
     }
-    tirGlow = min(sampleCathedralEnvironment(bouncedWorld, L, reflSunColor, skyTint, atelierMix), vec3<f32>(1.05))
-            * (vec3<f32>(0.24 * skyScale) + 0.58 * sunTransRGB);
-    tirWeight = 0.14;
-  } else if (internalExitF > 0.06) {
+    let envBounce = min(sampleCathedralEnvironment(bouncedWorld, L, reflSunColor, skyTint, atelierMix), vec3<f32>(4.2));
+    tirGlow = envBounce * (vec3<f32>(0.46 * skyScale) + 0.96 * sunTransRGB);
+    tirWeight = 0.56;
+  } else if (internalExitF > 0.04) {
     // Sub-critical steep internal Fresnel reflection approaching theta_c = 41.07 deg
     let partialBounceWorld = reflect(internalWorld, -exitNWorld);
-    tirGlow = min(sampleCathedralEnvironment(partialBounceWorld, L, reflSunColor, skyTint, atelierMix), vec3<f32>(1.05))
-            * (vec3<f32>(0.22 * skyScale) + 0.52 * sunTransRGB);
-    tirWeight = internalExitF * 0.22;
+    let envPartial = min(sampleCathedralEnvironment(partialBounceWorld, L, reflSunColor, skyTint, atelierMix), vec3<f32>(4.2));
+    tirGlow = envPartial * (vec3<f32>(0.42 * skyScale) + 0.90 * sunTransRGB);
+    tirWeight = clamp(internalExitF * 0.78, 0.0, 0.65);
   }
   outWorldDir = safeNormalize(outWorldDir, incidentDir);
 
-  // 4. Project doubly-refracted exit ray onto depth-sorted backdrop snapshot with Cauchy Abbe dispersion (V_d ~ 58)
-  let exitWorldPos = (shL2W * vec4<f32>(exitCentered, 1.0)).xyz;
-  var projDist: f32 = 0.10;
-  if (outWorldDir.y < -0.06 && exitWorldPos.y > 0.0) {
-    projDist = clamp(-exitWorldPos.y / outWorldDir.y, 0.006, 0.34);
+  // 4. Trace exit ray through up to 2 sibling Voronoi shards in uShards (true multi-shard crystal facet sparkle!)
+  var rayPosW = (shL2W * vec4<f32>(exitCentered, 1.0)).xyz + outWorldDir * 0.0012;
+  var rayDirW = outWorldDir;
+  let shardCount = u32(uScene.skyTintAndMode.w);
+  let sibStride = max(1u, shardCount / 28u);
+  var sibExtraTauLo = vec4<f32>(0.0);
+  var sibExtraTauHi = vec4<f32>(0.0);
+  var sibFacetSparkle = vec3<f32>(0.0);
+  var sibAtten: f32 = 1.0;
+  var sibHits: u32 = 0u;
+  for (var s: u32 = 0u; s < shardCount; s = s + sibStride) {
+    if (s == input.shardIdx) { continue; }
+    let pSib = &uShards[s];
+    let sCenter = (*pSib).localToWorld[3].xyz;
+    let relC = sCenter - rayPosW;
+    let tProj = dot(relC, rayDirW);
+    if (tProj > -0.18 && tProj < 0.42) {
+      let perpSq = dot(relC, relC) - tProj * tProj;
+      if (perpSq < 0.036) {
+        let sr0 = (*pSib).localToWorld[0].xyz;
+        let sr1 = (*pSib).localToWorld[1].xyz;
+        let sr2 = (*pSib).localToWorld[2].xyz;
+        let relO = rayPosW - sCenter;
+        let roS = vec3<f32>(dot(sr0, relO), dot(sr1, relO), dot(sr2, relO));
+        let rdS = vec3<f32>(dot(sr0, rayDirW), dot(sr1, rayDirW), dot(sr2, rayDirW));
+        let pCnt = min(MAX_SHARD_PLANES, u32(round((*pSib).originAndPlaneCount.w)));
+        var tEn: f32 = 0.0005;
+        var tEx: f32 = 0.42;
+        var nEnL = vec3<f32>(0.0, 1.0, 0.0);
+        var nExL = vec3<f32>(0.0, -1.0, 0.0);
+        var okS: bool = pCnt > 0u;
+        for (var k: u32 = 0u; k < pCnt; k = k + 1u) {
+          let pl = (*pSib).planes[k];
+          let num = abs(pl.w) - dot(pl.xyz, roS);
+          let den = dot(pl.xyz, rdS);
+          if (abs(den) < 1e-6) {
+            if (num < 0.0) { okS = false; break; }
+          } else {
+            let t = num / den;
+            if (den > 0.0) {
+              if (t < tEx) { tEx = t; nExL = pl.xyz; }
+            } else if (t > tEn) {
+              tEn = t;
+              nEnL = pl.xyz;
+            }
+            if (tEn > tEx) { okS = false; break; }
+          }
+        }
+        if (okS && tEx > tEn) {
+          let sLen = clamp(tEx - tEn, 0.008, 0.24);
+          let sibEnW = safeNormalize(((*pSib).localToWorld * vec4<f32>(nEnL, 0.0)).xyz, -rayDirW);
+          let sibExW = safeNormalize(((*pSib).localToWorld * vec4<f32>(nExL, 0.0)).xyz, rayDirW);
+          let fSibEn = dielectricFresnel(clamp(abs(dot(rayDirW, sibEnW)), 0.0, 1.0), 1.0, ior);
+          let sibRefl = reflect(rayDirW, sibEnW);
+          let sibEnv = min(sampleCathedralEnvironment(sibRefl, L, reflSunColor, skyTint, atelierMix), vec3<f32>(4.5));
+          let sibSpecG = evalGGXSpecular(sibEnW, -rayDirW, L, 0.026) * sunColor * sunTransRGB * 0.85;
+          sibFacetSparkle += (sibEnv * (0.28 + 0.72 * fSibEn) * 0.48 + sibSpecG) * sibAtten;
+
+          let sibSig = (*pSib).absorption + SODA_LIME_IRON_SIGMA;
+          let sibSp8 = evalSwatchSpectralSigma8(sibSig);
+          sibExtraTauLo += sibSp8.lo * sLen;
+          sibExtraTauHi += sibSp8.hi * sLen;
+          sibAtten *= (1.0 - fSibEn * 0.55) * 0.94;
+
+          var inSib = refract(rayDirW, sibEnW, 1.0 / ior);
+          inSib = select(safeNormalize(inSib, rayDirW), reflect(rayDirW, sibEnW), length(inSib) < 1e-4);
+          var outSib = refract(inSib, -sibExW, ior);
+          if (length(outSib) < 1e-4) {
+            let tirSib = reflect(inSib, -sibExW);
+            let tirSibEnv = min(sampleCathedralEnvironment(tirSib, L, reflSunColor, skyTint, atelierMix), vec3<f32>(4.5));
+            sibFacetSparkle += tirSibEnv * (vec3<f32>(0.35 * skyScale) + 0.85 * sunTransRGB) * 0.42 * sibAtten;
+            outSib = tirSib;
+          }
+          rayPosW = rayPosW + rayDirW * tEx + safeNormalize(outSib, rayDirW) * 0.0012;
+          rayDirW = safeNormalize(outSib, rayDirW);
+          sibHits = sibHits + 1u;
+          if (sibHits >= 2u) { break; }
+        }
+      }
+    }
   }
 
-  let offsetClip = uScene.viewProj * vec4<f32>(exitWorldPos + outWorldDir * projDist, 1.0);
+  let exitWorldPos = rayPosW;
+  var projDist: f32 = 0.11;
+  if (rayDirW.y < -0.06 && exitWorldPos.y > 0.0) {
+    projDist = clamp(-exitWorldPos.y / rayDirW.y, 0.006, 0.36);
+  }
+
+  let offsetClip = uScene.viewProj * vec4<f32>(exitWorldPos + rayDirW * projDist, 1.0);
   let refractedNDC = offsetClip.xy / max(offsetClip.w, 1e-5);
   let baseRefractUV = vec2<f32>(refractedNDC.x * 0.5 + 0.5, 0.5 - refractedNDC.y * 0.5);
-  let deltaUV = clamp(baseRefractUV - screenUV, vec2<f32>(-0.075), vec2<f32>(0.075));
+  let deltaUV = clamp(baseRefractUV - screenUV, vec2<f32>(-0.085), vec2<f32>(0.085));
 
-  let dispBoost = 1.0 + tirWeight * 0.65;
-  let dispFracR = (GLASS_IOR_G - GLASS_IOR_R) / (GLASS_IOR_G - 1.0) * 5.8 * dispBoost;
-  let dispFracB = (GLASS_IOR_B - GLASS_IOR_G) / (GLASS_IOR_G - 1.0) * 5.2 * dispBoost;
+  let dispBoost = 1.0 + tirWeight * 0.55;
+  let dispFracR = (GLASS_IOR_G - GLASS_IOR_R) / (GLASS_IOR_G - 1.0) * 5.2 * dispBoost;
+  let dispFracB = (GLASS_IOR_B - GLASS_IOR_G) / (GLASS_IOR_G - 1.0) * 4.8 * dispBoost;
   let uvR = clamp(screenUV + deltaUV * (1.0 - dispFracR), vec2<f32>(0.002), vec2<f32>(0.998));
   let uvG = clamp(screenUV + deltaUV, vec2<f32>(0.002), vec2<f32>(0.998));
   let uvB = clamp(screenUV + deltaUV * (1.0 + dispFracB), vec2<f32>(0.002), vec2<f32>(0.998));
@@ -314,50 +396,60 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let bgB = select(tapB.b, centerBackdrop.b, tapB.a > 0.0 && tapB.a < camDist - 0.035);
   let bgRGB = vec3<f32>(bgR, bgG, bgB);
 
-  // 5. Exact Beer-Lambert + Soda-Lime Iron-Oxide volumetric absorption + Maxwell-Fresnel transmission
+  // 5. 8-Band Spectral Transmittance + Sibling-Shard Crystal Sparkle
   let sigma = mix(
     shAbs,
     shAcc.xyz,
     0.5 * (vitrail.accentMix + exitVitrail.accentMix)
   ) + SODA_LIME_IRON_SIGMA;
-  let transmittance = exp(-sigma * totalGlassPath * 1.32) * max(0.35, dualInterfaceTrans);
+  let shSpec8 = evalSwatchSpectralSigma8(sigma);
+  var shSpecTau: SpectralTau8;
+  shSpecTau.lo = shSpec8.lo * (totalGlassPath * 0.92) + sibExtraTauLo * 0.85;
+  shSpecTau.hi = shSpec8.hi * (totalGlassPath * 0.92) + sibExtraTauHi * 0.85;
+  let transmittance = integrateSpectralTau8ToRGB(shSpecTau) * max(0.62, dualInterfaceTrans) * sibAtten;
 
-  let edgeRefractionDepth = mix(0.58, 1.0, smoothstep(0.05, 0.48, internalExitCos));
+  let edgeRefractionDepth = mix(0.84, 1.0, smoothstep(0.04, 0.36, internalExitCos));
 
   let cosTheta = clamp(dot(N, V), 0.0, 1.0);
   let fresnel = dielectricFresnel(cosTheta, 1.0, ior);
 
-  let facetRough = select(0.036, 0.052, input.isOuter > 0.5);
-  let sunSpec = evalGGXSpecular(N, V, L, facetRough) * fresnel * sunColor * sunTransRGB * 0.72;
+  let facetRough = select(0.022, 0.038, input.isOuter > 0.5);
+  let sunSpec = evalGGXSpecular(N, V, L, facetRough) * fresnel * sunColor * mix(sunTransRGB * 0.55, vec3<f32>(1.0), directSunVis) * 0.92;
   let envRefl = sampleCathedralEnvironment(reflect(incidentDir, N), L, reflSunColor, skyTint, atelierMix);
-  let facetEnv = envRefl / (vec3<f32>(1.0) + envRefl * 0.58);
+  let facetEnv = envRefl / (vec3<f32>(1.0) + envRefl * 0.35);
 
-  // Physical dihedral glass ridge optics: dark refractive rim + colored-sun-gated crystal ridge flash
-  let sharpEdgeBand = 1.0 - smoothstep(0.0004, 0.0024 + aaFilter * 1.0, minCleavageEdgeDist);
+  // Physical dihedral glass ridge optics: crisp refractive rim + sunlit crystal ridge flash
+  let sharpEdgeBand = 1.0 - smoothstep(0.0005, 0.0030 + aaFilter * 1.0, minCleavageEdgeDist);
   let ridgeLocalN = safeNormalize(localN + closestEdgePlaneN, localN);
   let ridgeWorldN = safeNormalize((shL2W * vec4<f32>(ridgeLocalN, 0.0)).xyz, N);
-  let ridgeGGX = evalGGXSpecular(ridgeWorldN, V, L, 0.075) * sunColor * sunTransRGB * 0.34;
+  let ridgeGGX = evalGGXSpecular(ridgeWorldN, V, L, 0.052) * sunColor * mix(sunTransRGB * 0.55, vec3<f32>(1.0), directSunVis) * 0.58;
   let ridgeFresnel = dielectricFresnel(clamp(abs(dot(ridgeWorldN, V)), 0.0, 1.0), 1.0, ior);
-  let ridgeSkyGlint = sampleCathedralEnvironment(reflect(incidentDir, ridgeWorldN), L, reflSunColor, skyTint, atelierMix) * ridgeFresnel * 0.18;
+  let ridgeSkyGlint = sampleCathedralEnvironment(reflect(incidentDir, ridgeWorldN), L, reflSunColor, skyTint, atelierMix) * ridgeFresnel * 0.28;
   let edgeSpecGlint = sharpEdgeBand * (ridgeGGX + ridgeSkyGlint);
 
-  let dihedralEdgeDarken = mix(0.68, 1.0, smoothstep(0.0, 0.0040, minCleavageEdgeDist));
-  let meniscusAO = mix(1.0, vitrail.paneMeniscusAO, input.isOuter);
-  let pathScatter = 1.0 - exp(-totalGlassPath * 3.6);
-  let bodySwatchTint = exp(-sigma * max(totalGlassPath * 1.45, 0.18));
-  let forwardLobe = pow(max(0.0, dot(incidentDir, L)), 3.5);
-  let transmittedSunGlow = bodySwatchTint * sunColor * sunTransRGB * pathScatter * (0.018 + 0.15 * forwardLobe);
-  let interiorRadiant = mix(bgRGB * edgeRefractionDepth * dihedralEdgeDarken * meniscusAO, tirGlow, tirWeight) * transmittance + transmittedSunGlow;
+  let dihedralEdgeDarken = mix(0.85, 1.0, smoothstep(0.0, 0.0035, minCleavageEdgeDist));
+  let meniscusAO = mix(1.0, vitrail.paneMeniscusAO, input.isOuter * 0.55);
+  let pathScatter = 1.0 - exp(-totalGlassPath * 3.4);
+  var swatchTau: SpectralTau8;
+  swatchTau.lo = shSpec8.lo * max(totalGlassPath * 1.15, 0.14);
+  swatchTau.hi = shSpec8.hi * max(totalGlassPath * 1.15, 0.14);
+  let bodySwatchTint = integrateSpectralTau8ToRGB(swatchTau);
+  let shMin = min(bodySwatchTint.r, min(bodySwatchTint.g, bodySwatchTint.b));
+  let shPureJewel = max(vec3<f32>(0.0), bodySwatchTint - vec3<f32>(shMin * 0.80));
+  let forwardLobe = pow(max(0.0, dot(incidentDir, L)), 3.6);
+  let facetSunSpark = bodySwatchTint * sunColor * sunTransRGB * pow(max(0.0, dot(reflect(internalWorld, -exitNWorld), L)), 9.0) * 0.42;
+  let transmittedSunGlow = (shPureJewel * sunColor * sunTransRGB * (0.012 + 0.24 * forwardLobe) * pathScatter) + facetSunSpark;
+  let interiorRadiant = (mix(bgRGB * edgeRefractionDepth * dihedralEdgeDarken * meniscusAO, tirGlow, tirWeight) + sibFacetSparkle) * transmittance + transmittedSunGlow;
 
-  let maxUntintedF = select(0.062, 0.088, input.isOuter > 0.5);
+  let maxUntintedF = select(0.11, 0.14, input.isOuter > 0.5);
   let untintedF = min(fresnel, maxUntintedF);
-  let tintedGrazingF = (fresnel - untintedF) * 0.82;
-  let grazingTint = mix(vec3<f32>(0.06), bodySwatchTint, 0.92);
-  let reflTerm = facetEnv * untintedF + envRefl / (vec3<f32>(1.0) + envRefl * 0.32) * (tintedGrazingF * grazingTint);
-  let transmitWeight = 1.0 - untintedF - tintedGrazingF * 0.45;
+  let tintedGrazingF = (fresnel - untintedF) * 0.86;
+  let grazingTint = mix(vec3<f32>(0.10), bodySwatchTint, 0.92);
+  let reflTerm = facetEnv * untintedF + envRefl / (vec3<f32>(1.0) + envRefl * 0.24) * (tintedGrazingF * grazingTint);
+  let transmitWeight = 1.0 - untintedF - tintedGrazingF * 0.40;
   let rawGlint = sunSpec + edgeSpecGlint;
-  let boundedGlint = rawGlint / (vec3<f32>(1.0) + rawGlint * 0.45);
-  let surfaceCaustic = causticFlux * sunColor * 0.10 * windowGobo * polariscopeMod;
+  let boundedGlint = rawGlint / (vec3<f32>(1.0) + rawGlint * 0.30);
+  let surfaceCaustic = causticFlux * sunColor * 0.04 * clamp(-N.y, 0.0, 1.0) * windowGobo * polariscopeMod;
   var shardRGB = interiorRadiant * transmitWeight + reflTerm + boundedGlint + surfaceCaustic + vec3<f32>(_keepDepth + _keepOpt + _keepCenters + _keepCaustic);
 
   // Optional recessed 60/40 tin-lead / copper-foil came conductor shading on outer motif facets
@@ -400,10 +492,10 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
     // Brewster s-polarized oblique rim glint (peaks near theta_B = 56.7 deg -> cosTheta ~ 0.55)
     let dBrewster = (cosTheta - 0.549) / 0.28;
     let brewsterBell = exp(-dBrewster * dBrewster);
-    let darkFieldBase = smokedCrystalBg * (0.31 * chordExtinction) * edgeRefractionDepth * dihedralEdgeDarken * meniscusAO * transmitWeight
-                      + reflTerm * (0.48 + 0.24 * brewsterBell)
-                      + sunSpec * 0.48 + edgeSpecGlint * 0.55;
-    let fringeEnergy = max(0.18, bgLuma * 1.35 + dot(transmittedSunGlow, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.15 + 0.13 * skyScale);
+    let darkFieldBase = smokedCrystalBg * (0.42 * chordExtinction) * edgeRefractionDepth * dihedralEdgeDarken * meniscusAO * transmitWeight
+                      + reflTerm * (0.58 + 0.28 * brewsterBell)
+                      + sunSpec * 0.56 + edgeSpecGlint * 0.62;
+    let fringeEnergy = max(0.24, bgLuma * 1.55 + dot(transmittedSunGlow, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.25 + 0.16 * skyScale);
     let fringeGate = smoothstep(0.11, 0.46, residualStress);
     shardRGB = (darkFieldBase + shardIsochromatic * fringeEnergy * fringeGate * (1.0 - fresnel * 0.42)) * (1.0 - cameWeight * 0.84)
              + vec3<f32>(_keepDepth + _keepOpt + _keepCenters + _keepCaustic);

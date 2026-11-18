@@ -106,22 +106,22 @@ export const STAINED_GLASS_PALETTE: StainedGlassSwatch[] = [
   {
     id: 4,
     name: 'Manganese Amethyst',
-    absorption: [2.6, 8.6, 0.85],
-    accentAbsorption: [1.4, 7.4, 2.2], // Smoked plum-violet
+    absorption: [3.1, 8.8, 1.15],
+    accentAbsorption: [1.8, 7.6, 2.5], // Smoked plum-violet
     uiHex: '#7e22ce',
   },
   {
     id: 5,
     name: 'Peacock Teal',
-    absorption: [8.1, 0.82, 0.95],
-    accentAbsorption: [6.5, 2.1, 0.48], // Deep Venetian sea-glass
+    absorption: [8.4, 1.45, 1.65],
+    accentAbsorption: [6.8, 2.5, 1.05], // Deep Venetian sea-glass
     uiHex: '#0f766e',
   },
   {
     id: 6,
     name: 'Gold-Ruby Rose',
-    absorption: [0.26, 6.8, 4.2],
-    accentAbsorption: [0.20, 2.8, 7.2], // Antique cranberry-rose
+    absorption: [0.52, 7.8, 5.6],
+    accentAbsorption: [0.42, 4.2, 8.2], // Deep cranberry-bordeaux (no neon hot-pink)
     uiHex: '#be185d',
   },
   {

@@ -9,61 +9,80 @@ export interface MeshData {
 }
 
 /**
- * Generates a smooth-chamfered rectangular glass prism mesh at exact Jenga scale
- * (7.5 cm x 1.5 cm x 2.5 cm -> half-extents 0.375 x 0.075 x 0.125 dm).
- * A rounded bevel along all 12 edges and 8 corners produces authentic specular highlights
- * along the cut glass edges and solder seams.
+ * Generates a precision 5-segment C1-continuous fire-polished rectangular glass prism mesh
+ * at exact Jenga scale (7.5 cm x 1.5 cm x 2.5 cm -> half-extents 0.375 x 0.075 x 0.125 dm):
+ *   - 6 optically flat primary faces (exact axial normals across 100% of flat interior)
+ *   - Tight 0.68 mm 5-segment cylindrical edge fillets & spherical corners (~0.13 mm strips)
+ * Eliminates chunky low-poly corner triangles at macro zoom while preserving razor-crisp edge highlights.
  */
 export function createBeveledBlockMesh(
   hx: number = BLOCK_HALF_X,
   hy: number = BLOCK_HALF_Y,
   hz: number = BLOCK_HALF_Z,
-  bevel: number = 0.0125, // ~1.25 mm diamond-polished glass prism chamfer
-  segments: number = 1
+  bevel: number = 0.0068, // ~0.68 mm precision-polished glass edge fillet
+  segments: number = 5
 ): MeshData {
   const verts: number[] = [];
   const indices: number[] = [];
+  const segs = Math.max(3, segments);
+  const b = Math.min(bevel, Math.min(hx, hy, hz) * 0.35);
 
   const makeAxisStops = (halfExt: number): number[] => {
-    const flatStop = Math.max(0.05, 1.0 - bevel / halfExt);
+    const flatStop = Math.max(0.1, 1.0 - b / halfExt);
     const stops: number[] = [-1.0];
-    for (let i = 1; i <= segments; i++) {
-      stops.push(-1.0 + (i / segments) * (1.0 - flatStop));
+    for (let i = 1; i <= segs; i++) {
+      // Cosine arc spacing concentrates vertices smoothly across the 90-deg fillet curvature
+      const theta = ((segs - i) / segs) * (Math.PI * 0.5);
+      stops.push(-flatStop - Math.sin(theta) * (1.0 - flatStop));
     }
-    for (let i = segments; i >= 1; i--) {
-      stops.push(1.0 - (i / segments) * (1.0 - flatStop));
+    for (let i = 0; i <= segs; i++) {
+      const theta = (i / segs) * (Math.PI * 0.5);
+      stops.push(flatStop + Math.sin(theta) * (1.0 - flatStop));
     }
-    stops.push(1.0);
     return stops;
   };
 
-  const stopsX = makeAxisStops(hx);
-  const stopsY = makeAxisStops(hy);
-  const stopsZ = makeAxisStops(hz);
+  // Deduplicate exact +/-flatStop endpoints (i == segs in first loop, i == 0 in second loop)
+  const cleanStops = (raw: number[]): number[] => {
+    const out: number[] = [];
+    for (const v of raw) {
+      if (out.length === 0 || Math.abs(v - out[out.length - 1]) > 1e-6) {
+        out.push(v);
+      }
+    }
+    return out;
+  };
 
-  const mapCubePointToRoundedBox = (cx: number, cy: number, cz: number) => {
-    // Map unit cube [-1, 1]^3 onto exact box [-hx, hx] x [-hy, hy] x [-hz, hz],
-    // then clamp to inner core [-hx+b, hx-b] to get exact signed distance surface point + outward normal!
+  const stopsX = cleanStops(makeAxisStops(hx));
+  const stopsY = cleanStops(makeAxisStops(hy));
+  const stopsZ = cleanStops(makeAxisStops(hz));
+
+  const mapCubePointToPolishedBox = (cx: number, cy: number, cz: number) => {
     const px = cx * hx;
     const py = cy * hy;
     const pz = cz * hz;
 
-    const ix = Math.max(-(hx - bevel), Math.min(hx - bevel, px));
-    const iy = Math.max(-(hy - bevel), Math.min(hy - bevel, py));
-    const iz = Math.max(-(hz - bevel), Math.min(hz - bevel, pz));
+    const ix = Math.max(-(hx - b), Math.min(hx - b, px));
+    const iy = Math.max(-(hy - b), Math.min(hy - b, py));
+    const iz = Math.max(-(hz - b), Math.min(hz - b, pz));
 
     let dx = px - ix;
     let dy = py - iy;
     let dz = pz - iz;
     const dLen = Math.hypot(dx, dy, dz);
     if (dLen < 1e-7) {
-      // Pure flat face center
       if (Math.abs(cx) >= Math.abs(cy) && Math.abs(cx) >= Math.abs(cz)) {
-        dx = Math.sign(cx); dy = 0; dz = 0;
+        dx = Math.sign(cx);
+        dy = 0;
+        dz = 0;
       } else if (Math.abs(cy) >= Math.abs(cx) && Math.abs(cy) >= Math.abs(cz)) {
-        dx = 0; dy = Math.sign(cy); dz = 0;
+        dx = 0;
+        dy = Math.sign(cy);
+        dz = 0;
       } else {
-        dx = 0; dy = 0; dz = Math.sign(cz);
+        dx = 0;
+        dy = 0;
+        dz = Math.sign(cz);
       }
     } else {
       dx /= dLen;
@@ -72,9 +91,9 @@ export function createBeveledBlockMesh(
     }
 
     return {
-      x: ix + dx * bevel,
-      y: iy + dy * bevel,
-      z: iz + dz * bevel,
+      x: ix + dx * b,
+      y: iy + dy * b,
+      z: iz + dz * b,
       nx: dx,
       ny: dy,
       nz: dz,
@@ -95,7 +114,7 @@ export function createBeveledBlockMesh(
       for (let iu = 0; iu < uCount; iu++) {
         const u = uStops[iu];
         const [cx, cy, cz] = evalCube(u, v);
-        const p = mapCubePointToRoundedBox(cx, cy, cz);
+        const p = mapCubePointToPolishedBox(cx, cy, cz);
         verts.push(p.x, p.y, p.z, p.nx, p.ny, p.nz);
       }
     }
@@ -114,7 +133,6 @@ export function createBeveledBlockMesh(
     }
   };
 
-  // +Z (front), -Z (back), +X (right), -X (left), +Y (top), -Y (bottom) with outward CCW winding
   emitCubeFace(stopsX, stopsY, (u, v) => [u, v, 1], false);
   emitCubeFace(stopsX, stopsY, (u, v) => [u, v, -1], true);
   emitCubeFace(stopsZ, stopsY, (u, v) => [1, v, -u], false);
