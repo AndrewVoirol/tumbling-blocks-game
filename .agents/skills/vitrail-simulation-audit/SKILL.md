@@ -42,7 +42,7 @@ Use this playbook and its executable 10-probe dynamical harness (`scripts/audit-
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `74/74` Vitest Suite (`9` suites: `T1–T9`, `C1–C8`, `10` Faithful-Glass & Sandbox Checks `M1–M10`, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `6` Mobile Plinth, `9` Acoustics, `11` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
+5. **Complete `86/86` Vitest Suite (`9` suites: `T1–T9`, `C1–C8`, `14` Faithful-Glass, Sandbox & Realism Checks `M1–M14`, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `6` Mobile Plinth, `13` Acoustics, `15` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
    ```bash
    npx vitest run --maxWorkers=3
    npm run eval:preship

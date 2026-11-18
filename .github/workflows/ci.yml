@@ -14,7 +14,7 @@ env:
 
 jobs:
   fast-gates:
-    name: Build, MuJoCo Calibration & 9-Probe Dynamics
+    name: Build, MuJoCo Calibration & 10-Probe Dynamics
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -28,7 +28,7 @@ jobs:
         run: npm run build
       - name: MuJoCo 4.0 Calibration Scorecard (8/8)
         run: npm run calibrate:physics
-      - name: 9-Probe Continuous Dynamics Audit (9/9)
+      - name: 10-Probe Continuous Dynamics Audit (10/10)
         run: npm run audit:dynamics
 
   vitest:
@@ -41,8 +41,8 @@ jobs:
         include:
           - label: Physics, Colosseum & Fidelity
             files: tests/physicsAndFracture.test.ts tests/physicsColosseum.test.ts tests/physicsComparisonFidelity.test.ts
-          - label: Acoustics, Multiplayer & Touch/HUD
-            files: tests/acoustics.test.ts tests/multiplayer.test.ts tests/touchAndHud.test.ts
+          - label: Acoustics, Multiplayer, Touch & Mobile Plinth
+            files: tests/acoustics.test.ts tests/multiplayer.test.ts tests/touchAndHud.test.ts tests/mobilePlinth.test.ts
             setup_chrome: true
           - label: 520-Seed Stateful Fuzzer
             files: tests/statefulFuzz.test.ts
