@@ -413,10 +413,10 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   let cosTheta = clamp(dot(N, V), 0.0, 1.0);
   let fresnel = dielectricFresnel(cosTheta, 1.0, ior);
 
-  let facetRough = select(0.022, 0.038, input.isOuter > 0.5);
-  let sunSpec = evalGGXSpecular(N, V, L, facetRough) * fresnel * sunColor * mix(sunTransRGB * 0.55, vec3<f32>(1.0), directSunVis) * 0.92;
+  let facetRough = select(0.014, 0.020, input.isOuter > 0.5);
+  let sunSpec = evalGGXSpecular(N, V, L, facetRough) * fresnel * sunColor * mix(sunTransRGB * 0.50, vec3<f32>(1.0), directSunVis) * 0.95;
   let envRefl = sampleCathedralEnvironment(reflect(incidentDir, N), L, reflSunColor, skyTint, atelierMix);
-  let facetEnv = envRefl / (vec3<f32>(1.0) + envRefl * 0.35);
+  let facetEnv = envRefl / (vec3<f32>(1.0) + envRefl * 0.18);
 
   // Physical dihedral glass ridge optics: crisp refractive rim + sunlit crystal ridge flash
   let sharpEdgeBand = 1.0 - smoothstep(0.0005, 0.0030 + aaFilter * 1.0, minCleavageEdgeDist);
@@ -434,11 +434,9 @@ fn fs_glass_shard(input: ShardVSOut, @builtin(front_facing) isFront: bool) -> @l
   swatchTau.lo = shSpec8.lo * max(totalGlassPath * 1.15, 0.14);
   swatchTau.hi = shSpec8.hi * max(totalGlassPath * 1.15, 0.14);
   let bodySwatchTint = integrateSpectralTau8ToRGB(swatchTau);
-  let shMin = min(bodySwatchTint.r, min(bodySwatchTint.g, bodySwatchTint.b));
-  let shPureJewel = max(vec3<f32>(0.0), bodySwatchTint - vec3<f32>(shMin * 0.80));
-  let forwardLobe = pow(max(0.0, dot(incidentDir, L)), 3.6);
-  let facetSunSpark = bodySwatchTint * sunColor * sunTransRGB * pow(max(0.0, dot(reflect(internalWorld, -exitNWorld), L)), 9.0) * 0.42;
-  let transmittedSunGlow = (shPureJewel * sunColor * sunTransRGB * (0.012 + 0.24 * forwardLobe) * pathScatter) + facetSunSpark;
+  let forwardLobe = pow(max(0.0, dot(incidentDir, L)), 5.5);
+  let facetSunSpark = bodySwatchTint * sunColor * sunTransRGB * pow(max(0.0, dot(reflect(internalWorld, -exitNWorld), L)), 12.0) * 0.38;
+  let transmittedSunGlow = (bodySwatchTint * sunColor * sunTransRGB * (0.04 * forwardLobe) * pathScatter) + facetSunSpark;
   let interiorRadiant = (mix(bgRGB * edgeRefractionDepth * dihedralEdgeDarken * meniscusAO, tirGlow, tirWeight) + sibFacetSparkle) * transmittance + transmittedSunGlow;
 
   let maxUntintedF = select(0.11, 0.14, input.isOuter > 0.5);

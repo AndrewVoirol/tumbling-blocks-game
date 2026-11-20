@@ -221,8 +221,8 @@ fn evaluateVitrailPattern(pLocal: vec3<f32>, motifId: i32, seed: f32) -> Vitrail
     }
   }
 
-  // Calm surface ripples on unadorned cut crystal (motifId == 0) so rear bricks transmit tack-sharp like Ground Truth!
-  let rippleScale = select(0.10, 0.36, motifId > 0);
+  // Precision diamond-ground architectural glass on motifId == 0 (micro-subtle optical figure, zero molded-plastic waviness)
+  let rippleScale = select(0.022, 0.30, motifId > 0);
   var out: VitrailSample;
   out.cameMask = cameMask;
   out.accentMix = accentMix;
@@ -454,55 +454,63 @@ struct SpectralTau8 {
   hi: vec4<f32>, // 565, 605, 645, 685 nm (Yellow-Green, Orange, Ruby-Red, Deep-Violet-Red)
 };
 
-fn evalSwatchSpectralSigma8(sigmaRGB: vec3<f32>) -> SpectralTau8 {
-  // Reconstruct physical semiconductor / transition-metal cathedral stained-glass spectra from sigmaRGB,
-  // calibrated 1:1 against the 16-band Ground-Truth Path Tracer:
-  //   - Amber/Gold (CdS / Ag0 485 nm cut-on): 96% pure golden transmission across 530..685 nm, zero green mud!
-  //   - Selenium Ruby (CdSSe 602 nm cut-on): sharp crimson passband above 605 nm!
-  //   - Chartres Cobalt (Co2+ ligand-field): vivid blue + 505 nm emerald shoulder (Amber x Cobalt -> Green) + 685 nm violet tail (Ruby x Cobalt -> Violet)!
-  let sR = sigmaRGB.x;
-  let sG = sigmaRGB.y;
-  let sB = sigmaRGB.z;
+fn evalSwatchSpectralSigma8WithDensity(sigmaRGB: vec3<f32>, densityScale: f32) -> SpectralTau8 {
+  // Bright, Luminous Stained-Glass Basis (water-clear ~0.09/dm passband + clean stop-band -> bright jewel glass, zero dark mud & zero pastel!):
+  let sR = sigmaRGB.x * densityScale;
+  let sG = sigmaRGB.y * densityScale;
+  let sB = sigmaRGB.z * densityScale;
 
-  let isCobalt = smoothstep(4.5, 7.5, sR) * (1.0 - smoothstep(0.4, 1.5, sB));
-  let isAmber  = (1.0 - smoothstep(0.25, 0.85, sR)) * (1.0 - smoothstep(2.2, 4.4, sG)) * smoothstep(5.5, 8.2, sB);
-  let isRuby   = (1.0 - smoothstep(0.30, 0.90, sR)) * smoothstep(4.2, 6.8, sG) * smoothstep(4.5, 7.2, sB);
+  let isCobalt = smoothstep(4.5 * densityScale, 7.5 * densityScale, sR) * (1.0 - smoothstep(0.4, 1.5, sigmaRGB.z));
+  let isAmber  = (1.0 - smoothstep(0.25, 0.85, sigmaRGB.x)) * (1.0 - smoothstep(2.2, 4.4, sigmaRGB.y)) * smoothstep(5.5, 8.2, sigmaRGB.z);
+  let isRuby   = (1.0 - smoothstep(0.30, 0.90, sigmaRGB.x)) * smoothstep(4.2, 6.8, sigmaRGB.y) * smoothstep(4.5, 7.2, sigmaRGB.z);
 
-  var b415 = sB * 1.12 + 0.12;
-  var b455 = sB * 0.92;
+  var b415 = sB * 1.06 + 0.08;
+  var b455 = sB * 0.90;
   var b495 = sB * 0.46 + sG * 0.42;
   var b530 = sG * 0.86;
   var b565 = sG * 0.46 + sR * 0.42;
-  var b605 = sR * 0.82 + sG * 0.16;
-  var b645 = sR * 0.94;
-  var b685 = sR * 0.88;
+  var b605 = sR * 0.82 + sG * 0.15;
+  var b645 = sR * 0.92;
+  var b685 = sR * 0.86;
 
-  // Sharp Ag0 / CdS Amber cut-on: pure sunlit lemon-gold without brown-olive green attenuation
-  b495 = mix(b495, 1.55, isAmber * 0.85);
-  b530 = mix(b530, 0.20, isAmber * 0.90);
-  b565 = mix(b565, 0.11, isAmber * 0.92);
-  b605 = mix(b605, 0.09, isAmber * 0.92);
-  b645 = mix(b645, 0.09, isAmber * 0.92);
-  b685 = mix(b685, 0.09, isAmber * 0.92);
+  // Warm Golden-Honey Amber: clean blue cut-off + high golden passband (bright luminous honey-gold, never dark brown & never cream!)
+  b415 = mix(b415, 10.5 * densityScale, isAmber * 0.92);
+  b455 = mix(b455, 9.60 * densityScale, isAmber * 0.92);
+  b495 = mix(b495, 3.60 * densityScale, isAmber * 0.88);
+  b530 = mix(b530, 1.05 * densityScale, isAmber * 0.90);
+  b565 = mix(b565, 0.28 * densityScale, isAmber * 0.92);
+  b605 = mix(b605, 0.12 * densityScale, isAmber * 0.92);
+  b645 = mix(b645, 0.10 * densityScale, isAmber * 0.92);
+  b685 = mix(b685, 0.10 * densityScale, isAmber * 0.92);
 
-  // Sharp CdSSe Selenium Ruby 602 nm cut-on: block 565 nm yellow-green completely so Ruby stays pure vivid crimson (zero terracotta orange leak!)
-  b530 = mix(b530, 13.5, isRuby * 0.95);
-  b565 = mix(b565, 12.8, isRuby * 0.95);
-  b605 = mix(b605, 2.35, isRuby * 0.88);
-  b645 = mix(b645, 0.11, isRuby * 0.92);
-  b685 = mix(b685, 0.09, isRuby * 0.92);
+  // Luminous Selenium Ruby: high >605 nm red passband (~97% clear in red!) + clean green/blue block
+  b415 = mix(b415, 10.5 * densityScale, isRuby * 0.94);
+  b455 = mix(b455, 11.0 * densityScale, isRuby * 0.94);
+  b495 = mix(b495, 11.0 * densityScale, isRuby * 0.94);
+  b530 = mix(b530, 10.8 * densityScale, isRuby * 0.95);
+  b565 = mix(b565, 7.20 * densityScale, isRuby * 0.94);
+  b605 = mix(b605, 1.45 * densityScale, isRuby * 0.88);
+  b645 = mix(b645, 0.12 * densityScale, isRuby * 0.92);
+  b685 = mix(b685, 0.10 * densityScale, isRuby * 0.92);
 
-  // Co2+ tetrahedral Cobalt passband + 505 nm emerald shoulder + >675 nm deep-violet window
-  b415 = mix(b415, 0.15, isCobalt * 0.85);
-  b455 = mix(b455, 0.12, isCobalt * 0.88);
-  b495 = mix(b495, 1.18, isCobalt * 0.78);
-  b530 = mix(b530, 2.05, isCobalt * 0.75);
-  b685 = mix(b685, min(sR * 0.20, 1.45), isCobalt * 0.88);
+  // Luminous Chartres Cobalt: high blue passband (~97% clear in blue!) + 500 nm emerald shoulder + 685 nm violet window
+  b415 = mix(b415, 0.14 * densityScale, isCobalt * 0.90);
+  b455 = mix(b455, 0.11 * densityScale, isCobalt * 0.92);
+  b495 = mix(b495, 1.25 * densityScale, isCobalt * 0.82);
+  b530 = mix(b530, 2.45 * densityScale, isCobalt * 0.80);
+  b565 = mix(b565, 6.80 * densityScale, isCobalt * 0.88);
+  b605 = mix(b605, 8.40 * densityScale, isCobalt * 0.90);
+  b645 = mix(b645, 8.20 * densityScale, isCobalt * 0.90);
+  b685 = mix(b685, 1.55 * densityScale, isCobalt * 0.88);
 
   var out: SpectralTau8;
   out.lo = vec4<f32>(b415, b455, b495, b530);
   out.hi = vec4<f32>(b565, b605, b645, b685);
   return out;
+}
+
+fn evalSwatchSpectralSigma8(sigmaRGB: vec3<f32>) -> SpectralTau8 {
+  return evalSwatchSpectralSigma8WithDensity(sigmaRGB, 0.88);
 }
 
 /**
@@ -677,50 +685,47 @@ fn sampleCathedralEnvironment(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: ve
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
   let aMix = clamp(atelierMix, 0.0, 1.0);
 
-  // Studio Dark-Field Reflection Environment + Crisp HDR Window Strips:
-  // Real glass looks like crystal (not milky plastic) because 80% of reflection angles see rich dark
-  // architectural shadow while polished bevels & faces catch crisp, high-contrast HDR lancet & clerestory windows!
+  // Dark-Field Gallery Surround (prevents milky grey Fresnel veil from turning saturated glass pastel!) + crisp HDR window key:
   let highClerestory = smoothstep(0.66, 0.84, sunDir.y);
-  let darkFloor = mix(vec3<f32>(0.042, 0.030, 0.021), vec3<f32>(0.115, 0.084, 0.056), aMix) * skyScale;
-  let shadowedStone = mix(vec3<f32>(0.068, 0.064, 0.062), vec3<f32>(0.165, 0.155, 0.144), aMix) * (1.0 + 0.12 * highClerestory) * skyScale
-                    + skyTint * mix(0.075, 0.145, aMix);
-  let vaultZenith = skyTint * mix(0.22, 0.38, aMix)
-                  + mix(vec3<f32>(0.048, 0.054, 0.066), vec3<f32>(0.115, 0.124, 0.140), aMix) * (1.0 + 0.15 * highClerestory) * skyScale;
+  let warmWoodBounce = mix(vec3<f32>(0.032, 0.022, 0.015), vec3<f32>(0.095, 0.070, 0.048), aMix) * skyScale;
+  let sunlitPlaster  = mix(vec3<f32>(0.042, 0.040, 0.040), vec3<f32>(0.115, 0.108, 0.102), aMix) * (1.0 + 0.10 * highClerestory) * skyScale
+                     + skyTint * mix(0.035, 0.095, aMix);
+  let skyDomeZenith  = skyTint * mix(0.14, 0.26, aMix)
+                     + mix(vec3<f32>(0.034, 0.038, 0.048), vec3<f32>(0.085, 0.092, 0.108), aMix) * skyScale;
 
-  var env = mix(shadowedStone, vaultZenith, smoothstep(0.0, 0.80, max(0.0, up)));
-  env = mix(darkFloor, env, smoothstep(-0.28, 0.04, up));
+  var env = mix(sunlitPlaster, skyDomeZenith, smoothstep(-0.05, 0.78, up));
+  env = mix(warmWoodBounce, env, smoothstep(-0.34, 0.06, up));
 
-  // Primary Tall Arched Lancet Window (bounded HDR area light with fine stone & lead mullions)
+  // Broad Architectural Studio Window Key + Soft Skylight Gradient (gives flat glass faces a natural perspective sheen!)
   let right = safeNormalize(cross(vec3<f32>(0.0, 1.0, 0.0), sunDir), vec3<f32>(1.0, 0.0, 0.0));
   let winUp = cross(sunDir, right);
   let sunCos = dot(d, sunDir);
   let winU = dot(d, right);
   let winV = dot(d, winUp);
 
-  let archHalfW = 0.28 * (1.0 - smoothstep(0.08, 0.44, winV) * 0.48);
-  let inPrimaryWindow = smoothstep(archHalfW + 0.045, archHalfW - 0.025, abs(winU)) *
-                        smoothstep(0.45, 0.36, abs(winV)) *
-                        smoothstep(0.18, 0.44, sunCos);
+  let archHalfW = 0.34 * (1.0 - smoothstep(0.12, 0.48, winV) * 0.38);
+  let inPrimaryWindow = smoothstep(archHalfW + 0.055, archHalfW - 0.025, abs(winU)) *
+                        smoothstep(0.48, 0.36, abs(winV)) *
+                        smoothstep(0.12, 0.42, sunCos);
 
-  // Clean, mullion-free continuous studio softbox/lancet luminance (eliminates synthetic diagonal/horizontal window-blind bars on flat crystal!)
-  let paneGrad = 0.86 + 0.14 * cos(winU * 5.0) * cos(winV * 3.5);
+  let paneGrad = 0.88 + 0.12 * cos(winU * 3.8) * cos(winV * 2.8);
   let windowPanes = inPrimaryWindow * paneGrad;
 
-  let primaryWindowLight = windowPanes * sunColor * (1.15 + 0.85 * smoothstep(0.68, 0.98, sunCos));
-  let softSolarHalo = pow(max(0.0, sunCos), 18.0) * sunColor * 0.20;
+  let primaryWindowLight = windowPanes * sunColor * (0.95 + 0.85 * smoothstep(0.68, 0.985, sunCos));
+  let softSolarHalo = pow(max(0.0, sunCos), 14.0) * sunColor * 0.24;
 
-  // Secondary Cool Clerestory Fill Window on opposite/overhead angle for shadow-side bevel rim highlights
-  let fillDir = safeNormalize(vec3<f32>(-sunDir.x * 0.85, 0.58, -sunDir.z * 0.85), vec3<f32>(0.0, 1.0, 0.0));
+  // Opposite Studio Bounce Reflector + Overhead Skylight Strip so every glass face & bevel rim catches clean light
+  let fillDir = safeNormalize(vec3<f32>(-sunDir.x * 0.85, 0.52, -sunDir.z * 0.85), vec3<f32>(0.0, 1.0, 0.0));
   let fillRight = safeNormalize(cross(vec3<f32>(0.0, 1.0, 0.0), fillDir), vec3<f32>(1.0, 0.0, 0.0));
   let fillUp = cross(fillDir, fillRight);
   let fillU = dot(d, fillRight);
   let fillV = dot(d, fillUp);
-  let inFillStrip = smoothstep(0.36, 0.26, abs(fillU)) *
-                    smoothstep(0.22, 0.14, abs(fillV)) *
-                    smoothstep(0.22, 0.48, dot(d, fillDir));
-  let coolClerestoryLight = inFillStrip * (skyTint * 1.95 + vec3<f32>(0.28, 0.32, 0.40) * skyScale);
+  let inFillStrip = smoothstep(0.42, 0.26, abs(fillU)) *
+                    smoothstep(0.28, 0.16, abs(fillV)) *
+                    smoothstep(0.14, 0.44, dot(d, fillDir));
+  let coolClerestoryLight = inFillStrip * (skyTint * 1.45 + vec3<f32>(0.26, 0.30, 0.38) * skyScale);
 
-  let zenithStrip = smoothstep(0.74, 0.92, up) * smoothstep(0.32, 0.20, abs(d.x)) * (skyTint * 0.90);
+  let zenithStrip = smoothstep(0.68, 0.90, up) * smoothstep(0.38, 0.20, abs(d.x)) * (skyTint * 0.82);
 
   return env + primaryWindowLight + softSolarHalo + coolClerestoryLight + zenithStrip;
 }
@@ -735,26 +740,27 @@ fn sampleStudioBackdrop(rayDir: vec3<f32>, sunDir: vec3<f32>, sunColor: vec3<f32
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
   let aMix = clamp(atelierMix, 0.0, 1.0);
 
+  // Bright Sunlit Daylight Studio Backdrop (restores full luminous room light behind the tower so glass glows brightly, never dark cave!)
+  let roomLightMix = smoothstep(0.15, 0.75, aMix);
   let highClerestoryBg = smoothstep(0.66, 0.84, sunDir.y);
-  let lowerAlcove = mix(vec3<f32>(0.178, 0.158, 0.140), vec3<f32>(0.215, 0.196, 0.176), aMix) * (1.0 + 0.18 * highClerestoryBg) * skyScale
-                  + skyTint * mix(0.115, 0.130, aMix);
-  let midWall     = mix(vec3<f32>(0.286, 0.264, 0.240), vec3<f32>(0.335, 0.310, 0.282), aMix) * (1.0 + 0.20 * highClerestoryBg) * skyScale
-                  + skyTint * mix(0.210, 0.230, aMix);
-  let upperVault  = mix(vec3<f32>(0.242, 0.246, 0.260), vec3<f32>(0.295, 0.288, 0.282), aMix) * (1.0 + 0.22 * highClerestoryBg) * skyScale
-                  + skyTint * mix(0.340, 0.360, aMix);
+  let lowerAlcove = mix(vec3<f32>(0.178, 0.158, 0.140), vec3<f32>(0.228, 0.208, 0.188), roomLightMix) * (1.0 + 0.18 * highClerestoryBg) * skyScale
+                  + skyTint * mix(0.115, 0.145, roomLightMix);
+  let midWall     = mix(vec3<f32>(0.286, 0.264, 0.240), vec3<f32>(0.355, 0.328, 0.298), roomLightMix) * (1.0 + 0.20 * highClerestoryBg) * skyScale
+                  + skyTint * mix(0.210, 0.248, roomLightMix);
+  let upperVault  = mix(vec3<f32>(0.242, 0.246, 0.260), vec3<f32>(0.312, 0.305, 0.298), roomLightMix) * (1.0 + 0.22 * highClerestoryBg) * skyScale
+                  + skyTint * mix(0.340, 0.375, roomLightMix);
 
   var bg = mix(lowerAlcove, midWall, smoothstep(-0.32, 0.02, up));
   bg = mix(bg, upperVault, smoothstep(0.05, 0.58, up));
 
-  // Subtle smooth architectural wall warmth + opposite-wall sunlight wash (matching evalStudioRoomRGB in Ground Truth!)
   let sunDirXZ = normalize(vec2<f32>(sunDir.x, sunDir.z + 1e-5));
   let rayXZ = normalize(vec2<f32>(d.x, d.z + 1e-5));
   let sunAlign = dot(rayXZ, sunDirXZ);
   let oppWallWash = smoothstep(-0.60, 0.85, -sunAlign) * smoothstep(-0.30, 0.28, up);
   let windowBay = smoothstep(0.08, 0.88, sunAlign) * smoothstep(-0.28, 0.22, up);
-  bg += sunColor * mix(0.074, 0.058, aMix) * oppWallWash
-      + (sunColor * mix(0.058, 0.044, aMix) + skyTint * 0.065) * windowBay
-      + skyTint * 0.095 * smoothstep(-0.10, 0.50, up);
+  bg += sunColor * mix(0.074, 0.064, roomLightMix) * oppWallWash
+      + (sunColor * mix(0.058, 0.048, roomLightMix) + skyTint * 0.068) * windowBay
+      + skyTint * 0.098 * smoothstep(-0.10, 0.50, up);
 
   return bg;
 }

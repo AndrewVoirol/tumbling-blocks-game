@@ -393,7 +393,7 @@ export function buildDeterministicTowerMaterials(
       motif = (Math.floor(seedRng() * 4) & 3) as TraceryMotif;
       rippleSeed = +(0.25 + seedRng() * 96.0).toFixed(5);
     } else {
-      swatchId = (layer * 3 + slot * 2 + Math.floor(layer / 2)) % paletteLen;
+      swatchId = (layer * 5 + slot * 3 + 5) % paletteLen;
       motif = 0;
       rippleSeed = (id + 1) * 1.6180339;
     }

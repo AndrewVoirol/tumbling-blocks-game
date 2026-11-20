@@ -185,7 +185,9 @@ fn sampleRefractedDispersedBackground(
   let sunColor = uScene.sunColorAndAspect.xyz;
   let skyTint = uScene.skyTintAndMode.xyz;
   let skyScale = clamp(dot(skyTint, vec3<f32>(0.3333333)) / 0.567, 0.0, 4.0);
-  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
+  let rawStudioVal = uScene.tableAoCounts.w;
+  let atelierMix = clamp(rawStudioVal, 0.0, 1.0);
+  let crystalDensity = mix(0.88, 0.66, clamp((rawStudioVal - 1.0) / 0.28, 0.0, 1.0));
   let nDotL = max(0.0, L.y);
 
   let hitTableG = dirG.y < -1e-4 && posG.y > 0.0;
@@ -222,10 +224,10 @@ fn sampleRefractedDispersedBackground(
       let cosTab = clamp(-dirG.y, 0.0, 1.0);
       let fTab = 0.042 + 0.958 * pow(1.0 - cosTab, 5.0);
       let reflTab = vec3<f32>(dirG.x, -dirG.y, dirG.z);
-      let skyGloss = sampleStudioBackdrop(reflTab, L, sunColor, skyTint, atelierMix) * fTab * (1.0 - matG.roughness * 0.52) * baseOccG;
-      let sunTabSpec = evalGGXSpecular(vec3<f32>(0.0, 1.0, 0.0), -dirG, L, matG.roughness) * fTab * sunColor * sharedShadowBase * sharedGobo * 0.42;
+      let skyGloss = sampleStudioBackdrop(reflTab, L, sunColor, skyTint, atelierMix) * fTab * (1.0 - matG.roughness * 0.58) * baseOccG * 0.32;
+      let sunTabSpec = evalGGXSpecular(vec3<f32>(0.0, 1.0, 0.0), -dirG, L, matG.roughness) * fTab * sunColor * sharedShadowBase * sharedGobo * 0.36;
       sharedTableGloss = skyGloss + sunTabSpec;
-      sharedWoodAlbedo *= (1.0 - fTab);
+      sharedWoodAlbedo *= (1.0 - fTab * 0.45);
       validTableG = true;
     }
   }
@@ -354,7 +356,9 @@ fn traceTowerGlassRayDispersed(
   let iorR: f32 = GLASS_IOR_R;
   let iorG: f32 = GLASS_IOR_G;
   let iorB: f32 = GLASS_IOR_B;
-  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
+  let rawStudioVal = uScene.tableAoCounts.w;
+  let atelierMix = clamp(rawStudioVal, 0.0, 1.0);
+  let crystalDensity = mix(0.88, 0.66, clamp((rawStudioVal - 1.0) / 0.28, 0.0, 1.0));
 
   // 1. Refract Green carrier ray + R/B Abbe dispersion into primary block
   var internalDirWorld = refract(incidentDir, frontWorldNormal, 1.0 / iorG);
@@ -383,28 +387,35 @@ fn traceTowerGlassRayDispersed(
   ) + SODA_LIME_IRON_SIGMA;
 
   var worldRayPos = mulBlockL2WPoint(primaryIdx, exitPosLocal);
-  // Coupled horizontal course-to-course transmission vs outer vertical wall TIR:
-  // On horizontal +/-Y bearing faces (isHorizExit0 == 1.0), coupled exit refraction (iorExit = 1.055) eliminates the
-  // 41.07-deg Total Internal Reflection periscope cutoff so you can ALWAYS see through horizontal bricks into the
-  // supporting bricks below at every camera angle & zoom, while vertical +/-X / +/-Z walls retain full 3-bounce TIR waveguiding!
-  let isHorizExit0 = step(0.65, abs(box0.exitNormalLocal.y));
-  let effExitIor0 = select(iorG, select(1.055, iorG, isRefCard), isHorizExit0 > 0.5);
-  let directOut0 = refract(internalDirWorld, -exitPerturbedN, effExitIor0);
+  // True n = 1.522 heavy-slab Snell refraction with smooth grazing guard strictly on top-to-bottom (+/-Y -> +/-Y) rays:
+  // - Rays entering a horizontal face and exiting the opposite horizontal face refract with full n = 1.522
+  //   (preserving the 7.1 mm thick-glass lateral step over wood grain & gaps!), smoothly capping sin(theta_out) <= 0.985
+  //   only if block tilt pushes an internal top-to-bottom ray past 41.07 deg so courses never hit a TIR cutoff wall.
+  // - Rays entering vertical side/end faces (+/-X, +/-Z) keep exact n = 1.522 on all faces so bottom/side hits
+  //   undergo genuine 100% Total Internal Reflection inside the rectangular prism waveguide!
+  let frontLocalN0 = mulBlockW2LDir(primaryIdx, frontWorldNormal);
+  let isTopToBot0 = step(0.65, abs(frontLocalN0.y)) * step(0.65, abs(box0.exitNormalLocal.y));
+  let rippleDamp0 = mix(1.0, 0.25, isTopToBot0);
+  let exitSteerN0 = safeNormalize(exitNormalWorld + exit0RippleWorld * rippleDamp0, exitNormalWorld);
+  let internalCosExit = clamp(abs(dot(internalDirWorld, exitSteerN0)), 0.0, 1.0);
+  let sinExit0 = sqrt(max(1e-6, 1.0 - internalCosExit * internalCosExit));
+  let guardedHorizIor0 = min(iorG, 0.985 / sinExit0);
+  let effExitIor0 = select(iorG, select(guardedHorizIor0, iorG, isRefCard), isTopToBot0 > 0.5);
+  let directOut0 = refract(internalDirWorld, -exitSteerN0, effExitIor0);
   let hasDirect0 = length(directOut0) >= 1e-4;
   var worldRayDir = select(internalDirWorld, safeNormalize(directOut0, internalDirWorld), hasDirect0);
-  let internalCosExit = clamp(abs(dot(internalDirWorld, exitPerturbedN)), 0.0, 1.0);
   let exactExitF0 = select(
     dielectricFresnel(internalCosExit, iorG, 1.0),
-    select(clamp(dielectricFresnel(internalCosExit, 1.18, 1.0) * 0.42, 0.03, 0.24), dielectricFresnel(internalCosExit, iorG, 1.0), isRefCard),
-    isHorizExit0 > 0.5
+    select(min(0.18, dielectricFresnel(internalCosExit, effExitIor0, 1.0)), dielectricFresnel(internalCosExit, iorG, 1.0), isRefCard),
+    isTopToBot0 > 0.5
   );
   var exitTransmission0: f32 = 1.0 - exactExitF0;
 
-  // Multi-bounce lossless Total Internal Reflection (3-step rectangular prism waveguide on vertical +/-X / +/-Z walls):
-  if (!isRefCard && isHorizExit0 < 0.5 && (exactExitF0 > 0.14 || !hasDirect0)) {
+  // Multi-bounce lossless Total Internal Reflection (3-step rectangular prism waveguide on vertical-entry & side walls):
+  if (!isRefCard && isTopToBot0 < 0.5 && (exactExitF0 > 0.14 || !hasDirect0)) {
     var wgPosL = exitPosLocal;
     var wgDirL = rdLocal;
-    var wgExitNL = safeNormalize(mulBlockW2LDir(primaryIdx, exitPerturbedN), box0.exitNormalLocal);
+    var wgExitNL = safeNormalize(mulBlockW2LDir(primaryIdx, exitSteerN0), box0.exitNormalLocal);
     var wgPath: f32 = 0.0;
     var wgExited = false;
     var wgOutWorld = worldRayDir;
@@ -418,11 +429,10 @@ fn traceTowerGlassRayDispersed(
       wgExitNL = bHit.exitNormalLocal;
       let candWorldD = mulBlockL2WDir(primaryIdx, wgDirL);
       let candWorldN = mulBlockL2WDir(primaryIdx, wgExitNL);
-      let isHorizWg = step(0.65, abs(wgExitNL.y));
-      let tryOut = refract(candWorldD, -candWorldN, select(iorG, 1.055, isHorizWg > 0.5));
+      let tryOut = refract(candWorldD, -candWorldN, iorG);
       if (length(tryOut) >= 1e-4) {
         let cosEx = clamp(abs(dot(candWorldD, candWorldN)), 0.0, 1.0);
-        wgBounceTrans = max(0.74, 1.0 - dielectricFresnel(cosEx, select(iorG, 1.18, isHorizWg > 0.5), 1.0));
+        wgBounceTrans = max(0.74, 1.0 - dielectricFresnel(cosEx, iorG, 1.0));
         wgOutWorld = safeNormalize(tryOut, candWorldD);
         wgExited = true;
         break;
@@ -435,29 +445,29 @@ fn traceTowerGlassRayDispersed(
     }
     exitTransmission0 = (1.0 - exactExitF0) + exactExitF0 * wgBounceTrans;
 
-    // Never mix worldRayPos halfway across two distinct faces (which teleports rays past supporting blocks!);
-    // snap ray trajectory cleanly only on true TIR (!hasDirect0), using exact energy weighting below theta_c.
+    // Snap trajectory cleanly on true TIR (!hasDirect0) with full physical Beer-Lambert path attenuation (1.0 * wgPath)
     if (!hasDirect0) {
-      pathLen0 += wgPath * 0.72;
+      pathLen0 += wgPath;
       worldRayPos = mulBlockL2WPoint(primaryIdx, wgPosL);
       worldRayDir = wgOutWorld;
     }
   }
-  var rayCoupledHoriz: f32 = select(0.0, 1.0, !isRefCard && isHorizExit0 > 0.5 && hasDirect0);
+  var prevHorizExitIor: f32 = select(iorG, effExitIor0, !isRefCard && isTopToBot0 > 0.5 && hasDirect0);
   let internalMirrorContrib = vec3<f32>(0.0);
   worldRayDir = safeNormalize(worldRayDir, incidentDir);
 
   let inR0 = safeNormalize(refract(incidentDir, frontWorldNormal, 1.0 / iorR), internalDirWorld);
   let inB0 = safeNormalize(refract(incidentDir, frontWorldNormal, 1.0 / iorB), internalDirWorld);
-  var dirR = refract(inR0, -exitPerturbedN, iorR);
+  let exitRatio0 = effExitIor0 / iorG;
+  var dirR = refract(inR0, -exitSteerN0, iorR * exitRatio0);
   dirR = select(worldRayDir, safeNormalize(dirR, worldRayDir), length(dirR) >= 1e-4 && hasDirect0);
-  var dirB = refract(inB0, -exitPerturbedN, iorB);
+  var dirB = refract(inB0, -exitSteerN0, iorB * exitRatio0);
   dirB = select(worldRayDir, safeNormalize(dirB, worldRayDir), length(dirB) >= 1e-4 && hasDirect0);
   var posR = worldRayPos + (inR0 - internalDirWorld) * box0.tFar;
   var posB = worldRayPos + (inB0 - internalDirWorld) * box0.tFar;
 
   let throughput0 = exp(-sigma0 * pathLen0);
-  let specSigma0 = evalSwatchSpectralSigma8(sigma0);
+  let specSigma0 = evalSwatchSpectralSigma8WithDensity(sigma0, crystalDensity);
   var specTau: SpectralTau8;
   specTau.lo = specSigma0.lo * pathLen0;
   specTau.hi = specSigma0.hi * pathLen0;
@@ -466,12 +476,14 @@ fn traceTowerGlassRayDispersed(
   let lightEnergy = transmittedSun * 0.42 + skyTint * 0.20;
   let scatterGate = select(1.0, 0.0, isRefCard);
 
-  // Subtle internal prism reflection sparkle restricted to steep bevel/TIR angles (> 45 deg, zero flat-face glare!)
+  // Subtle internal prism reflection restricted to colored jewel glass (avoids untinted white inner borders on clear #7 blocks)
   var prismExitSparkle = vec3<f32>(0.0);
-  if (!isRefCard && exactExitF0 > 0.09) {
-    let intReflWorld = reflect(internalDirWorld, -exitPerturbedN);
-    let roomSpark0 = sampleCathedralEnvironment(intReflWorld, L, transmittedSun * 0.75, skyTint, atelierMix);
-    prismExitSparkle = roomSpark0 * integrateSpectralTau8ToRGB(specTau) * smoothstep(0.09, 0.65, exactExitF0) * 0.24;
+  if (!isRefCard && exactExitF0 > 0.18) {
+    let isDyed0 = smoothstep(0.85, 2.20, max(sigma0.x, max(sigma0.y, sigma0.z)));
+    let intReflWorld = reflect(internalDirWorld, -exitSteerN0);
+    let roomSpark0 = sampleCathedralEnvironment(intReflWorld, L, transmittedSun * 0.55, skyTint, atelierMix);
+    let clampedSpark0 = roomSpark0 / (vec3<f32>(1.0) + roomSpark0 * 0.65);
+    prismExitSparkle = clampedSpark0 * integrateSpectralTau8ToRGB(specTau) * smoothstep(0.18, 0.72, exactExitF0) * 0.12 * isDyed0;
   }
 
   let bubbleSparkle = select(evaluateSeedBubbles(roLocal, rdLocal, box0.tFar, seed0), 0.0, isRefCard);
@@ -649,11 +661,14 @@ fn traceTowerGlassRayDispersed(
     let qMidCheck = max(abs(pMidCheck) - innerHalf, vec3<f32>(0.0));
     let bevelLipCoverage = select(1.0, 1.0 - smoothstep(BLOCK_BEVEL_R - 0.0016, BLOCK_BEVEL_R + 0.0020, length(qMidCheck)), !isRefCard);
 
-    // Exact Snell parallel-slab invariance (n_exit * eta_entry == 1.000): prevents double-bending shallow rays down into dark lower courses!
-    let horizCoupleIn = rayCoupledHoriz * step(0.65, abs(nearestBox.entryNormalLocal.y));
-    let effEntryEtaG = mix(1.0 / iorG, 1.0 / 1.055, horizCoupleIn);
-    let effEntryEtaR = mix(1.0 / iorR, 1.0 / 1.053, horizCoupleIn);
-    let effEntryEtaB = mix(1.0 / iorB, 1.0 / 1.058, horizCoupleIn);
+    // Exact Snell parallel-slab invariance (n_exit * eta_entry == 1.000): uses exact 1/1.522 on standard rays
+    // and pairs with guardedHorizIor only on tilted grazing top-to-bottom transitions!
+    let isHorizEntry2 = step(0.65, abs(nearestBox.entryNormalLocal.y));
+    let effInIorG = mix(iorG, prevHorizExitIor, isHorizEntry2 * isTightContact);
+    let inRatio2 = effInIorG / iorG;
+    let effEntryEtaG = 1.0 / effInIorG;
+    let effEntryEtaR = 1.0 / (iorR * inRatio2);
+    let effEntryEtaB = 1.0 / (iorB * inRatio2);
 
     var insideSecondary = refract(worldRayDir, entryNWorld, effEntryEtaG);
     if (length(insideSecondary) < 1e-4) {
@@ -666,30 +681,32 @@ fn traceTowerGlassRayDispersed(
     var segLen = clamp(insideBox.tFar, 0.006, 0.76);
     var localExitPos = localEntryPos + insideLocal * segLen;
     let vExit2 = evaluateVitrailPattern(localExitPos, hitMotif, hitSeed);
-    let exit2RippleWorld = mulBlockL2WDir(nearestIdx, vExit2.rippleGrad) * 1.10;
+    let exit2RippleWorld = mulBlockL2WDir(nearestIdx, vExit2.rippleGrad) * 0.90;
 
     let avgAccent = 0.5 * (vHit.accentMix + vExit2.accentMix);
     let sigmaHit = mix(hitAbsMotif.xyz, hitAccSeed.xyz, avgAccent) + SODA_LIME_IRON_SIGMA;
 
+    let isTopToBot2 = isHorizEntry2 * step(0.65, abs(insideBox.exitNormalLocal.y));
     var exitN2World = safeNormalize(
-      mulBlockL2WDir(nearestIdx, insideBox.exitNormalLocal) + exit2RippleWorld,
+      mulBlockL2WDir(nearestIdx, insideBox.exitNormalLocal) + exit2RippleWorld * mix(1.0, 0.25, isTopToBot2),
       entryNWorld
     );
-    let isHorizExit2 = step(0.65, abs(insideBox.exitNormalLocal.y));
-    let effExitIor2 = select(iorG, select(1.055, iorG, isRefCard), isHorizExit2 > 0.5);
     let cosExit2 = clamp(abs(dot(insideSecondary, exitN2World)), 0.0, 1.0);
+    let sinExit2 = sqrt(max(1e-6, 1.0 - cosExit2 * cosExit2));
+    let guardedHorizIor2 = min(iorG, 0.985 / sinExit2);
+    let effExitIor2 = select(iorG, select(guardedHorizIor2, iorG, isRefCard), isTopToBot2 > 0.5);
     let exactExitF2 = select(
       dielectricFresnel(cosExit2, iorG, 1.0),
-      select(clamp(dielectricFresnel(cosExit2, 1.18, 1.0) * 0.38, 0.02, 0.22), dielectricFresnel(cosExit2, iorG, 1.0), isRefCard),
-      isHorizExit2 > 0.5
+      select(min(0.16, dielectricFresnel(cosExit2, effExitIor2, 1.0)), dielectricFresnel(cosExit2, iorG, 1.0), isRefCard),
+      isTopToBot2 > 0.5
     );
     var exitTrans2: f32 = 1.0 - exactExitF2;
     let directOut2 = refract(insideSecondary, -exitN2World, effExitIor2);
     let hasDirect2 = length(directOut2) >= 1e-4;
     var exitedDir = select(insideSecondary, safeNormalize(directOut2, insideSecondary), hasDirect2);
 
-    // 3-step lossless internal prism waveguide on vertical +/-X / +/-Z walls of secondary blocks
-    if (!isRefCard && isHorizExit2 < 0.5 && (exactExitF2 > 0.14 || !hasDirect2)) {
+    // 3-step lossless internal prism waveguide on vertical-entry & side walls of secondary blocks
+    if (!isRefCard && isTopToBot2 < 0.5 && (exactExitF2 > 0.14 || !hasDirect2)) {
       var wgPos2 = localExitPos;
       var wgDir2 = insideLocal;
       var wgNL2 = safeNormalize(mulBlockW2LDir(nearestIdx, exitN2World), insideBox.exitNormalLocal);
@@ -707,11 +724,10 @@ fn traceTowerGlassRayDispersed(
         wgNL2 = tirBox.exitNormalLocal;
         let twD = mulBlockL2WDir(nearestIdx, wgDir2);
         let twN = mulBlockL2WDir(nearestIdx, wgNL2);
-        let isHorizWg2 = step(0.65, abs(wgNL2.y));
-        let tryO2 = refract(twD, -twN, select(iorG, 1.055, isHorizWg2 > 0.5));
+        let tryO2 = refract(twD, -twN, iorG);
         if (length(tryO2) >= 1e-4) {
           let cEx2 = clamp(abs(dot(twD, twN)), 0.0, 1.0);
-          wgTrans2 = max(0.72, 1.0 - dielectricFresnel(cEx2, select(iorG, 1.18, isHorizWg2 > 0.5), 1.0));
+          wgTrans2 = max(0.72, 1.0 - dielectricFresnel(cEx2, iorG, 1.0));
           wgOut2 = safeNormalize(tryO2, twD);
           wgExWN2 = twN;
           wgDone2 = true;
@@ -727,7 +743,7 @@ fn traceTowerGlassRayDispersed(
       exitTrans2 = (1.0 - exactExitF2) + exactExitF2 * wgTrans2;
 
       if (!hasDirect2) {
-        segLen += wgSpan2 * 0.70;
+        segLen += wgSpan2;
         localExitPos = wgPos2;
         exitN2World = wgExWN2;
         exitedDir = wgOut2;
@@ -744,34 +760,34 @@ fn traceTowerGlassRayDispersed(
     let hitSunTrans = exp(-hitTauUp * 0.65) * hitGobo * polariscopeMod;
     let hitSolarIrrad = sunColor * hitSunTrans;
 
-    var seamEnv = skyTint * 0.10 + hitSolarIrrad * pow(max(0.0, dot(seamReflDir, L)), 8.0) * 0.65;
+    var seamEnv = skyTint * 0.08 + hitSolarIrrad * pow(max(0.0, dot(seamReflDir, L)), 10.0) * 0.55;
     if (bounce == 0u && isRefCard) {
       seamEnv = sampleCathedralEnvironment(seamReflDir, L, sunColor, skyTint, atelierMix);
     } else if (bounce == 0u) {
-      // Smooth mullion-free interior window/stone reflection so 1 px internal cross-course bevels never stair-step!
       let upSeam = clamp(seamReflDir.y, -1.0, 1.0);
       let sunCosSeam = max(0.0, dot(seamReflDir, L));
-      seamEnv = skyTint * mix(0.14, 0.28, smoothstep(-0.2, 0.7, upSeam))
-              + hitSolarIrrad * (0.12 * smoothstep(0.15, 0.65, sunCosSeam) + 0.68 * pow(sunCosSeam, 9.0));
+      seamEnv = skyTint * mix(0.08, 0.18, smoothstep(-0.2, 0.7, upSeam))
+              + hitSolarIrrad * (0.08 * smoothstep(0.18, 0.68, sunCosSeam) + 0.58 * pow(sunCosSeam, 11.0));
     }
     let seamWeight = select(
       0.24 + 0.24 * isTightContact,
-      (0.04 + 0.34 * entryBevelMask + 0.05 * isTightContact) * bevelLipCoverage,
+      (0.025 + 0.035 * entryBevelMask + 0.020 * isTightContact) * bevelLipCoverage,
       !isRefCard
     );
     internalScatter += seamEnv * throughput * seamFresnel * seamWeight * scatterGate;
 
     let effSegLen = segLen * bevelLipCoverage;
     let segBeer = exp(-sigmaHit * effSegLen);
-    let swatchRich = exp(-sigmaHit * max(effSegLen * 1.15, 0.16));
-    let minCh = min(swatchRich.r, min(swatchRich.g, swatchRich.b));
-    let pureJewelPass = max(vec3<f32>(0.0), swatchRich - vec3<f32>(minCh * 0.86));
+    let hitSpecSelf = evalSwatchSpectralSigma8WithDensity(sigmaHit, crystalDensity);
+    var hitTauSelf8: SpectralTau8;
+    hitTauSelf8.lo = hitSpecSelf.lo * max(effSegLen, 0.16);
+    hitTauSelf8.hi = hitSpecSelf.hi * max(effSegLen, 0.16);
+    let swatchRich = integrateSpectralTau8ToRGB(hitTauSelf8);
     let qExitBevel = max(abs(localExitPos) - innerHalf, vec3<f32>(0.0));
-    let exitBevelMask = smoothstep(0.0010, 0.0120, length(qExitBevel));
-    let bevelSunSpark = swatchRich * hitSolarIrrad * exitBevelMask * pow(max(0.0, dot(reflect(insideSecondary, -exitN2World), L)), 10.0) * 0.38;
-    // Clear optical glass: zero milky front-lit fog, preserving true backlit forward glow + internal bevel sparkle
-    let hitForwardGlint = pureJewelPass * hitSolarIrrad * (0.008 + 0.24 * pow(max(0.0, dot(worldRayDir, L)), 3.8)) * (1.0 - exp(-effSegLen * 3.0)) * 0.36;
-    let hitBodyGlow = (hitForwardGlint + bevelSunSpark) * bevelLipCoverage;
+    let exitBevelMask = smoothstep(0.0010, 0.0110, length(qExitBevel));
+    // Non-scattering optical crystal interior (mu_s = 0): zero milky dyed-plastic bulk fog, only crisp exit-bevel sun glints!
+    let bevelSunSpark = swatchRich * hitSolarIrrad * exitBevelMask * pow(max(0.0, dot(reflect(insideSecondary, -exitN2World), L)), 18.0) * 0.14;
+    let hitBodyGlow = bevelSunSpark * bevelLipCoverage;
 
     let maxCame2 = max(vHit.cameMask, vExit2.cameMask) * bevelLipCoverage;
     var hitCameEmit = vec3<f32>(0.0);
@@ -800,8 +816,8 @@ fn traceTowerGlassRayDispersed(
     }
 
     let effSeamF = seamFresnel * bevelLipCoverage;
-    let coupledEntryTrans = mix(1.0 - effSeamF, 1.0 - effSeamF * 0.38, isTightContact * scatterGate);
-    let coupledExitTrans = mix(1.0, mix(exitTrans2, max(exitTrans2, 0.90), isTightContact * scatterGate), bevelLipCoverage);
+    let coupledEntryTrans = mix(1.0 - effSeamF, 1.0 - effSeamF * 0.22, isTightContact * scatterGate);
+    let coupledExitTrans = mix(1.0, mix(exitTrans2, max(exitTrans2, 0.955), isTightContact * scatterGate), bevelLipCoverage);
     internalScatter += throughput * coupledEntryTrans * (hitBodyGlow * (1.0 - maxCame2 * 0.80) + hitCameEmit) * scatterGate;
 
     // Prevent surface putty meniscus AO from compounding multiplicatively across 10 stacked courses
@@ -810,13 +826,15 @@ fn traceTowerGlassRayDispersed(
     let cameAtten2 = (1.0 - maxCame2 * 0.82) * meniscus2;
     let stepInterface = coupledEntryTrans * coupledExitTrans * crackAtten * cameAtten2;
 
-    if (!isRefCard && exactExitF2 > 0.12) {
+    if (!isRefCard && exactExitF2 > 0.22) {
+      let isDyed2 = smoothstep(0.85, 2.20, max(sigmaHit.x, max(sigmaHit.y, sigmaHit.z)));
       let intRefl2 = reflect(insideSecondary, -exitN2World);
-      let roomSpark2 = sampleCathedralEnvironment(intRefl2, L, hitSolarIrrad * 0.75, skyTint, atelierMix);
-      internalScatter += throughput * coupledEntryTrans * segBeer * roomSpark2 * smoothstep(0.12, 0.70, exactExitF2) * 0.18 * bevelLipCoverage * scatterGate;
+      let roomSpark2 = sampleCathedralEnvironment(intRefl2, L, hitSolarIrrad * 0.55, skyTint, atelierMix);
+      let clampedSpark2 = roomSpark2 / (vec3<f32>(1.0) + roomSpark2 * 0.65);
+      internalScatter += throughput * coupledEntryTrans * segBeer * clampedSpark2 * smoothstep(0.22, 0.76, exactExitF2) * 0.08 * isDyed2 * bevelLipCoverage * scatterGate;
     }
 
-    let hitSpec8 = evalSwatchSpectralSigma8(sigmaHit);
+    let hitSpec8 = evalSwatchSpectralSigma8WithDensity(sigmaHit, crystalDensity);
     specTau.lo += hitSpec8.lo * effSegLen;
     specTau.hi += hitSpec8.hi * effSegLen;
     interfaceScalar *= stepInterface;
@@ -828,23 +846,22 @@ fn traceTowerGlassRayDispersed(
     worldRayPos = mulBlockL2WPoint(nearestIdx, localExitPos) + worldRayDir * 0.0025;
     let stepVecG = worldRayPos - prevPosG;
 
+    let exitRatio2 = effExitIor2 / iorG;
     var inR = refract(dirR, entryNWorld, effEntryEtaR);
     inR = select(safeNormalize(inR, insideSecondary), insideSecondary, length(inR) < 1e-4);
-    let effExitIorR2 = select(iorR, select(1.053, iorR, isRefCard), isHorizExit2 > 0.5);
-    var outR = refract(inR, -exitN2World, effExitIorR2);
+    var outR = refract(inR, -exitN2World, iorR * exitRatio2);
     outR = select(safeNormalize(outR, worldRayDir), worldRayDir, length(outR) < 1e-4);
     posR += (dirR - prevDirG) * nearestT + stepVecG + (inR - insideSecondary) * segLen;
     dirR = outR;
 
     var inB = refract(dirB, entryNWorld, effEntryEtaB);
     inB = select(safeNormalize(inB, insideSecondary), insideSecondary, length(inB) < 1e-4);
-    let effExitIorB2 = select(iorB, select(1.058, iorB, isRefCard), isHorizExit2 > 0.5);
-    var outB = refract(inB, -exitN2World, effExitIorB2);
+    var outB = refract(inB, -exitN2World, iorB * exitRatio2);
     outB = select(safeNormalize(outB, worldRayDir), worldRayDir, length(outB) < 1e-4);
     posB += (dirB - prevDirG) * nearestT + stepVecG + (inB - insideSecondary) * segLen;
     dirB = outB;
 
-    rayCoupledHoriz = select(0.0, 1.0, !isRefCard && isHorizExit2 > 0.5 && hasDirect2);
+    prevHorizExitIor = select(iorG, effExitIor2, !isRefCard && isTopToBot2 > 0.5 && hasDirect2);
     lastHitIdx = nearestIdx;
   }
 
@@ -883,7 +900,7 @@ fn traceTowerGlassRayDispersed(
           if (tLeave > tEnter && tLeave > 0.002) {
             let sLen = clamp(tLeave - max(0.0, tEnter), 0.01, 0.30);
             let sSigma = (*pSh).absorption + SODA_LIME_IRON_SIGMA;
-            let shSpec8 = evalSwatchSpectralSigma8(sSigma);
+            let shSpec8 = evalSwatchSpectralSigma8WithDensity(sSigma, crystalDensity);
             specTau.lo += shSpec8.lo * sLen;
             specTau.hi += shSpec8.hi * sLen;
             interfaceScalar *= 0.916;
@@ -901,12 +918,9 @@ fn traceTowerGlassRayDispersed(
   let bgDispersed = sampleRefractedDispersedBackground(posR, dirR, worldRayPos, worldRayDir, posB, dirB);
   let transmittedDispersed = bgDispersed * throughput;
 
-  // Clear cut-crystal primary pane: zero milky front-lit haze so contrasting rear blocks mix spectrally with sharp silhouettes!
-  let primaryRich = sqrt(throughput0) * throughput0;
-  let primMin = min(primaryRich.r, min(primaryRich.g, primaryRich.b));
-  let primPureChroma = max(vec3<f32>(0.0), primaryRich - vec3<f32>(primMin * 0.84));
-  let forwardAlign = pow(max(0.0, dot(incidentDir, L)), 4.0);
-  let glassSunGlow = primPureChroma * transmittedSun * (0.006 + 0.24 * forwardAlign) * scatterGate;
+  // Non-scattering architectural optical crystal (mu_s = 0): zero front-lit haze, only direct backlit solar forward lobe!
+  let forwardAlign = pow(max(0.0, dot(incidentDir, L)), 5.0);
+  let glassSunGlow = throughput * transmittedSun * (0.11 * forwardAlign) * scatterGate;
 
   return transmittedDispersed + glassSunGlow + internalScatter;
 }
@@ -935,7 +949,9 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let macroWorldN = safeNormalize(((*pBlk).localToWorld * vec4<f32>(smoothLocalN, 0.0)).xyz, input.worldNormal);
 
   // Upstream-only colored solar transmittance (replaces opaque binary self-shadow blackout!)
-  let atelierMix = clamp(uScene.tableAoCounts.w, 0.0, 1.0);
+  let rawStudioVal = uScene.tableAoCounts.w;
+  let atelierMix = clamp(rawStudioVal, 0.0, 1.0);
+  let crystalDensity = mix(0.88, 0.66, clamp((rawStudioVal - 1.0) / 0.28, 0.0, 1.0));
   let rawSunVis = sampleSunShadowPCF(uSunDepthTex, uScene.sunViewProj, input.worldPos, macroWorldN, L, 0.022);
   let windowGobo = evaluateStudioWindowGobo(input.worldPos, L, atelierMix);
   let sunDirLocal = ((*pBlk).worldToLocal * vec4<f32>(-L, 0.0)).xyz;
@@ -959,7 +975,8 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let polariscope = uBlockCenters[97].w;
   let polariscopeMod = 1.0 - 0.75 * polariscope;
   let rawSunTrans = mix(exp(-tauUpstream * 0.80), vec3<f32>(1.0), rawSunVis) * windowGobo;
-  let sunTransRGB = (rawSunTrans + causticBounce * windowGobo) * polariscopeMod;
+  let surfaceCaustic = causticBounce * windowGobo;
+  let sunTransRGB = (rawSunTrans + surfaceCaustic) * polariscopeMod;
   let directSunVis = rawSunVis * windowGobo * polariscopeMod;
 
   // Smooth C1 0.68 mm fire-polished bevel mask (1.0 on flat faces, 0.0 across the rounded 0.68 mm edge fillet)
@@ -975,44 +992,65 @@ fn fs_glass_tower(input: TowerVSOut) -> @location(0) vec4<f32> {
   let rippleWorld = ((*pBlk).localToWorld * vec4<f32>(vitrail.rippleGrad * flatFaceMask, 0.0)).xyz;
   let glassNormal = safeNormalize(macroWorldN + rippleWorld, macroWorldN);
 
-  let refractedRGB = traceTowerGlassRayDispersed(input.worldPos, incidentDir, glassNormal, input.blockIdx, vitrail, sunTransRGB);
+  // Stabilize interior refraction normal across the 0.68 mm edge fillet (keeping 100% curved glassNormal for specular!)
+  // so 1-2 px corner bevels refract smoothly into the block volume instead of clipping into dark stair-step slivers!
+  let absLN = abs(smoothLocalN);
+  let domAxisLocalN = select(
+    select(vec3<f32>(0.0, 0.0, sign(smoothLocalN.z)), vec3<f32>(0.0, sign(smoothLocalN.y), 0.0), absLN.y >= absLN.z),
+    vec3<f32>(sign(smoothLocalN.x), 0.0, 0.0),
+    absLN.x >= max(absLN.y, absLN.z)
+  );
+  let domAxisWorldN = safeNormalize(((*pBlk).localToWorld * vec4<f32>(domAxisLocalN, 0.0)).xyz, macroWorldN);
+  let refractEntryN = safeNormalize(mix(domAxisWorldN, glassNormal, 0.32 + 0.68 * flatFaceMask), glassNormal);
 
-  // Exact Maxwell-Fresnel dielectric reflectance + outer reflections evaluated AFTER multi-bounce raytracer
+  let refractedRGB = traceTowerGlassRayDispersed(input.worldPos, incidentDir, refractEntryN, input.blockIdx, vitrail, sunTransRGB);
+
+  // Prevent the 90-deg rounded 0.68 mm edge fillet from acting as a 180-deg cylindrical sky mirror (which catches white
+  // window/sky strips at ALL camera angles and draws permanent white borders around blocks!):
+  // Keep outer specular normal within a subtle ~5 deg edge roll of the flat face normal (except in two-block-cross refCard),
+  // so edges share the adjacent face's calm dark-field reflection and only glint when the face itself catches the light!
+  let isRefCardFrag = uScene.cameraPosAndTime.w < -0.01;
+  let edgeSpecN = select(
+    safeNormalize(mix(domAxisWorldN, glassNormal, 0.10 + 0.90 * flatFaceMask), domAxisWorldN),
+    glassNormal,
+    isRefCardFrag
+  );
+
   let sunColor = uScene.sunColorAndAspect.xyz;
   let skyTint = uScene.skyTintAndMode.xyz;
-  let cosTheta = clamp(dot(glassNormal, V), 0.0, 1.0);
+  let cosTheta = clamp(dot(edgeSpecN, V), 0.0, 1.0);
   let fresnel = dielectricFresnel(cosTheta, 1.0, GLASS_IOR_G);
 
-  let reflDir = reflect(incidentDir, glassNormal);
+  let reflDir = reflect(incidentDir, edgeSpecN);
   let reflSunColor = sunColor * mix(0.20 + 0.80 * sunTransRGB, vec3<f32>(1.0), directSunVis);
   var envReflection = sampleCathedralEnvironment(reflDir, L, reflSunColor, skyTint, atelierMix);
-  // Soft-compress reflection luminance on flat primary faces so grazing top/front panes never white-out (#FFFFFF)
-  // over the blocks below, while keeping full crisp HDR specular hairlines along the 0.68 mm polished bevel rim!
-  let flatGlareCompress = envReflection / (vec3<f32>(1.0) + envReflection * 0.62);
-  envReflection = mix(envReflection, flatGlareCompress, flatFaceMask);
+  let flatGlareCompress = envReflection / (vec3<f32>(1.0) + envReflection * 0.28);
+  envReflection = select(flatGlareCompress, envReflection, isRefCardFrag);
 
-  // Occlude overhead studio skylight inside buried horizontal course-to-course V-groove chamfers:
-  // Only the top-most uncovered course (y near uBlockCenters[97].y) sees unobstructed zenith sky; interior
-  // horizontal chamfers sit directly against the neighboring glass course, eliminating stark white fluorescent seam bars!
   let towerTopY = uBlockCenters[97].y;
-  let isHorizBevel = (1.0 - flatFaceMask) * smoothstep(0.35, 0.68, abs(macroWorldN.y));
+  let isHorizBevel = (1.0 - flatFaceMask) * smoothstep(0.32, 0.68, abs(macroWorldN.y));
   let isCoveredCourse = 1.0 - smoothstep(towerTopY - 0.14, towerTopY - 0.02, input.worldPos.y);
-  let seamSkyOcc = isHorizBevel * isCoveredCourse * smoothstep(-0.05, 0.65, abs(reflDir.y));
-  let bodySwatchTint = exp(-sigmaSelf * 0.14);
-  envReflection *= mix(vec3<f32>(1.0), mix(vec3<f32>(0.18), bodySwatchTint * 0.42, 0.65), seamSkyOcc * (1.0 - directSunVis * 0.65));
+  let seamSkyOcc = isHorizBevel * isCoveredCourse;
+  let selfSpec8 = evalSwatchSpectralSigma8WithDensity(sigmaSelf, crystalDensity);
+  var selfTintTau: SpectralTau8;
+  selfTintTau.lo = selfSpec8.lo * 0.32;
+  selfTintTau.hi = selfSpec8.hi * 0.32;
+  let bodySwatchTint = integrateSpectralTau8ToRGB(selfTintTau);
+  envReflection *= mix(vec3<f32>(1.0), bodySwatchTint * 0.20, seamSkyOcc * (1.0 - directSunVis * 0.50));
 
-  let glassRoughness = mix(0.032, 0.055, flatFaceMask);
+  let glassRoughness = 0.020;
   let sunMicroSpec = min(
-    evalGGXSpecular(glassNormal, V, L, glassRoughness) * fresnel,
-    1.15
-  ) * sunColor * mix(sunTransRGB * 0.35, vec3<f32>(1.0), directSunVis) * (1.0 - seamSkyOcc * 0.72) * 0.65;
+    evalGGXSpecular(edgeSpecN, V, L, glassRoughness) * fresnel,
+    0.95
+  ) * sunColor * mix(sunTransRGB * 0.25, vec3<f32>(1.0), directSunVis) * (1.0 - seamSkyOcc * 0.85) * mix(0.30, 0.65, flatFaceMask);
 
-  // Preserve exact dielectric Fresnel up to 70 deg incidence (fresnel <= 0.32), and body-tint extreme grazing reflections
-  let untintedF = min(fresnel, 0.32);
-  let grazingExcess = max(0.0, fresnel - 0.32);
-  let reflContrib = envReflection * (vec3<f32>(untintedF) + bodySwatchTint * (grazingExcess * 0.68));
+  let effTransFresnel = select(mix(min(fresnel, 0.12), fresnel, flatFaceMask), fresnel, isRefCardFrag);
+  let maxUntintedF = select(mix(0.025, 0.20, flatFaceMask), 0.32, isRefCardFrag);
+  let untintedF = min(fresnel, maxUntintedF);
+  let grazingExcess = max(0.0, fresnel - untintedF) * mix(0.24, 0.65, flatFaceMask);
+  let reflContrib = envReflection * (vec3<f32>(untintedF) + bodySwatchTint * grazingExcess);
 
-  var finalRGB = refractedRGB * (1.0 - fresnel) + reflContrib + sunMicroSpec + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCaustic + _keepCenters);
+  var finalRGB = refractedRGB * (1.0 - effTransFresnel) + reflContrib + sunMicroSpec + vec3<f32>(_keepDepth + _keepShards + _keepOpt + _keepCaustic + _keepCenters);
 
   // Recessed 60/40 tin-lead / copper-foil came conductor shading + patinated flux seam darkening when motifId > 0
   if (vitrail.cameMask > 0.001) {

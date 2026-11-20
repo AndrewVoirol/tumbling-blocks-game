@@ -9,7 +9,6 @@ import { GameMode } from './physics/PhysicsWorld';
 import { isValidRoomCode, normalizeRoomCode } from './multiplayer';
 import {
   AcousticCrystalSvg,
-  ClerestoryPaneMosaicSvg,
   CodexStepMedallionSvg,
   EtchedCloseSvg,
   EtchedCrystalCompassSvg,
@@ -73,12 +72,15 @@ function useMobilePlinthActive(): boolean {
 
 const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#f59e0b', '#10b981'];
 
-const LIGHT_LABELS: Record<string, string> = {
-  'lancet-morning': 'Morning',
-  'daylight-atelier': 'Atelier',
-  'high-clerestory': 'Noon',
-  'golden-vespers': 'Vespers',
-};
+function getInitialLightingPresetId(): string {
+  if (typeof window !== 'undefined') {
+    const req = new URLSearchParams(window.location.search).get('light');
+    if (req && LIGHTING_PRESETS.some((p) => p.id === req)) {
+      return req;
+    }
+  }
+  return LIGHTING_PRESETS[0].id;
+}
 
 export type QuarryGlassTone =
   | 'opal'
@@ -334,7 +336,7 @@ export const App: React.FC = () => {
 
   const [telemetry, setTelemetry] = useState<VitrailHudTelemetry>(INITIAL_TELEMETRY);
   const [muted, setMuted] = useState<boolean>(false);
-  const [lightPreset, setLightPreset] = useState<string>(LIGHTING_PRESETS[0].id);
+  const [lightPreset, setLightPreset] = useState<string>(getInitialLightingPresetId);
   const [showHelp, setShowHelp] = useState<boolean>(false);
   const [mobileOverlayOpen, setMobileOverlayOpen] = useState<boolean>(false);
   const [gpuError, setGpuError] = useState<string | null>(null);
@@ -370,11 +372,28 @@ export const App: React.FC = () => {
     });
     engineRef.current = engine;
 
-    engine.init().catch((err: unknown) => {
-      if (!cancelled) {
-        setGpuError(err instanceof Error ? err.message : String(err));
-      }
-    });
+    engine
+      .init()
+      .then(() => {
+        if (!cancelled) {
+          engine.setLightingPreset(getInitialLightingPresetId());
+          const studioParam = new URLSearchParams(window.location.search).get('studio')?.toLowerCase();
+          if (engine.renderer && studioParam) {
+            if (studioParam === 'a') {
+              engine.renderer.lightingOverride = { atelierMix: 0.48 };
+            } else if (studioParam === 'b') {
+              engine.renderer.lightingOverride = { atelierMix: 1.0 };
+            } else if (studioParam === 'c') {
+              engine.renderer.lightingOverride = { atelierMix: 1.28 };
+            }
+          }
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setGpuError(err instanceof Error ? err.message : String(err));
+        }
+      });
 
     return () => {
       cancelled = true;
@@ -886,35 +905,6 @@ export const App: React.FC = () => {
 
             {/* 2. Leaded Window Body */}
             <div className="lancet-sash-body">
-              {/* Clerestory Sky Panes: Click sky glass directly to shift studio sunlight */}
-              <div
-                className="lancet-course sky-course"
-                role="radiogroup"
-                aria-label="Cathedral Window Sunlight"
-              >
-                {LIGHTING_PRESETS.map((p) => {
-                  const isSelected = lightPreset === p.id;
-                  return (
-                    <QuarryButton
-                      key={p.id}
-                      role="radio"
-                      aria-checked={isSelected}
-                      tone="crystal"
-                      active={isSelected}
-                      soundTone="tab"
-                      onAudioDown={playUiDown}
-                      onAudioUp={playUiUp}
-                      inlayArt={<ClerestoryPaneMosaicSvg presetId={p.id} active={isSelected} />}
-                      className="sky-lancet-pane"
-                      onClick={() => handleSelectLighting(p.id)}
-                      title={`Window Light: ${p.name}`}
-                    >
-                      <span className="sky-pane-label">{LIGHT_LABELS[p.id] ?? p.name}</span>
-                    </QuarryButton>
-                  );
-                })}
-              </div>
-
               {/* Frosted Milk-Opal Cartouche + Wright Margin-Light Inlays */}
               <div className="lancet-course cartouche-course">
                 <div className="margin-inlay-cell" aria-hidden="true">

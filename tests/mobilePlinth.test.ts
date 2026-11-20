@@ -1491,10 +1491,8 @@ describe('Cathedral Plinth Mobile HUD & E1–E8 Contracts', () => {
           }));
         }));
       })`);
-      expect(lightingAndClose.halfGemColors).toHaveLength(4);
-      expect(new Set(lightingAndClose.halfGemColors).size).toBe(4);
-      expect(lightingAndClose.fullGemColors).toHaveLength(4);
-      expect(new Set(lightingAndClose.fullGemColors).size).toBe(4);
+      expect(lightingAndClose.halfGemColors).toHaveLength(0);
+      expect(lightingAndClose.fullGemColors).toHaveLength(0);
       expect(lightingAndClose.halfCloseHasCrystalTone).toBe(true);
       expect(lightingAndClose.fullCloseHasCrystalTone).toBe(true);
       expect(lightingAndClose.hasInvalidBtnClass).toBe(false);

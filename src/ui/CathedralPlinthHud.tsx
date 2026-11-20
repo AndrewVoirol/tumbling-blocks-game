@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import './cathedralPlinth.css';
-import { INITIAL_LAYERS, LIGHTING_PRESETS, STAINED_GLASS_PALETTE } from '../physics/constants';
+import { INITIAL_LAYERS, STAINED_GLASS_PALETTE } from '../physics/constants';
 import { isValidRoomCode, normalizeRoomCode } from '../multiplayer';
 import type { GameMode } from '../physics/PhysicsWorld';
 import type { AiDifficulty, VitrailHudTelemetry } from '../engine/GameEngine';
@@ -84,21 +84,6 @@ const SUPPRESSED_INSPECT_PHASES = new Set([
   'EXTRACTED',
   'COLLAPSED',
 ]);
-
-function getLightPresetGemHex(presetId: string): string {
-  switch (presetId) {
-    case 'lancet-morning':
-      return '#60a5fa';
-    case 'daylight-atelier':
-      return '#f6e3a1';
-    case 'high-clerestory':
-      return '#2dd4bf';
-    case 'golden-vespers':
-      return '#f97316';
-    default:
-      return '#a8c8ff';
-  }
-}
 
 function getTouchInspectStatusLabel(status: TouchInspectStatus): string {
   switch (status) {
@@ -667,30 +652,7 @@ export const StudioControlsContent: React.FC<{
       )}
 
       <section className="atelier-section" aria-label="Lighting and Optics">
-        <div className="atelier-section-title">Cathedral Light &amp; Optics</div>
-        <div className="atelier-btn-grid">
-          {LIGHTING_PRESETS.map((preset) => {
-            const gemHex = getLightPresetGemHex(preset.id);
-            return (
-              <QuarryButton
-                key={preset.id}
-                tone="crystal"
-                active={p.lightPreset === preset.id}
-                soundTone="tab"
-                onAudioDown={p.playUiDown}
-                onAudioUp={p.playUiUp}
-                onClick={() => p.onSelectLightPreset(preset.id)}
-              >
-                <span
-                  className="inlaid-gem"
-                  aria-hidden="true"
-                  style={{ backgroundColor: gemHex, boxShadow: `0 0 6px ${gemHex}` }}
-                />
-                <span>{preset.name}</span>
-              </QuarryButton>
-            );
-          })}
-        </div>
+        <div className="atelier-section-title">Optics &amp; Acoustics</div>
         <div className="atelier-row-actions">
           <QuarryButton
             tone={telemetry.polariscopeMode ? 'teal' : 'crystal'}
@@ -1509,32 +1471,6 @@ export const CathedralPlinthHud: React.FC<CathedralPlinthHudProps> = (p) => {
                       >
                         Sandbox
                       </QuarryButton>
-                    </div>
-
-                    <div className="half-section-label">Cathedral Window Light</div>
-                    <div className="half-light-grid">
-                      {LIGHTING_PRESETS.map((preset) => {
-                        const gemHex = getLightPresetGemHex(preset.id);
-                        return (
-                          <QuarryButton
-                            key={preset.id}
-                            tone="crystal"
-                            active={p.lightPreset === preset.id}
-                            soundTone="tab"
-                            onAudioDown={p.playUiDown}
-                            onAudioUp={p.playUiUp}
-                            className="half-light-btn"
-                            onClick={() => p.onSelectLightPreset(preset.id)}
-                          >
-                            <span
-                              className="inlaid-gem"
-                              aria-hidden="true"
-                              style={{ backgroundColor: gemHex, boxShadow: `0 0 6px ${gemHex}` }}
-                            />
-                            <span>{preset.name}</span>
-                          </QuarryButton>
-                        );
-                      })}
                     </div>
 
                     <div className="half-utility-row">

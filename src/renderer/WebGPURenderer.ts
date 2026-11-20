@@ -1567,10 +1567,11 @@ export class WebGPURenderer {
       this.sceneUniformData[66] = aoMaxX;
       this.sceneUniformData[67] = aoMaxZ;
     }
+    const effAtelierMix = this.lightingOverride?.atelierMix ?? this.lightingPreset.atelierMix ?? 0;
     this.sceneUniformData[68] = intactCount;
     this.sceneUniformData[69] = shardStride;
     this.sceneUniformData[70] = maxBlockHalfY;
-    this.sceneUniformData[71] = this.lightingPreset.atelierMix ?? 0;
+    this.sceneUniformData[71] = effAtelierMix;
 
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, this.sceneUniformData.buffer);
 
@@ -1585,8 +1586,8 @@ export class WebGPURenderer {
     let presetExposure = 1.26;
     if (this.polariscopeMode) {
       presetExposure = 1.32;
-    } else if (this.lightingPreset.id === 'daylight-atelier') {
-      presetExposure = 1.16;
+    } else if (effAtelierMix >= 0.85) {
+      presetExposure = 1.18;
     } else if (this.lightingPreset.id === 'high-clerestory') {
       presetExposure = 1.32;
     } else if (this.lightingPreset.id === 'golden-vespers') {

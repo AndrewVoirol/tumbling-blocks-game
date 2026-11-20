@@ -99,37 +99,37 @@ export const STAINED_GLASS_PALETTE: StainedGlassSwatch[] = [
   {
     id: 3,
     name: 'Cathedral Emerald',
-    absorption: [7.4, 0.34, 5.4],
-    accentAbsorption: [5.6, 0.52, 3.1], // Bottle-green tourmaline
+    absorption: [7.2, 0.48, 5.1],
+    accentAbsorption: [5.8, 0.72, 3.6], // Deep bottle-green tourmaline
     uiHex: '#15803d',
   },
   {
     id: 4,
     name: 'Manganese Amethyst',
-    absorption: [3.1, 8.8, 1.15],
-    accentAbsorption: [1.8, 7.6, 2.5], // Smoked plum-violet
+    absorption: [3.3, 8.2, 1.35],
+    accentAbsorption: [2.2, 7.2, 2.4], // Deep royal plum-amethyst
     uiHex: '#7e22ce',
   },
   {
     id: 5,
     name: 'Peacock Teal',
-    absorption: [8.4, 1.45, 1.65],
-    accentAbsorption: [6.8, 2.5, 1.05], // Deep Venetian sea-glass
+    absorption: [8.0, 1.38, 1.68],
+    accentAbsorption: [6.6, 2.15, 1.25], // Deep Venetian petrol sea-glass
     uiHex: '#0f766e',
   },
   {
     id: 6,
     name: 'Gold-Ruby Rose',
-    absorption: [0.52, 7.8, 5.6],
-    accentAbsorption: [0.42, 4.2, 8.2], // Deep cranberry-bordeaux (no neon hot-pink)
+    absorption: [0.68, 7.6, 5.4],
+    accentAbsorption: [0.56, 4.8, 7.6], // Deep cranberry-bordeaux
     uiHex: '#be185d',
   },
   {
     id: 7,
     name: 'Antique Seeded Crystal',
     // High-iron soda-lime architectural glass: water-clear on 1.5 cm faces, subtle sea-green along 7.5 cm edges!
-    absorption: [0.58, 0.20, 0.38],
-    accentAbsorption: [0.42, 0.88, 2.6], // Pale smoked champagne accent
+    absorption: [0.62, 0.19, 0.39],
+    accentAbsorption: [0.50, 0.28, 0.54], // Clear flint crystal with sea-green iron edge
     uiHex: '#cfe5de',
   },
 ];
@@ -153,12 +153,12 @@ export interface LightingPreset {
 export const LIGHTING_PRESETS: LightingPreset[] = [
   {
     id: 'lancet-morning',
-    name: 'Morning Lancet',
-    sunAzimuthDeg: -42,
-    sunElevationDeg: 38,
-    sunColor: [3.4, 3.05, 2.55],
-    skyTint: [0.44, 0.54, 0.72],
-    atelierMix: 0,
+    name: 'Studio Daylight',
+    sunAzimuthDeg: -38,
+    sunElevationDeg: 39,
+    sunColor: [3.35, 3.20, 2.96],
+    skyTint: [0.58, 0.66, 0.78],
+    atelierMix: 1,
   },
   {
     id: 'daylight-atelier',

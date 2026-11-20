@@ -407,6 +407,8 @@ export class MujocoPhysicsEngine {
   private unloadedBounceLastSimTime: Float64Array = new Float64Array(128).fill(-10);
   private unloadedBounceHopCount: Uint8Array = new Uint8Array(128);
   private unloadedBouncePeakVClose: Float64Array = new Float64Array(128);
+  private unloadedBouncePendingVClose: Float64Array = new Float64Array(128);
+  private unloadedBouncePendingOnsetTime: Float64Array = new Float64Array(128).fill(-10);
   private blockPreSubstepLinSpeedSi: Float64Array = new Float64Array(128);
   private blockPreSubstepAngSpeedSi: Float64Array = new Float64Array(128);
   private towerRebuildSimTime: number = 0;
@@ -1033,6 +1035,8 @@ export class MujocoPhysicsEngine {
       this.unloadedBounceLastSimTime = new Float64Array(blockCap);
       this.unloadedBounceHopCount = new Uint8Array(blockCap);
       this.unloadedBouncePeakVClose = new Float64Array(blockCap);
+      this.unloadedBouncePendingVClose = new Float64Array(blockCap);
+      this.unloadedBouncePendingOnsetTime = new Float64Array(blockCap);
     }
     if (this.blockPreSubstepLinSpeedSi.length < blockCap) {
       this.blockPreSubstepLinSpeedSi = new Float64Array(blockCap);
@@ -1041,6 +1045,8 @@ export class MujocoPhysicsEngine {
     this.unloadedBounceLastSimTime.fill(-10);
     this.unloadedBounceHopCount.fill(0);
     this.unloadedBouncePeakVClose.fill(0);
+    this.unloadedBouncePendingVClose.fill(0);
+    this.unloadedBouncePendingOnsetTime.fill(-10);
     this.blockPreSubstepLinSpeedSi.fill(0);
     this.blockPreSubstepAngSpeedSi.fill(0);
     this.blockRockTransferCount.fill(0);
@@ -4795,30 +4801,55 @@ export class MujocoPhysicsEngine {
         isFreeRockingBodyForBlock ||
         (blk.id < this.blockLastRockTime.length &&
           this.simTime - this.blockLastRockTime[blk.id] < 0.28);
-      const maxElasticBounceSpeed =
-        CRAZE_IMPACT_SPEED * 0.85 * (1.0 - 0.36 * Math.min(0.95, blk.damage));
+      const inActiveTowerCollapse =
+        (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED') &&
+        !this.hadFullSleepAfterCollapse;
+      const isElevatedTowerCourse =
+        !acc.bestRawHitTable && blk.position[1] > BLOCK_HEIGHT * 2.5;
+      const useTurnaroundBounce =
+        !inActiveTowerCollapse &&
+        !isElevatedTowerCourse &&
+        !(inPostRebuildCreepWindow && !acc.bestRawHitTable);
+      // Cover all non-shattering & copper-foil-tethered tabletop drops (0.3 cm up to ~12.5 cm) and free tabletop
+      // block-on-block strikes via Kelvin-Voigt turnaround restitution (`vPtPostMps >= -0.04 m/s`), while keeping
+      // elevated standing tower courses & active collapses on the pre-craze Substep-1 contact profile.
+      const maxElasticBounceSpeed = useTurnaroundBounce
+        ? 16.2
+        : CRAZE_IMPACT_SPEED * 0.85 * (1.0 - 0.36 * Math.min(0.95, blk.damage));
       let hasOverheadBlock = false;
+      const isLateralBlockStrike =
+        useTurnaroundBounce &&
+        !inInitialTowerSpawnSettle &&
+        !acc.bestRawHitTable &&
+        acc.contacts.length > 0 &&
+        acc.maxRawVCloseReal >= 1.2 &&
+        acc.hasRawSeparatedOnset;
       const mayBeUnloadedCandidate =
         !blk.shattered &&
         !blk.extracted &&
         blk.id !== this.activeBlockId &&
         !inRockingGuard &&
-        acc.upwardSupportFn > 0.02 &&
+        (acc.upwardSupportFn > 0.02 || isLateralBlockStrike) &&
         clampLoadN < 0.45 &&
         acc.downwardTopFn < 0.28 &&
-        acc.distinctContactBodies <= 3;
+        acc.distinctContactBodies <= (useTurnaroundBounce ? 4 : 3);
       if (mayBeUnloadedCandidate) {
         const bx = blk.position[0];
         const by = blk.position[1];
         const bz = blk.position[2];
         for (let k = 0; k < this.blocks.length; k++) {
           const ob = this.blocks[k];
+          // Suppress bounce when another block is directly resting on OR co-falling as an upper column on `blk`
+          // (`|ob.vy - blk.vy| < 0.95`), while still allowing bounce when a stray block is far overhead in mid-air!
           if (
             ob.id !== blk.id &&
             !ob.shattered &&
             !ob.extracted &&
             ob.id !== this.activeBlockId &&
             ob.position[1] > by + BLOCK_HEIGHT * 0.55 &&
+            (!useTurnaroundBounce ||
+              (ob.position[1] < by + BLOCK_HEIGHT * 1.32 &&
+                Math.abs(ob.linVel[1] - blk.linVel[1]) < 0.95)) &&
             Math.abs(ob.position[0] - bx) < BLOCK_LENGTH * 0.85 &&
             Math.abs(ob.position[2] - bz) < BLOCK_LENGTH * 0.85
           ) {
@@ -4830,7 +4861,7 @@ export class MujocoPhysicsEngine {
       const isUnloadedCandidate = mayBeUnloadedCandidate && !hasOverheadBlock;
 
       if (this.fidelity.elasticUnloadedGlassBounce && isUnloadedCandidate) {
-        const vCloseReal = acc.maxRawVCloseReal;
+        const rawVCloseNow = acc.maxRawVCloseReal;
         const lastBounceT =
           blk.id < this.unloadedBounceLastSimTime.length
             ? this.unloadedBounceLastSimTime[blk.id]
@@ -4841,16 +4872,56 @@ export class MujocoPhysicsEngine {
         }
         const hop =
           blk.id < this.unloadedBounceHopCount.length ? this.unloadedBounceHopCount[blk.id] : 0;
-        const hasDownwardPreVel = blk.linVel[1] < -0.04;
+        const hasApproachPreVel =
+          blk.linVel[1] < -0.04 ||
+          (isLateralBlockStrike && Math.hypot(blk.linVel[0], blk.linVel[1], blk.linVel[2]) > 0.08);
+
+        const inPostShatterRubbleSettle =
+          (this.sandboxCollapseActive || this.turnPhase === 'COLLAPSED') &&
+          this.shatteredCount > 0;
+        if (useTurnaroundBounce) {
+          const minOnsetVClose = inPostShatterRubbleSettle && hop === 0 ? 1.45 : 0.32;
+          if (
+            blk.id < this.unloadedBouncePendingVClose.length &&
+            rawVCloseNow >= minOnsetVClose &&
+            rawVCloseNow < maxElasticBounceSpeed &&
+            !(inPostRebuildCreepWindow && rawVCloseNow < 0.65) &&
+            this.simTime - lastBounceT >= 0.012 &&
+            (acc.hasRawSeparatedOnset || (hop === 0 && hasApproachPreVel && rawVCloseNow >= 0.95)) &&
+            (hop > 0 || hasApproachPreVel || rawVCloseNow >= 0.95)
+          ) {
+            if (
+              this.simTime - this.unloadedBouncePendingOnsetTime[blk.id] > 0.032 ||
+              rawVCloseNow > this.unloadedBouncePendingVClose[blk.id]
+            ) {
+              this.unloadedBouncePendingVClose[blk.id] = rawVCloseNow;
+            }
+            if (this.simTime - this.unloadedBouncePendingOnsetTime[blk.id] > 0.032) {
+              this.unloadedBouncePendingOnsetTime[blk.id] = this.simTime;
+            }
+          }
+        }
+
+        const hasPendingOnset =
+          useTurnaroundBounce &&
+          blk.id < this.unloadedBouncePendingVClose.length &&
+          this.unloadedBouncePendingVClose[blk.id] >= 0.28 &&
+          this.simTime - this.unloadedBouncePendingOnsetTime[blk.id] <= 0.030;
+        const hasLegacyDirectOnset =
+          !useTurnaroundBounce &&
+          rawVCloseNow >= 0.28 &&
+          !(inPostRebuildCreepWindow && rawVCloseNow < 0.65) &&
+          (acc.hasRawSeparatedOnset || (hop === 0 && hasApproachPreVel && rawVCloseNow >= 0.95)) &&
+          (hop > 0 || hasApproachPreVel || rawVCloseNow >= 0.95);
+        const vCloseReal = hasPendingOnset
+          ? Math.max(rawVCloseNow, this.unloadedBouncePendingVClose[blk.id])
+          : rawVCloseNow;
 
         if (
-          vCloseReal >= 0.28 &&
+          (hasPendingOnset || hasLegacyDirectOnset) &&
           vCloseReal < maxElasticBounceSpeed &&
-          !(inPostRebuildCreepWindow && vCloseReal < 0.65) &&
-          hop < 5 &&
-          this.simTime - lastBounceT >= 0.012 &&
-          (acc.hasRawSeparatedOnset || (hop === 0 && hasDownwardPreVel && vCloseReal >= 0.95)) &&
-          (hop > 0 || hasDownwardPreVel || vCloseReal >= 0.95)
+          hop < (useTurnaroundBounce ? 6 : 5) &&
+          this.simTime - lastBounceT >= 0.012
         ) {
           if (hop === 0 && blk.id < this.unloadedBouncePeakVClose.length) {
             this.unloadedBouncePeakVClose[blk.id] = vCloseReal;
@@ -4861,10 +4932,12 @@ export class MujocoPhysicsEngine {
               ? this.unloadedBouncePeakVClose[blk.id]
               : vCloseReal;
           const effVCloseReal =
-            hop === 0 ? vCloseReal : Math.min(vCloseReal, peakV0 * Math.pow(0.72, hop));
+            hop === 0
+              ? vCloseReal
+              : Math.min(vCloseReal, peakV0 * Math.pow(useTurnaroundBounce ? 0.74 : 0.72, hop));
           const effVCloseMps = effVCloseReal * M_PER_DM;
 
-          // Force-weighted center of pressure across upward support contacts (handles 2-3 cross-course blocks levelly)
+          // Force-weighted 3D collision center-of-pressure across upward OR lateral/oblique contacts!
           let supW = 0;
           let wpX = 0, wpY = 0, wpZ = 0;
           let lhX = 0, lhY = 0, lhZ = 0;
@@ -4872,7 +4945,7 @@ export class MujocoPhysicsEngine {
           let supTableWeight = 0;
           for (let ci = 0; ci < acc.contacts.length; ci++) {
             const c = acc.contacts[ci];
-            if (c.nAtoB[1] < -0.55 && c.fnN > 0.002) {
+            if ((c.nAtoB[1] < -0.55 || (!c.hitTable && isLateralBlockStrike)) && c.fnN > 0.002) {
               const w = c.fnN;
               supW += w;
               wpX += c.worldPtDm[0] * w;
@@ -4905,7 +4978,17 @@ export class MujocoPhysicsEngine {
 
           const uTaper = Math.max(0, Math.min(1, (effVCloseReal - 0.28) / 0.72));
           const smoothTaper = uTaper * uTaper * (3 - 2 * uTaper);
-          const e0 = copHitTable ? 0.36 : 0.50;
+          const crazeLossFrac = useTurnaroundBounce
+            ? Math.max(
+                0,
+                Math.min(
+                  1,
+                  (effVCloseReal - CRAZE_IMPACT_SPEED) /
+                    Math.max(1.0, SHATTER_IMPACT_SPEED - CRAZE_IMPACT_SPEED)
+                )
+              )
+            : 0.0;
+          const e0 = (copHitTable ? 0.36 : 0.50) * (1.0 - 0.26 * crazeLossFrac);
           const eEff = e0 * Math.pow(0.84, hop) * smoothTaper;
 
           const rb = this.worldCompat.getRigidBody(blk.bodyHandle);
@@ -4931,8 +5014,12 @@ export class MujocoPhysicsEngine {
             const vPostPtZ =
               qvel[dof + 2] + (wWorldSi[0] * rWorldM[1] - wWorldSi[1] * rWorldM[0]);
             let vOtherPostAlongN = 0;
-            if (acc.bestRawOtherBodyId >= 2) {
-              const oInfo = this.worldCompat.getMapping(acc.bestRawOtherBodyId);
+            let invMassEffB = 0;
+            let otherRb: ReturnType<typeof this.worldCompat.getRigidBody> | null = null;
+            let otherInfo: ReturnType<typeof this.worldCompat.getMapping> | undefined;
+            const otherBodyId = acc.bestRawOtherBodyId;
+            if (otherBodyId >= 2) {
+              const oInfo = this.worldCompat.getMapping(otherBodyId);
               if (oInfo && oInfo.enabled) {
                 const oAdr = oInfo.qposAdr;
                 const oDof = oInfo.dofAdr;
@@ -4956,13 +5043,55 @@ export class MujocoPhysicsEngine {
                 const ovY = qvel[oDof + 1] + (oWWorld[2] * orM[0] - oWWorld[0] * orM[2]);
                 const ovZ = qvel[oDof + 2] + (oWWorld[0] * orM[1] - oWWorld[1] * orM[0]);
                 vOtherPostAlongN = ovX * nUp[0] + ovY * nUp[1] + ovZ * nUp[2];
+
+                // Symmetric Newton's 3rd Law + Euler angular impulse coupling when striking a free unclamped block!
+                const candOtherBlk =
+                  otherBodyId < this.bodyIdToBlock.length ? this.bodyIdToBlock[otherBodyId] : undefined;
+                const otherClampN =
+                  candOtherBlk && candOtherBlk.id < this.cachedClampingLoadN.length
+                    ? this.cachedClampingLoadN[candOtherBlk.id]
+                    : 99.0;
+                if (
+                  useTurnaroundBounce &&
+                  candOtherBlk &&
+                  !candOtherBlk.shattered &&
+                  !candOtherBlk.extracted &&
+                  candOtherBlk.id !== this.activeBlockId &&
+                  otherClampN < 0.65 &&
+                  (nUp[1] < 0.82 || oAdr >= 0 && qpos[oAdr + 1] > BLOCK_HALF_Y * M_PER_DM + 0.004)
+                ) {
+                  const mB = Math.max(0.01, m.body_mass[otherBodyId]);
+                  const ob3 = otherBodyId * 3;
+                  const ibx = Math.max(1e-7, m.body_inertia[ob3 + 0]);
+                  const iby = Math.max(1e-7, m.body_inertia[ob3 + 1]);
+                  const ibz = Math.max(1e-7, m.body_inertia[ob3 + 2]);
+                  const orLocalM = quatInverseRotateVec3(oQuat, orM);
+                  const onLocal = quatInverseRotateVec3(oQuat, nUp);
+                  const brcx = orLocalM[1] * onLocal[2] - orLocalM[2] * onLocal[1];
+                  const brcy = orLocalM[2] * onLocal[0] - orLocalM[0] * onLocal[2];
+                  const brcz = orLocalM[0] * onLocal[1] - orLocalM[1] * onLocal[0];
+                  invMassEffB = 1.0 / mB + (brcx * brcx) / ibx + (brcy * brcy) / iby + (brcz * brcz) / ibz;
+                  otherRb = this.worldCompat.getRigidBody(otherBodyId);
+                  otherInfo = oInfo;
+                }
               }
             }
             const vPtPostMps =
               vPostPtX * nUp[0] + vPostPtY * nUp[1] + vPostPtZ * nUp[2] - vOtherPostAlongN;
             const vTargetOutMps = eEff * effVCloseMps;
 
-            if (vTargetOutMps > 0.012 && vPtPostMps < vTargetOutMps) {
+            // Fire restitution right at Kelvin-Voigt compression turnaround (vPtPostMps >= -0.04 m/s), after peak
+            // contact force has developed AND after inward penetration has stopped so zero rebound is lost to damping!
+            const readyAtTurnaround =
+              !useTurnaroundBounce ||
+              effVCloseReal < 5.0 ||
+              isLateralBlockStrike ||
+              vPtPostMps >= -0.04;
+            if (readyAtTurnaround && vTargetOutMps > 0.012 && vPtPostMps < vTargetOutMps) {
+              if (blk.id < this.unloadedBouncePendingVClose.length) {
+                this.unloadedBouncePendingVClose[blk.id] = 0;
+                this.unloadedBouncePendingOnsetTime[blk.id] = -10;
+              }
               const mA = Math.max(0.01, m.body_mass[blk.bodyHandle]);
               const bid3 = blk.bodyHandle * 3;
               const ix = Math.max(1e-7, m.body_inertia[bid3 + 0]);
@@ -4980,13 +5109,22 @@ export class MujocoPhysicsEngine {
               const invMassEffA = 1.0 / mA + (rcx * rcx) / ix + (rcy * rcy) / iy + (rcz * rcz) / iz;
 
               const dvMps = Math.max(0, vTargetOutMps - Math.max(-effVCloseMps, vPtPostMps));
-              const jSi = dvMps / invMassEffA;
+              const jSi = dvMps / (invMassEffA + invMassEffB);
               const jSim = jSi * FROUDE_VEL_SCALE;
               rb.applyImpulseAtPoint(
                 { x: nUp[0] * jSim, y: nUp[1] * jSim, z: nUp[2] * jSim },
                 { x: copWorldDm[0], y: copWorldDm[1], z: copWorldDm[2] },
                 true
               );
+              if (otherRb && otherInfo && invMassEffB > 0) {
+                otherRb.applyImpulseAtPoint(
+                  { x: -nUp[0] * jSim, y: -nUp[1] * jSim, z: -nUp[2] * jSim },
+                  { x: copWorldDm[0], y: copWorldDm[1], z: copWorldDm[2] },
+                  true
+                );
+                otherInfo.quietTicks = 0;
+                otherInfo.settledAsleep = false;
+              }
               this.didUnloadedBounceThisSubstep = true;
               info.quietTicks = 0;
               info.settledAsleep = false;
@@ -5111,8 +5249,15 @@ export class MujocoPhysicsEngine {
       const lastCrazeSec = this.blockLastCrazeArr[blk.id];
       const dtSinceCraze = this.simTime - lastCrazeSec;
       const inSameSlapWindow = dtSinceCraze < 0.24;
+      const isOwnReboundSettleHop =
+        !this.sandboxCollapseActive &&
+        this.turnPhase !== 'COLLAPSED' &&
+        blk.id < this.unloadedBounceHopCount.length &&
+        this.unloadedBounceHopCount[blk.id] > 0 &&
+        this.simTime - this.unloadedBounceLastSimTime[blk.id] < 0.35 &&
+        acc.maxVCloseReal < 6.8;
       const cascadeGraceWeight =
-        inSameSlapWindow
+        inSameSlapWindow || isOwnReboundSettleHop
           ? 0.0
           : (this.turnPhase === 'COLLAPSED' || this.sandboxCollapseActive) && dtSinceCraze < 4.0
             ? 0.08
@@ -5231,7 +5376,7 @@ export class MujocoPhysicsEngine {
         blk.prePos[2] + rWorld[2],
       ];
 
-      const inSameContactSlap = dtSinceCraze < 0.025;
+      const inSameContactSlap = dtSinceCraze < 0.025 || isOwnReboundSettleHop;
       const isCleaved = blk.damage >= 0.78;
       const priorDamageForTear = inSameContactSlap
         ? 0.0
@@ -5266,7 +5411,10 @@ export class MujocoPhysicsEngine {
         this.turnPhase !== 'COLLAPSED'
           ? Math.max(0.42, 0.80 - 0.42 * priorDamageForTear)
           : Math.max(0.62, 0.96 - 0.36 * priorDamageForTear));
-      const baseShatterThreshold = isCleaved ? vTearCleaved : vTearFresh;
+      const baseShatterThreshold =
+        isCleaved && !(inSameContactSlap && !this.sandboxCollapseActive)
+          ? vTearCleaved
+          : vTearFresh;
       const shatterThreshold = isRubbleDragProtected
         ? Math.max(baseShatterThreshold, 14.8)
         : baseShatterThreshold;
@@ -5797,6 +5945,8 @@ export class MujocoPhysicsEngine {
         const minUpVySim = (hitTable ? 0.21 : 0.17) * vCloseSim;
         if (targetLv[1] < minUpVySim) targetLv[1] = minUpVySim;
       }
+      // Smooth C^1 outer-landing-zone crush dissipation during Sandbox topples (preserving 100% central scatter at r <= 1.55 dm
+      // while keeping outer whip-tip cullet in the landing corridor with zero hard 0.29 m apron velocity clamp).
       if (this.sandboxCollapseActive && Math.hypot(pos.x, pos.z) > 1.8) {
         targetLv[0] *= 0.46;
         targetLv[2] *= 0.46;
@@ -6016,7 +6166,9 @@ export class MujocoPhysicsEngine {
         hxDm = Math.min(BLOCK_HALF_X - 0.002, Math.max(0.011, spanHxDm * 0.90));
         hyDm = Math.min(BLOCK_HALF_Y - 0.0015, Math.max(0.011, spanHyDm * 0.96));
         hzDm = Math.min(BLOCK_HALF_Z - 0.002, Math.max(0.011, spanHzDm * 0.90));
-        const heroCap = this.shards.length >= 96 ? 24 : 40;
+        // Allow >2x more 3D shard-on-shard convex hulls across small/medium shatters so cullet forms genuine
+        // multi-layer 3D mounds, tapering when >= 160 shards surround a standing base so base shear isn't jammed!
+        const heroCap = this.shards.length >= 76 ? 24 : 52;
         isHeroShard = geom.volume >= 0.0022 && activeHeroCount < heroCap;
       } else {
         const volFit = Math.max(0.54, Math.min(0.84, Math.cbrt(geom.volume / aabbVolDm3) * 0.92));

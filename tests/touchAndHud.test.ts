@@ -1202,7 +1202,7 @@ describe('Vitrail Multi-Touch Disambiguation, Responsive HUD, Audio Guards & Gla
           report.zoneOverlaps,
           `${stateLabel} @ ${vpWidth}x${vpHeight} HUD zone overlaps`
         ).toEqual([]);
-        expect(report.controlCount).toBeGreaterThanOrEqual(expectMobile ? 3 : 10);
+        expect(report.controlCount).toBeGreaterThanOrEqual(expectMobile ? 3 : 8);
       };
 
       // State 1: Pass & Play -> AI active (Apprentice vs Master Glazier radiogroup visible!)
