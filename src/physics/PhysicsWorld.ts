@@ -3,6 +3,7 @@ import {
   AdversarialPlacementPlan,
   BlockCriticalityCandidate,
   MujocoPhysicsEngine,
+  SandboxCollapseImpulseOptions,
   SceneRaycastHit,
   SceneRaycastOptions,
 } from './MujocoPhysicsEngine';
@@ -31,6 +32,7 @@ export type {
   AdversarialPlacementPlan,
   BlockCriticalityCandidate,
   ExtractionSlipResult,
+  SandboxCollapseImpulseOptions,
   SceneRaycastHit,
   SceneRaycastOptions,
 };

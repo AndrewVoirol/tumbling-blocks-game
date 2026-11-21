@@ -76,6 +76,9 @@ When running a native `swarm` (`workspace: "share"` for concurrent authors, `wor
    - Verify both `uCausticTex.a` Voronoi shard caustic ribbons on the oak table when `intactCount === 0` AND smoked neutral-density crystal refraction (`~30%` passband background visibility on unloaded prisms/shards + `0.11` dark-field trough extinction inside stressed courses)—never pass Polariscope dark-field by crushing transmission into `< 1%` matte-black silhouettes, and never pass negative bases to WGSL `pow()`.
 3. **Outlier-Trimmed `Plumb`, Sandbox `Toppled` Parity & Multiplayer Seed Sync (`App.tsx`, `src/multiplayer/*`)**:
    - Keep internal `solverLeanAngleDeg` separate from HUD `leanAngleDeg` (`standingTilts[tiltLen - 5]` column consensus when stationary, `maxDynamicTipTiltRad` when tipping), assert `isToppled` (`— Toppled`) on collapsed Sandbox heaps (`currentLayers === 0 && shatteredCount > 0`), and preserve sequential `mulberry32` `54/54` Host/Worker/Guest block palette parity.
+4. **Coordinate-Free `360°` 2D Contact-Hull Equilibrium & Post-Vitest Dev-Server Hygiene**:
+   - Audit resting blocks against the 2D `d.contact` convex-hull equilibrium oracle across `360°` partial pushes/pulls/side-shoves/diagonal corners and post-collapse piles (`0/100` unpropped CoM violations; never bypass `angAccSi` torque-balance gates in `postCollapseRubble`, and include `mj_energyPos` elastic contact potential in passivity checks).
+   - Always restart `npx vite --host 127.0.0.1 --port 5174 --strictPort --force` *after* the final `vitest` run and verify `0` `504 Outdated Optimize Dep` errors in Chrome DevTools MCP before asking the user to test.
 
 ---
 

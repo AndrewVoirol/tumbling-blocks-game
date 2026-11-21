@@ -16,6 +16,7 @@ import {
 import type {
   AdversarialPlacementPlan,
   BlockCriticalityCandidate,
+  SandboxCollapseImpulseOptions,
   SceneRaycastHit,
   SceneRaycastOptions,
 } from './MujocoPhysicsEngine';
@@ -1715,7 +1716,7 @@ export class MujocoWorkerBridge {
     return true;
   }
 
-  public triggerSandboxCollapseImpulse(): void {
+  public triggerSandboxCollapseImpulse(options?: SandboxCollapseImpulseOptions): void {
     const seq = ++this.commandSeq;
     this.sandboxCollapseActive = true;
     this.sandboxCollapseLatchUntilSeq = seq;
@@ -1723,6 +1724,7 @@ export class MujocoWorkerBridge {
       type: 'triggerSandboxCollapseImpulse',
       epoch: this.epoch,
       seq,
+      options,
     });
   }
 

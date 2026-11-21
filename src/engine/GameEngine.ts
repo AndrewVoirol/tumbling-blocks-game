@@ -346,6 +346,8 @@ export class GameEngine {
   private activeGrabSmoothedClampingN: number | null = null;
   private activeGrabLastSmoothSimTime: number = -1;
   private activeGrabTrackedBlockId: number | null = null;
+  private lastDemoCollapseAzimuthRad: number | null = null;
+  private demoCollapseCount: number = 0;
 
   constructor(canvas?: HTMLCanvasElement, onTelemetry?: TelemetryListener) {
     this.canvas = canvas ?? ({ style: {} } as HTMLCanvasElement);
@@ -4297,7 +4299,30 @@ export class GameEngine {
       this.sandboxPostToppleSlewActive = false;
       this.lastObservedPhysCollapseActive = true;
     }
-    this.physics.triggerSandboxCollapseImpulse();
+    this.demoCollapseCount++;
+    const twoPi = Math.PI * 2;
+    const azimuthRad =
+      this.lastDemoCollapseAzimuthRad === null
+        ? Math.random() * twoPi
+        : (this.lastDemoCollapseAzimuthRad + 1.31 + Math.random() * (twoPi - 2.62)) % twoPi;
+    this.lastDemoCollapseAzimuthRad = azimuthRad;
+    const twistSign = Math.random() < 0.5 ? -1 : 1;
+    const hingeRoll = Math.random();
+    const hingeBias = hingeRoll < 0.32 ? -1 : hingeRoll > 0.68 ? 1 : 0;
+    const asymMag = 0.35 + Math.random() * 0.60;
+    const asymmetry = (Math.random() < 0.5 ? -1 : 1) * asymMag;
+    const energyScale = 0.92 + Math.random() * 0.20;
+    const fractureSeedSalt =
+      ((Math.floor(Math.random() * 0x7ffffffe) + 1) ^ Math.imul(this.demoCollapseCount, 0x9e3779b1)) |
+      1;
+    this.physics.triggerSandboxCollapseImpulse({
+      azimuthRad,
+      twistSign,
+      hingeBias,
+      asymmetry,
+      energyScale,
+      fractureSeedSalt,
+    });
     this.emitTelemetry(true);
   }
 
@@ -5204,7 +5229,13 @@ export class GameEngine {
     }
 
     const dragPromoteThresholdPx =
-      pointerType === 'touch' && this.pendingForegroundShardHit !== null ? 8.0 : 5.0;
+      pointerType === 'touch' && this.pendingForegroundShardHit !== null
+        ? 8.0
+        : !this.mpRole &&
+            this.physics.gameMode === 'sandbox' &&
+            this.pendingForegroundShardHit === null
+          ? 2.5
+          : 5.0;
     if (
       this.interactionMode === 'block_pending' &&
       this.pointerMovedDist >= dragPromoteThresholdPx &&

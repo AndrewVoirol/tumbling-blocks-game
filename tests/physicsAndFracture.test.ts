@@ -11,6 +11,7 @@ import {
 } from '../src/physics/constants';
 import { ensureRapierInitialized, PhysicsWorld } from '../src/physics/PhysicsWorld';
 import { GlassAudioEngine } from '../src/audio/GlassAudioEngine';
+import { quatFromAxisAngle, quatRotateVec3 } from '../src/math/vecMat';
 
 describe('3D Anisotropic Voronoi Stained Glass Fracture', () => {
   it('conserves exact 7.5 x 2.5 x 1.5 cm Jenga block volume and exports convex planes across motifs', () => {
@@ -1286,7 +1287,7 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
     expect(engine.physics.turnPhase).toBe('SELECT_BLOCK');
     engine.setModalOpen(false);
 
-    // 3. Sandbox pull onto table tracks grabPlaneY downward so prism lands directly under cursor aim
+    // 3. Sandbox pull out of Row 10 holds block suspended in mid-air under cursor until release, then drops to table
     engine.resetGame('sandbox', 2);
     for (let i = 0; i < 60; i++) engine.physics.step(1 / 60);
     engine.camera.setPoseImmediate(0.68, 0.34, 5.2, [0, 1.44, 0], rect.width / rect.height);
@@ -1297,13 +1298,13 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
 
     let finalAx = sbx0;
     let finalAy = sby0;
-    const tableGoal: [number, number, number] = [1.85, 0.075, 0.0];
-    for (let i = 1; i <= 140; i++) {
-      const u = Math.min(1, i / 35);
+    const airGoal: [number, number, number] = [1.85, startPlaneY, 0.0];
+    for (let i = 1; i <= 90; i++) {
+      const u = Math.min(1, i / 30);
       const aim: [number, number, number] = [
-        (sbBlk.position[0] + 0.34) * (1 - u) + tableGoal[0] * u,
-        startPlaneY * (1 - u) + tableGoal[1] * u,
-        tableGoal[2],
+        (sbBlk.position[0] + 0.34) * (1 - u) + airGoal[0] * u,
+        startPlaneY,
+        airGoal[2],
       ];
       const [ax, ay] = projectScreen(aim);
       finalAx = ax;
@@ -1311,12 +1312,185 @@ describe('Tier 1 Physics, Fracture & Playability Benchmark Gate (T1-T4)', () => 
       engine.handlePointerMove(ax, ay, 7, rect);
       engine.physics.step(1 / 60);
     }
-    expect(engine.physics.grabPlaneY).toBeLessThan(startPlaneY - 0.65);
+    expect(Math.abs(engine.physics.grabPlaneY - startPlaneY)).toBeLessThan(0.05);
     expect(
       Math.abs(engine.physics.grabPlaneY - engine.physics.grabCurrentWorldOnBlock[1])
-    ).toBeLessThan(0.02);
+    ).toBeLessThan(0.05);
     const [grabSx, grabSy] = projectScreen(engine.physics.grabCurrentWorldOnBlock);
     expect(Math.hypot(grabSx - finalAx, grabSy - finalAy)).toBeLessThan(28.0);
+    engine.handlePointerUp(finalAx, finalAy, 7, rect);
+    for (let i = 0; i < 90; i++) engine.physics.step(1 / 60);
+    expect(sbBlk.shattered || sbBlk.position[1] < 0.22).toBe(true);
+
+    // 4. Subsequent pulls (#2, #3) AFTER shards shatter & sleep (`hadFullSleepAfterCollapse === true`),
+    // including a slow 0.8 s outer-tip pull across the shelf lip, must ALSO hover level (< 2.5 deg droop, 0 plummet)!
+    for (const targetLayer of [6, 12] as const) {
+      const nextBlk = engine.physics.blocks.find(
+        (b) => !b.shattered && !b.extracted && b.assignedLayer === targetLayer && b.isLooseSlot
+      )!;
+      const nextStartY = nextBlk.position[1];
+      const nextAxDir = quatRotateVec3(nextBlk.rotation, [1, 0, 0]);
+      const tipWorld: [number, number, number] = [
+        nextBlk.position[0] + nextAxDir[0] * 0.35,
+        nextStartY,
+        nextBlk.position[2] + nextAxDir[2] * 0.35,
+      ];
+      const [nx0, ny0] = projectScreen(tipWorld);
+      engine.handlePointerDown(nx0, ny0, 8 + targetLayer, 0, false, rect);
+      let lastNx = nx0;
+      let lastNy = ny0;
+      for (let i = 1; i <= 75; i++) {
+        const u = Math.min(1, i / 50); // slow 0.83 s human pull across the lip!
+        const lateralWiggle = i > 52 ? Math.sin((i - 52) * 0.35) * 0.45 : 0;
+        const aim: [number, number, number] = [
+          tipWorld[0] + nextAxDir[0] * (1.55 * u) - nextAxDir[2] * lateralWiggle,
+          nextStartY,
+          tipWorld[2] + nextAxDir[2] * (1.55 * u) + nextAxDir[0] * lateralWiggle,
+        ];
+        const [px, py] = projectScreen(aim);
+        lastNx = px;
+        lastNy = py;
+        engine.handlePointerMove(px, py, 8 + targetLayer, rect);
+        engine.physics.step(1 / 60);
+      }
+      const heldUp = quatRotateVec3(nextBlk.rotation, [0, 1, 0]);
+      const heldTiltDeg = (Math.acos(Math.max(-1, Math.min(1, heldUp[1]))) * 180) / Math.PI;
+      expect(Math.abs(nextBlk.position[1] - nextStartY)).toBeLessThan(0.06);
+      expect(heldTiltDeg).toBeLessThan(2.5);
+      engine.handlePointerUp(lastNx, lastNy, 8 + targetLayer, rect);
+      for (let i = 0; i < 85; i++) engine.physics.step(1 / 60);
+      expect(nextBlk.shattered || nextBlk.position[1] < 0.25).toBe(true);
+    }
+
+    // 5. After >= 5 blocks have shattered in Sandbox, blocks landing obliquely on a longitudinal edge
+    // (43 deg & 60 deg) roll cleanly onto a flat/side face (< 1.5 deg off-ortho), and blocks overhanging
+    // a flat tabletop block (+2 mm CoM overhang) teeter all the way down (> 16 deg) without hovering mid-tilt!
+    {
+      const rw = engine.physics.getWorld();
+      for (const extraLayer of [2, 4, 8, 14] as const) {
+        if (engine.physics.shatteredCount >= 5) break;
+        const lb = engine.physics.blocks.find(
+          (b) => !b.shattered && !b.extracted && b.assignedLayer === extraLayer && b.isLooseSlot
+        );
+        if (lb) {
+          rw.getRigidBody(lb.bodyHandle)!.setTranslation({ x: -2.5, y: 0.25, z: -1.4 }, true);
+          engine.physics.shatterBlock(lb, [0, 0, 0], 15.0, [0, 1, 0], true);
+        }
+      }
+      for (let i = 0; i < 60; i++) engine.physics.step(1 / 60);
+      expect(engine.physics.shatteredCount).toBeGreaterThanOrEqual(5);
+
+      const testBlk = engine.physics.blocks.find(
+        (b) => !b.shattered && !b.extracted && b.assignedLayer === 16 && b.isLooseSlot
+      )!;
+      const rbTest = rw.getRigidBody(testBlk.bodyHandle)!;
+      for (const sh of engine.physics.shards) {
+        if (Math.hypot(sh.position[0] + 2.4, sh.position[2] - 2.1) < 0.85) {
+          rw.getRigidBody(sh.bodyHandle)!.setTranslation({ x: -2.6, y: 0.04, z: -1.6 }, true);
+        }
+      }
+      for (const rollDeg of [43, 60] as const) {
+        const rad = (rollDeg * Math.PI) / 180;
+        const qRoll = quatFromAxisAngle([1, 0, 0], rad);
+        const yTouchDm = Math.abs(Math.cos(rad)) * 0.075 + Math.abs(Math.sin(rad)) * 0.1236 + 0.001;
+        const tInfo = rw.getMapping(testBlk.bodyHandle)!;
+        tInfo.settledAsleep = false;
+        tInfo.quietTicks = 0;
+        rbTest.setTranslation({ x: -2.4, y: yTouchDm, z: 2.1 }, true);
+        rbTest.setRotation({ x: qRoll[0], y: qRoll[1], z: qRoll[2], w: qRoll[3] }, true);
+        rbTest.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        rbTest.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        rw.syncKinematics();
+        for (let f = 0; f < 90; f++) engine.physics.step(1 / 60);
+        const nx = quatRotateVec3(testBlk.rotation, [1, 0, 0]);
+        const ny = quatRotateVec3(testBlk.rotation, [0, 1, 0]);
+        const nz = quatRotateVec3(testBlk.rotation, [0, 0, 1]);
+        const maxAlign = Math.max(Math.abs(nx[1]), Math.abs(ny[1]), Math.abs(nz[1]));
+        const offOrthoDeg = (Math.acos(Math.min(1, maxAlign)) * 180) / Math.PI;
+        expect(offOrthoDeg).toBeLessThan(1.5);
+      }
+
+      const fulcrumBlk = engine.physics.blocks.find(
+        (b) =>
+          !b.shattered &&
+          !b.extracted &&
+          b.id !== testBlk.id &&
+          b.assignedLayer === 15 &&
+          b.isLooseSlot
+      )!;
+      const rbFulc = rw.getRigidBody(fulcrumBlk.bodyHandle)!;
+      const s45 = Math.SQRT1_2;
+      rbFulc.setTranslation({ x: 1.85, y: 0.075, z: -1.3 }, true);
+      rbFulc.setRotation({ x: 0, y: s45, z: 0, w: s45 }, true);
+      rbFulc.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rbFulc.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      const tInfo = rw.getMapping(testBlk.bodyHandle)!;
+      tInfo.settledAsleep = false;
+      tInfo.quietTicks = 0;
+      rbTest.setTranslation({ x: 1.85 + 0.1236 + 0.02, y: 0.46, z: -1.3 }, true);
+      rbTest.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      rbTest.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rbTest.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      rw.syncKinematics();
+      for (let f = 0; f < 95; f++) engine.physics.step(1 / 60);
+      const nySeesaw = quatRotateVec3(testBlk.rotation, [0, 1, 0]);
+      const seesawTiltDeg = (Math.acos(Math.min(1, Math.abs(nySeesaw[1]))) * 180) / Math.PI;
+      expect(seesawTiltDeg).toBeGreaterThan(16.0);
+    }
+
+    // 6. Intermediate-course cantilevers (>70% overhang) tip & slide off rounded glass bevels without
+    //    freezing mid-tilt (12..25 deg), and pulling an outer pillar >70% out collapses the upper stack!
+    {
+      engine.physics.rebuildTower('sandbox', 2, 18, 42);
+      for (let i = 0; i < 40; i++) engine.physics.step(1 / 60);
+
+      // 6a. Loose block at 56 mm (75% overhang) falls cleanly out of Layer 8
+      const l8Loose = engine.physics.blocks.find(
+        (b) => b.assignedLayer === 8 && b.isLooseSlot
+      )!;
+      const pLoose0: [number, number, number] = [...l8Loose.position];
+      const axLoose = quatRotateVec3(l8Loose.rotation, [1, 0, 0]);
+      const wLoose0: [number, number, number] = [
+        pLoose0[0] + axLoose[0] * 0.25,
+        pLoose0[1],
+        pLoose0[2] + axLoose[2] * 0.25,
+      ];
+      engine.physics.startGrabBlock(l8Loose.id, [0.25, 0, 0], wLoose0);
+      for (let f = 1; f <= 30; f++) {
+        const d = 0.56 * Math.min(1, f / 25);
+        engine.physics.updateGrabTarget([wLoose0[0] + axLoose[0] * d, wLoose0[1], wLoose0[2] + axLoose[2] * d]);
+        engine.physics.step(1 / 60);
+      }
+      engine.physics.endGrab(false);
+      for (let f = 0; f < 65; f++) engine.physics.step(1 / 60);
+      expect(l8Loose.shattered || l8Loose.position[1] < pLoose0[1] - 0.35).toBe(true);
+
+      // 6b. Outer pillar at 54 mm (72% overhang) with center slot removed slips off bevel & buckles upper tower
+      engine.physics.rebuildTower('sandbox', 2, 18, 42);
+      const rwPillar = engine.physics.getWorld();
+      const l8Mid = engine.physics.blocks.find((b) => b.assignedLayer === 8 && b.assignedSlot === 1)!;
+      rwPillar.getRigidBody(l8Mid.bodyHandle)!.setTranslation({ x: 3.3, y: 0.075, z: 2.2 }, true);
+      l8Mid.extracted = true;
+      for (let i = 0; i < 25; i++) engine.physics.step(1 / 60);
+      const l8Pillar = engine.physics.blocks.find((b) => b.assignedLayer === 8 && b.assignedSlot === 0)!;
+      const pPil0: [number, number, number] = [...l8Pillar.position];
+      const axPil = quatRotateVec3(l8Pillar.rotation, [1, 0, 0]);
+      const wPil0: [number, number, number] = [
+        pPil0[0] + axPil[0] * 0.25,
+        pPil0[1],
+        pPil0[2] + axPil[2] * 0.25,
+      ];
+      engine.physics.startGrabBlock(l8Pillar.id, [0.25, 0, 0], wPil0);
+      for (let f = 1; f <= 30; f++) {
+        const d = 0.57 * Math.min(1, f / 25);
+        engine.physics.updateGrabTarget([wPil0[0] + axPil[0] * d, wPil0[1], wPil0[2] + axPil[2] * d]);
+        engine.physics.step(1 / 60);
+      }
+      engine.physics.endGrab(false);
+      for (let f = 0; f < 110; f++) engine.physics.step(1 / 60);
+      expect(l8Pillar.shattered || l8Pillar.position[1] < pPil0[1] - 0.35).toBe(true);
+      expect(engine.physics.shatteredCount).toBeGreaterThanOrEqual(4);
+    }
 
     engine.dispose();
   }, 30000);

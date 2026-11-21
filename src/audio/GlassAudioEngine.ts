@@ -37,6 +37,10 @@ export interface GlassImpactOptions {
   effectiveRadiusM?: number;
   /** Normalized radial strike coordinate r / R_table in [0, 1] across the R = 43 cm circular oak table */
   radialNorm?: number;
+  /** Normalized axial strike offset |x_local| / BLOCK_HALF_X in [0, 1] (0 = center fundamental antinode, 1 = free end) */
+  strikeOffsetXNorm?: number;
+  /** Normalized transverse strike eccentricity |z_local| / BLOCK_HALF_Z in [0, 1] (0 = centerline, 1 = outer bevel edge -> torsional boost) */
+  strikeOffsetZNorm?: number;
   /** Suppresses automatic circular white-oak Kirchhoff plate modes when already voiced by caller */
   skipOakPlateModes?: boolean;
 }
@@ -142,8 +146,8 @@ export class GlassAudioEngine {
   private nextVoiceId: number = 1;
   private trackedVoices: TrackedVoice[] = [];
 
-  /** Total concurrent transient Web Audio oscillator/buffer voices ceiling (with priority voice-stealing) */
-  public readonly MAX_VOICES = 12;
+  /** Total concurrent transient Web Audio oscillator/buffer voices ceiling (sized for 5-6 partials across multi-body impacts without ring cutoffs) */
+  public readonly MAX_VOICES = 32;
   /** Strict concurrent secondary Voronoi shard micro-grain cap (<= 12) */
   public readonly MAX_SHARD_GRAINS = 12;
 
@@ -699,8 +703,8 @@ export class GlassAudioEngine {
     const decayMs = clampFinite(28.0 + 0.82 * t60Ms, 28.0, 240.0, 160.0);
     const fundamentalHz = primary.freqHz;
 
-    const isDuctile = dmg >= 0.78 && dmg <= 0.96;
-    const shouldSpawnDoublet = isDuctile && primary.splitBeatHz > 0;
+    const hasAudibleCrazing = dmg >= 0.15 && dmg <= 0.98;
+    const shouldSpawnDoublet = hasAudibleCrazing && primary.splitBeatHz > 1.0;
 
     this.lastTapDiagnostics = {
       pinch01: p,
@@ -748,7 +752,7 @@ export class GlassAudioEngine {
     osc0.start(now);
     osc0.stop(stop0);
 
-    // 1b. Ductile solder-held cracked brick acoustic doublet partner (warble tone)
+    // 1b. Continuous Griffith crazing & solder-held cracked brick acoustic doublet partner (d >= 0.15)
     if (shouldSpawnDoublet && this.acquireVoiceSlot(now, 0.50)) {
       const oscSplit = this.ctx.createOscillator();
       const gSplit = this.ctx.createGain();
@@ -759,7 +763,7 @@ export class GlassAudioEngine {
           : fundamentalHz + primary.splitBeatHz;
       oscSplit.frequency.value = safeFreqHz(splitFreq * detune, sr);
       const splitDur = Math.max(0.014, durSec * 0.88);
-      const splitGain = safeGain(looseGain * (0.35 + 0.35 * dmg));
+      const splitGain = safeGain(looseGain * (0.20 + 0.50 * dmg));
       gSplit.gain.setValueAtTime(0.0001, now);
       gSplit.gain.linearRampToValueAtTime(splitGain, now + 0.001);
       gSplit.gain.exponentialRampToValueAtTime(0.0001, now + splitDur);
@@ -1077,13 +1081,33 @@ export class GlassAudioEngine {
     const gainBase = clampFinite(0.018 + intensity * 0.33, 0.015, 0.36, 0.12);
     const detune = 0.988 + this.prng() * 0.024;
     const priorityBase = 0.45 + 0.35 * intensity;
+    const hasStrikeCoord =
+      options?.strikeOffsetXNorm !== undefined || options?.strikeOffsetZNorm !== undefined;
+    const xi = clampFinite(options?.strikeOffsetXNorm ?? 0.35, 0.0, 1.0, 0.35);
+    const zeta = clampFinite(options?.strikeOffsetZNorm ?? 0.35, 0.0, 1.0, 0.35);
     let scheduledVoices = 0;
 
     for (let i = 0; i < selectedModes.length; i++) {
       const m = selectedModes[i];
       const scaledFreq = m.freqHz * (inferredWoodFromPitch ? 1.0 : pScale) * detune;
       const hertzWeight = computeHertzianModeGain(scaledFreq, hertz.cutoffHz);
-      const modeAmp = gainBase * m.relativeWeight * hertzWeight;
+      // Timoshenko free-free beam eigenmode spatial excitation factor phi_k(xi, zeta):
+      // Center strikes (xi ~ 0, zeta ~ 0) emphasize fundamental flexural n=1 (node at xi = 0.5517) and mute antisymmetric/torsional modes;
+      // corner/end strikes (xi -> 1 or zeta -> 1) strongly excite torsional n=1 (4053 Hz) and upper flexural partials!
+      let strikeModeShape = 1.0;
+      if (hasStrikeCoord) {
+        if (m.kind === 'flexural-y' && m.order === 1) {
+          const nodalDist = Math.abs(Math.cos((Math.PI * 0.5 * xi) / 0.5517));
+          strikeModeShape = 0.42 + 0.78 * Math.min(1.0, nodalDist);
+        } else if (m.kind === 'torsional') {
+          strikeModeShape = 0.24 + 1.05 * zeta + 0.25 * xi;
+        } else if (m.kind === 'flexural-y' && m.order === 2) {
+          strikeModeShape = 0.22 + 1.02 * Math.abs(Math.sin(Math.PI * xi * 0.88));
+        } else {
+          strikeModeShape = 0.32 + 0.92 * Math.max(xi, zeta);
+        }
+      }
+      const modeAmp = gainBase * m.relativeWeight * hertzWeight * strikeModeShape;
       if (modeAmp < 0.0025) continue;
       if (!this.acquireVoiceSlot(now, priorityBase - i * 0.05)) break;
 
@@ -1111,8 +1135,14 @@ export class GlassAudioEngine {
       osc.stop(stopT);
       scheduledVoices++;
 
-      // Ductile copper-foil cracked brick doublet-splitting beat partner on the primary flexural mode (d in [0.78, 0.96])
-      if (i === 0 && damage >= 0.78 && damage <= 0.96 && m.splitBeatHz > 1.0 && this.acquireVoiceSlot(now, priorityBase - 0.08)) {
+      // Continuous Griffith crazing & copper-foil cracked brick doublet-splitting beat partner (d >= 0.15)
+      if (
+        i === 0 &&
+        damage >= 0.15 &&
+        damage <= 0.98 &&
+        m.splitBeatHz > 1.0 &&
+        this.acquireVoiceSlot(now, priorityBase - 0.08)
+      ) {
         const oscSplit = this.ctx.createOscillator();
         const gSplit = this.ctx.createGain();
         oscSplit.type = 'sine';
@@ -1123,7 +1153,7 @@ export class GlassAudioEngine {
         const splitDur = Math.max(0.012, dur * 0.86);
         gSplit.gain.setValueAtTime(0.0001, now);
         gSplit.gain.linearRampToValueAtTime(
-          safeGain(modeAmp * (0.38 + 0.35 * damage), 0.25),
+          safeGain(modeAmp * (0.20 + 0.52 * damage), 0.25),
           now + 0.0012
         );
         gSplit.gain.exponentialRampToValueAtTime(0.0001, now + splitDur);
@@ -1142,17 +1172,25 @@ export class GlassAudioEngine {
       }
     }
 
-    // Hertzian-shaped contact impulse: warm lead-came tap at low v_n vs bright bevel click at high v_n
+    // Hertzian-shaped contact impulse: warm lead-came tap at low v_n vs sub-ms silicate bevel snap at high v_n
     if (this.noiseBuffer && intensity > 0.06 && this.acquireVoiceSlot(now, priorityBase - 0.12)) {
       const click = this.ctx.createBufferSource();
       click.buffer = this.noiseBuffer;
       const bp = this.ctx.createBiquadFilter();
       bp.type = 'bandpass';
-      bp.frequency.value = safeFreqHz(clampFinite(hertz.cutoffHz * 1.15, 650, 7200, 2400), sr);
-      bp.Q.value = vnMps < 0.2 ? 2.4 : 4.2;
+      const isHardGlassTick = surface === 'glass' && vnMps >= 0.14;
+      bp.frequency.value = safeFreqHz(
+        clampFinite(hertz.cutoffHz * (isHardGlassTick ? 1.45 : 1.15), 650, 8600, 2400),
+        sr
+      );
+      bp.Q.value = vnMps < 0.2 ? 2.4 : isHardGlassTick ? 3.2 : 4.2;
       const cg = this.ctx.createGain();
-      const pulseDur = clampFinite(Math.max(0.004, hertz.contactTimeSec * 14.0), 0.004, 0.014, 0.006);
-      cg.gain.setValueAtTime(safeGain(gainBase * 0.42, 0.25), now);
+      const pulseDur = isHardGlassTick
+        ? clampFinite(Math.max(0.0018, hertz.contactTimeSec * 9.5), 0.0018, 0.0065, 0.0032)
+        : clampFinite(Math.max(0.004, hertz.contactTimeSec * 14.0), 0.004, 0.014, 0.006);
+      const clickAmp = isHardGlassTick ? gainBase * (0.52 + 0.22 * Math.max(xi, zeta)) : gainBase * 0.42;
+      cg.gain.setValueAtTime(0.0001, now);
+      cg.gain.linearRampToValueAtTime(safeGain(clickAmp, 0.28), now + 0.00016);
       cg.gain.exponentialRampToValueAtTime(0.0001, now + pulseDur);
       click.connect(bp);
       bp.connect(cg);

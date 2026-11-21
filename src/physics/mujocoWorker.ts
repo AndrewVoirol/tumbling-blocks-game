@@ -6,6 +6,7 @@ import {
   type AdversarialPlacementPlan,
   type BlockCriticalityCandidate,
   MujocoPhysicsEngine,
+  type SandboxCollapseImpulseOptions,
   type SceneRaycastHit,
   type SceneRaycastOptions,
 } from './MujocoPhysicsEngine';
@@ -233,7 +234,12 @@ export type WorkerInboundMessage =
       timestampMs?: number;
     }
   | { type: 'releaseExtractedBlockOntoTop'; epoch: number; seq?: number }
-  | { type: 'triggerSandboxCollapseImpulse'; epoch: number; seq?: number }
+  | {
+      type: 'triggerSandboxCollapseImpulse';
+      epoch: number;
+      seq?: number;
+      options?: SandboxCollapseImpulseOptions;
+    }
   | {
       type: 'nudgeShard';
       epoch: number;
@@ -939,7 +945,7 @@ export function attachMujocoWorkerHost(scope: WorkerHostScope): { dispose: () =>
         break;
       }
       case 'triggerSandboxCollapseImpulse': {
-        engine.triggerSandboxCollapseImpulse();
+        engine.triggerSandboxCollapseImpulse(msg.options);
         postSnapshot(false);
         break;
       }

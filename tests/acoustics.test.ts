@@ -975,15 +975,17 @@ describe('Vitrail First-Principles Physical Modal & Impact Acoustics', () => {
     expect(fundOscs.length).toBe(1);
     expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(false);
 
-    // Intermediate crazing (d = 0.45): still exactly 1 fundamental oscillator (ductile tether only active at d in [0.78, 0.96])
+    // Intermediate crazing (d = 0.45): continuous Griffith flaw symmetry-breaking spawns gentle ~14 Hz doublet warble
     baseOscs = mockCtx.createdOscillators.length;
     audio.playTapTestResonance(0.2, [0, 0, 0], undefined, undefined, 0.45);
     tapOscs = mockCtx.createdOscillators.slice(baseOscs);
     fundOscs = tapOscs.filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
-    expect(fundOscs.length).toBe(1);
-    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(false);
+    expect(fundOscs.length).toBe(2);
+    expect(audio.lastTapDiagnostics?.doubletSpawned).toBe(true);
+    expect(audio.lastTapDiagnostics?.splitBeatHz).toBeGreaterThan(10.0);
+    expect(audio.lastTapDiagnostics?.splitBeatHz).toBeLessThan(18.0);
 
-    // Ductile cracked brick taps (d = 0.78, 0.85, 0.96): exactly 2 fundamental oscillators (primary + oscSplit)
+    // Ductile cracked brick taps (d = 0.78, 0.85, 0.96): 2 fundamental oscillators (primary + oscSplit) in 30-48 Hz band
     for (const d of [0.78, 0.85, 0.96]) {
       baseOscs = mockCtx.createdOscillators.length;
       audio.playTapTestResonance(0.15, [0, 0, 0], undefined, undefined, d);
@@ -1017,13 +1019,13 @@ describe('Vitrail First-Principles Physical Modal & Impact Acoustics', () => {
     // Stop slide
     audio.updateSlideFriction(0, 0, 0, 0, 0, 0);
 
-    // 4. Zero-leak polyphony & strict MAX_VOICES <= 12 + ductile [0.78, 0.96] boundary hygiene
-    expect(audio.MAX_VOICES).toBeLessThanOrEqual(12);
+    // 4. Multi-partial polyphony (>= 28 voices so 3-4 simultaneous clinks never voice-steal) & sub-0.15 undamaged silence
+    expect(audio.MAX_VOICES).toBeGreaterThanOrEqual(28);
 
-    // Tap & impact doublets strictly bounded to ductile bracket d in [0.78, 0.96]
-    for (const dOut of [0.0, 0.779, 0.961, 1.0]) {
+    // Undamaged / micro-scuff bricks below d = 0.15 emit a pure single fundamental (no false warble)
+    for (const dSub of [0.0, 0.08, 0.14]) {
       const tapStart = mockCtx.createdOscillators.length;
-      audio.playTapTestResonance(0.15, [0, 0, 0], undefined, undefined, dOut);
+      audio.playTapTestResonance(0.15, [0, 0, 0], undefined, undefined, dSub);
       const tapFund = mockCtx.createdOscillators
         .slice(tapStart)
         .filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
@@ -1032,18 +1034,18 @@ describe('Vitrail First-Principles Physical Modal & Impact Acoustics', () => {
 
       mockCtx.currentTime += 0.05;
       const impStart = mockCtx.createdOscillators.length;
-      audio.playGlassImpact(0.8, 1.0, [0, 0.5, 0], undefined, undefined, { damage: dOut });
+      audio.playGlassImpact(0.8, 1.0, [0, 0.5, 0], undefined, undefined, { damage: dSub });
       const impFund = mockCtx.createdOscillators
         .slice(impStart)
         .filter((o) => o.frequencyValues[0] >= 2200 && o.frequencyValues[0] <= 3600);
       expect(impFund.length).toBe(1);
     }
 
-    // Heavy burst must never exceed 12 concurrent voices
+    // Heavy burst must never exceed MAX_VOICES concurrent voices
     for (let i = 0; i < 40; i++) {
       mockCtx.currentTime += 0.002;
       audio.playGlassImpact(0.85, 1.0, [0, 0.2, 0], undefined, undefined, { damage: 0.88 });
-      expect(audio.getActiveVoiceCount()).toBeLessThanOrEqual(12);
+      expect(audio.getActiveVoiceCount()).toBeLessThanOrEqual(audio.MAX_VOICES);
     }
 
     mockCtx.currentTime += 0.5;
