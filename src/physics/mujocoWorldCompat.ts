@@ -57,6 +57,8 @@ export class MujocoWorldCompat {
   private data: MjData;
   private map: MujocoTowerIndexMap;
   private bodyLookup = new Map<number, BodyMapping>();
+  private bodyById: Array<BodyMapping | undefined> = [];
+  private geomById: Array<BodyMapping | undefined> = [];
   private customGravityBodies = new Set<BodyMapping>();
   private bodyFacadeCache = new Map<number, MujocoRigidBodyCompat>();
   private colliderFacadeCache = new Map<number, MujocoColliderCompat>();
@@ -68,10 +70,16 @@ export class MujocoWorldCompat {
     this.data = data;
     this.map = map;
 
+    const registerMapping = (entry: BodyMapping): void => {
+      this.bodyLookup.set(entry.bodyId, entry);
+      this.bodyById[entry.bodyId] = entry;
+      this.geomById[entry.geomId] = entry;
+    };
+
     for (let i = 0; i < map.blockBodyIds.length; i++) {
       const bodyId = map.blockBodyIds[i];
       const geomId = map.blockGeomIds[i];
-      this.bodyLookup.set(bodyId, {
+      registerMapping({
         bodyId,
         geomId,
         qposAdr: map.blockQposAdr[i],
@@ -89,7 +97,7 @@ export class MujocoWorldCompat {
     for (let s = 0; s < map.shardBodyIds.length; s++) {
       const bodyId = map.shardBodyIds[s];
       const geomId = map.shardGeomIds[s];
-      this.bodyLookup.set(bodyId, {
+      registerMapping({
         bodyId,
         geomId,
         qposAdr: map.shardQposAdr[s],
@@ -107,7 +115,7 @@ export class MujocoWorldCompat {
     for (let e = 0; e < map.extraBodyIds.length; e++) {
       const bodyId = map.extraBodyIds[e];
       const geomId = map.extraGeomIds[e];
-      this.bodyLookup.set(bodyId, {
+      registerMapping({
         bodyId,
         geomId,
         qposAdr: map.extraQposAdr[e],
@@ -132,11 +140,16 @@ export class MujocoWorldCompat {
   }
 
   public getMapping(bodyId: number): BodyMapping | undefined {
-    return this.bodyLookup.get(bodyId);
+    return bodyId >= 0 && bodyId < this.bodyById.length
+      ? this.bodyById[bodyId]
+      : this.bodyLookup.get(bodyId);
   }
 
   public markShardActive(bodyId: number, active: boolean, contype?: number, conaffinity?: number): void {
-    const m = this.bodyLookup.get(bodyId);
+    const m =
+      bodyId >= 0 && bodyId < this.bodyById.length
+        ? this.bodyById[bodyId]
+        : this.bodyLookup.get(bodyId);
     if (!m) return;
     m.enabled = active;
     m.settledAsleep = false;
@@ -174,7 +187,10 @@ export class MujocoWorldCompat {
   }
 
   public wakeBody(bodyId: number): void {
-    const info = this.bodyLookup.get(bodyId);
+    const info =
+      bodyId >= 0 && bodyId < this.bodyById.length
+        ? this.bodyById[bodyId]
+        : this.bodyLookup.get(bodyId);
     if (!info) return;
     info.settledAsleep = false;
     info.quietTicks = 0;
@@ -201,7 +217,7 @@ export class MujocoWorldCompat {
     for (let i = 0; i < blockIds.length; i++) {
       if (geomContype[blockGeoms[i]] === 0) continue; // Never wake parked unused/shattered blocks (`contype === 0`)!
       const bid = blockIds[i];
-      const info = this.bodyLookup.get(bid);
+      const info = this.bodyById[bid];
       if (info && info.enabled && !info.sensor) {
         info.settledAsleep = false;
         info.quietTicks = 0;
@@ -216,7 +232,7 @@ export class MujocoWorldCompat {
     for (let i = 0; i < shardIds.length; i++) {
       if (geomContype[shardGeoms[i]] === 0) continue; // Never wake parked pool shards (`contype === 0`)!
       const sid = shardIds[i];
-      const info = this.bodyLookup.get(sid);
+      const info = this.bodyById[sid];
       if (info && info.enabled && !info.sensor) {
         const xM = qpos[info.qposAdr + 0];
         const yM = qpos[info.qposAdr + 1];
@@ -247,7 +263,7 @@ export class MujocoWorldCompat {
     for (let i = 0; i < shardIds.length; i++) {
       if (geomContype[shardGeoms[i]] === 0) continue; // Never wake parked pool shards (`contype === 0`)!
       const sid = shardIds[i];
-      const info = this.bodyLookup.get(sid);
+      const info = this.bodyById[sid];
       if (info && info.enabled && !info.sensor) {
         info.settledAsleep = false;
         info.quietTicks = 0;
@@ -264,7 +280,10 @@ export class MujocoWorldCompat {
   }
 
   public getRigidBody(handle: number): MujocoRigidBodyCompat | undefined {
-    const info = this.bodyLookup.get(handle);
+    const info =
+      handle >= 0 && handle < this.bodyById.length
+        ? this.bodyById[handle]
+        : this.bodyLookup.get(handle);
     if (!info) return undefined;
     let facade = this.bodyFacadeCache.get(handle);
     if (!facade) {
@@ -275,11 +294,16 @@ export class MujocoWorldCompat {
   }
 
   public getCollider(geomHandle: number): MujocoColliderCompat | undefined {
-    let found: BodyMapping | undefined;
-    for (const info of this.bodyLookup.values()) {
-      if (info.geomId === geomHandle) {
-        found = info;
-        break;
+    let found =
+      geomHandle >= 0 && geomHandle < this.geomById.length
+        ? this.geomById[geomHandle]
+        : undefined;
+    if (!found) {
+      for (const info of this.bodyLookup.values()) {
+        if (info.geomId === geomHandle) {
+          found = info;
+          break;
+        }
       }
     }
     if (!found) return undefined;
@@ -345,11 +369,18 @@ export class MujocoWorldCompat {
     // Switch geom to mjGEOM_BOX (6) and update exact mass + box principal inertia in O(1)
     this.model.geom_type[gid] = 6; // mjGEOM_BOX
     this.model.geom_dataid[gid] = -1;
+    this.model.geom_pos[gid * 3 + 0] = 0;
+    this.model.geom_pos[gid * 3 + 1] = 0;
+    this.model.geom_pos[gid * 3 + 2] = 0;
+    this.model.geom_quat[gid * 4 + 0] = 1;
+    this.model.geom_quat[gid * 4 + 1] = 0;
+    this.model.geom_quat[gid * 4 + 2] = 0;
+    this.model.geom_quat[gid * 4 + 3] = 0;
     this.model.geom_size[gid * 3 + 0] = hxM;
     this.model.geom_size[gid * 3 + 1] = hyM;
     this.model.geom_size[gid * 3 + 2] = hzM;
     this.model.geom_rbound[gid] = Math.hypot(hxM, hyM, hzM);
-    // Reset AABB `[center(3), halfSize(3)]` so MuJoCo's BVH broadphase uses exact box bounds!
+    // Reset both geom_aabb and MuJoCo 4.0 body BVH leaf `bvh_aabb` `[center(3), halfSize(3)]` so broadphase uses exact box bounds!
     const aabbBase = gid * 6;
     this.model.geom_aabb[aabbBase + 0] = 0;
     this.model.geom_aabb[aabbBase + 1] = 0;
@@ -357,6 +388,16 @@ export class MujocoWorldCompat {
     this.model.geom_aabb[aabbBase + 3] = hxM;
     this.model.geom_aabb[aabbBase + 4] = hyM;
     this.model.geom_aabb[aabbBase + 5] = hzM;
+    const bvhAdr = this.model.body_bvhadr[info.bodyId];
+    if (bvhAdr >= 0) {
+      const bvhBase = bvhAdr * 6;
+      this.model.bvh_aabb[bvhBase + 0] = 0;
+      this.model.bvh_aabb[bvhBase + 1] = 0;
+      this.model.bvh_aabb[bvhBase + 2] = 0;
+      this.model.bvh_aabb[bvhBase + 3] = hxM;
+      this.model.bvh_aabb[bvhBase + 4] = hyM;
+      this.model.bvh_aabb[bvhBase + 5] = hzM;
+    }
     setBodyGeomCollisionMask(
       this.model,
       info.bodyId,

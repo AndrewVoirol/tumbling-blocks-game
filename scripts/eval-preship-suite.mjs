@@ -60,6 +60,7 @@ async function main() {
       { MujocoWorkerBridge },
       { attachMujocoWorkerHost },
       { MJ_CONTYPE_BLOCK },
+      contactEquilibrium,
     ] = await Promise.all([
       vite.ssrLoadModule('/src/audio/GlassAudioEngine.ts'),
       vite.ssrLoadModule('/src/engine/GameEngine.ts'),
@@ -70,6 +71,7 @@ async function main() {
       vite.ssrLoadModule('/src/physics/MujocoWorkerBridge.ts'),
       vite.ssrLoadModule('/src/physics/mujocoWorker.ts'),
       vite.ssrLoadModule('/src/physics/mujocoTowerBuilder.ts'),
+      vite.ssrLoadModule('/src/physics/contactEquilibrium.ts'),
     ]);
 
     const { BLOCK_HALF_Y, BLOCK_HEIGHT, BLOCK_LENGTH, TABLE_RADIUS } = constants;
@@ -352,6 +354,7 @@ async function main() {
       ensureMujocoInitialized,
       constants,
       vecMat,
+      contactEquilibrium,
     });
     const fuzzSeeds = 60;
     const fuzzActions = 50;
@@ -377,6 +380,8 @@ async function main() {
       fuzzErrors === 0 && totalFuzzActions === fuzzSeeds * fuzzActions,
       `actions=${totalFuzzActions}/${fuzzSeeds * fuzzActions}, collapseTraj=${fuzzCollapseTraj}, errors=${fuzzErrors}`
     );
+    fuzzSuite.dispose();
+    fuzzSuite = null;
 
     // =========================================================================
     // DOMAIN 4: Sandbox Smashing (18L, 24L, 30L), Solo Collapse & 512 Pool Wrap

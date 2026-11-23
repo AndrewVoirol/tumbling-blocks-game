@@ -203,14 +203,28 @@ export function estimateClampingLoadFromWrenchAndStack(
   if (!blk || blk.shattered || blk.extracted) return 0;
 
   const wBase = blockId * 4;
+  let maxTowerLayer = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    if (!b.shattered && !b.extracted && b.assignedLayer + 1 > maxTowerLayer) {
+      maxTowerLayer = b.assignedLayer + 1;
+    }
+  }
+  const photoColNormN =
+    7.5 * (maxTowerLayer > 30 ? Math.pow(maxTowerLayer / 30.0, 1.45) : 1.0);
+  const invertCompressCol = (s: number): number =>
+    maxTowerLayer <= 30 || s <= 0.72
+      ? s
+      : 0.72 + 0.55 * Math.atanh(Math.min(0.995, (s - 0.72) / 0.28));
+
   let approxDirectN = 0;
   if (wBase + 2 < blockPhotoelasticWrench.length) {
     const dmgLift = blk.damage * 0.28;
-    const cNeg = Math.max(0, blockPhotoelasticWrench[wBase + 0] - dmgLift);
-    const cCtr = Math.max(0, blockPhotoelasticWrench[wBase + 1] - dmgLift);
-    const cPos = Math.max(0, blockPhotoelasticWrench[wBase + 2] - dmgLift);
-    // Inverse of `MujocoPhysicsEngine` photoelastic scaling (`colForce / 7.5`, where `colForce = 1.75*min + 0.18*max - 0.38`)
-    approxDirectN = ((cNeg + cCtr + cPos) * 7.5) / 1.70;
+    const cNeg = invertCompressCol(Math.max(0, blockPhotoelasticWrench[wBase + 0] - dmgLift));
+    const cCtr = invertCompressCol(Math.max(0, blockPhotoelasticWrench[wBase + 1] - dmgLift));
+    const cPos = invertCompressCol(Math.max(0, blockPhotoelasticWrench[wBase + 2] - dmgLift));
+    // Inverse of `MujocoPhysicsEngine` photoelastic scaling (`colForce / photoColNormN`, where `colForce = 1.75*min + 0.18*max - 0.38`)
+    approxDirectN = ((cNeg + cCtr + cPos) * photoColNormN) / 1.70;
   }
 
   if (approxDirectN <= 0.25) {
@@ -229,10 +243,10 @@ export function estimateClampingLoadFromWrenchAndStack(
       const obDmgLift = ob.damage * 0.28;
       const obDirectN =
         obBase + 2 < blockPhotoelasticWrench.length
-          ? ((Math.max(0, blockPhotoelasticWrench[obBase + 0] - obDmgLift) +
-              Math.max(0, blockPhotoelasticWrench[obBase + 1] - obDmgLift) +
-              Math.max(0, blockPhotoelasticWrench[obBase + 2] - obDmgLift)) *
-              7.5) /
+          ? ((invertCompressCol(Math.max(0, blockPhotoelasticWrench[obBase + 0] - obDmgLift)) +
+              invertCompressCol(Math.max(0, blockPhotoelasticWrench[obBase + 1] - obDmgLift)) +
+              invertCompressCol(Math.max(0, blockPhotoelasticWrench[obBase + 2] - obDmgLift))) *
+              photoColNormN) /
             1.70
           : 0;
       if (obDirectN > maxTightDirectN) maxTightDirectN = obDirectN;
@@ -247,10 +261,10 @@ export function estimateClampingLoadFromWrenchAndStack(
     const obDmgLift = ob.damage * 0.28;
     const obDirectN =
       obBase + 2 < blockPhotoelasticWrench.length
-        ? ((Math.max(0, blockPhotoelasticWrench[obBase + 0] - obDmgLift) +
-            Math.max(0, blockPhotoelasticWrench[obBase + 1] - obDmgLift) +
-            Math.max(0, blockPhotoelasticWrench[obBase + 2] - obDmgLift)) *
-            7.5) /
+        ? ((invertCompressCol(Math.max(0, blockPhotoelasticWrench[obBase + 0] - obDmgLift)) +
+            invertCompressCol(Math.max(0, blockPhotoelasticWrench[obBase + 1] - obDmgLift)) +
+            invertCompressCol(Math.max(0, blockPhotoelasticWrench[obBase + 2] - obDmgLift))) *
+            photoColNormN) /
           1.70
         : 0;
     // Account for colForce's -0.38 per-zone offset when detecting bearing neighbors in the same row

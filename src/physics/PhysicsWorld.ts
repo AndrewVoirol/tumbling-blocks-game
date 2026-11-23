@@ -116,6 +116,9 @@ export interface GlassShardState {
   quietSubsteps: number;
   /** Simulation timestamp (`simTime` in seconds) when this Voronoi shard was spawned */
   spawnSimTime?: number;
+  /** Pre-declared monomorphic diagnostic fields for single-block underbelly / multi-block jaw-pinch checks */
+  nearIntactBlocks?: number;
+  hasUnderbellyWedge?: boolean;
 }
 
 export interface ShardImpactEvent {

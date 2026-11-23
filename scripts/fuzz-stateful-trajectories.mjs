@@ -103,10 +103,12 @@ export async function createFuzzSuite(deps) {
     ensureMujocoInitialized,
     constants,
     vecMat,
+    contactEquilibrium,
   } = deps;
 
   const { BLOCK_HALF_X, BLOCK_HALF_Y, BLOCK_HALF_Z, BLOCK_HEIGHT, TABLE_RADIUS } = constants;
   const { quatRotateVec3 } = vecMat;
+  const { areBlockObbsWithinGapDm, isShardSupportingBlockObbDm } = contactEquilibrium;
 
   await ensureMujocoInitialized(false);
 
@@ -229,11 +231,14 @@ export async function createFuzzSuite(deps) {
     const geomContype = mjModel ? mjModel.geom_contype : null;
     const geomConaffinity = mjModel ? mjModel.geom_conaffinity : null;
     const treeAsleep = mjData ? mjData.tree_asleep : null;
+    const qfrcApplied = mjData ? mjData.qfrc_applied : null;
 
     const isBodySleepingFast = (bodyId) => {
       if (!rw) return false;
       const mapping = rw.getMapping(bodyId);
-      if (!mapping || !mapping.enabled || mapping.settledAsleep) return true;
+      if (!mapping || !mapping.enabled) return true;
+      if (qfrcApplied && qfrcApplied[mapping.dofAdr + 1] !== 0) return false;
+      if (mapping.settledAsleep) return true;
       if (!bodyTreeId || !treeAsleep) return false;
       const tid = bodyTreeId[bodyId];
       return tid >= 0 ? treeAsleep[tid] >= 0 : false;
@@ -282,9 +287,11 @@ export async function createFuzzSuite(deps) {
       intactCount++;
       if (b.damage > 0.01) crazedCount++;
 
-      // Unsupported sleeping intact block check (`y > 2.6 cm = 0.26 dm`)
+      // Unsupported sleeping intact block check (`y > 2.6 cm = 0.26 dm`) using 15-axis Gottschalk OBB support
       if (!b.extracted && b.id !== phys.activeBlockId && rw) {
+        const tx = b.position[0];
         const ty = b.position[1];
+        const tz = b.position[2];
         const asleep = ty > 0.26 ? isBodySleepingFast(b.bodyHandle) : false;
         if (asleep && ty > 0.26) {
           const exVec = quatRotateVec3(b.rotation, [1, 0, 0]);
@@ -294,17 +301,40 @@ export async function createFuzzSuite(deps) {
             Math.abs(exVec[1]) * BLOCK_HALF_X +
             Math.abs(upVec[1]) * BLOCK_HALF_Y +
             Math.abs(ezVec[1]) * BLOCK_HALF_Z;
-          if (ty - extY > 0.035) {
+          if (ty > 0.095 && ty - extY > 0.025) {
+            const rx = b.rotation[0];
+            const ry = b.rotation[1];
+            const rz = b.rotation[2];
+            const rqw = b.rotation[3];
             let supported = false;
             for (let j = 0; j < phys.blocks.length; j++) {
               const sb = phys.blocks[j];
               if (sb.id === b.id || sb.shattered || sb.extracted) continue;
-              const dy = ty - sb.position[1];
+              const sx = sb.position[0];
+              const sy = sb.position[1];
+              const sz = sb.position[2];
+              const dy = ty - sy;
               if (
-                dy > -0.46 &&
-                dy < 0.86 &&
-                Math.abs(b.position[0] - sb.position[0]) < 0.86 &&
-                Math.abs(b.position[2] - sb.position[2]) < 0.86
+                dy > -0.02 &&
+                dy < 0.85 &&
+                sy - BLOCK_HALF_X < ty + 0.02 &&
+                areBlockObbsWithinGapDm(
+                  tx,
+                  ty,
+                  tz,
+                  rx,
+                  ry,
+                  rz,
+                  rqw,
+                  sx,
+                  sy,
+                  sz,
+                  sb.rotation[0],
+                  sb.rotation[1],
+                  sb.rotation[2],
+                  sb.rotation[3],
+                  0.035
+                )
               ) {
                 supported = true;
                 break;
@@ -313,12 +343,21 @@ export async function createFuzzSuite(deps) {
             if (!supported) {
               for (let j = 0; j < phys.shards.length; j++) {
                 const os = phys.shards[j];
-                const dy = ty - os.position[1];
                 if (
-                  dy > 0.015 &&
-                  dy < 0.66 &&
-                  Math.abs(b.position[0] - os.position[0]) < 0.74 &&
-                  Math.abs(b.position[2] - os.position[2]) < 0.74
+                  isShardSupportingBlockObbDm(
+                    tx,
+                    ty,
+                    tz,
+                    rx,
+                    ry,
+                    rz,
+                    rqw,
+                    os.position[0],
+                    os.position[1],
+                    os.position[2],
+                    0.22,
+                    0.035
+                  )
                 ) {
                   supported = true;
                   break;
@@ -396,16 +435,33 @@ export async function createFuzzSuite(deps) {
         );
       }
 
-      // Unsupported sleeping shard check (`y > 2.6 cm = 0.26 dm`)
+      // Unsupported sleeping shard check (`y > 2.6 cm = 0.26 dm` and bottom above `y = 0` oak tabletop)
       if (rw) {
         const [sx, sy, sz] = s.position;
         const asleep = sy > 0.26 ? isBodySleepingFast(s.bodyHandle) : false;
         if (asleep && sy > 0.26) {
+          let supported = false;
+          if (mjModel && mjData && Math.hypot(sx, sz) <= TABLE_RADIUS + 0.04) {
+            const gid = s.colliderHandle;
+            const aabb = mjModel.geom_aabb;
+            const xm = mjData.geom_xmat;
+            const gp = mjData.geom_xpos;
+            const ab = gid * 6;
+            const xb = gid * 9;
+            const gb = gid * 3;
+            const wCyM = gp[gb + 1] + xm[xb + 3] * aabb[ab + 0] + xm[xb + 4] * aabb[ab + 1] + xm[xb + 5] * aabb[ab + 2];
+            const halfYM =
+              Math.abs(xm[xb + 3]) * aabb[ab + 3] +
+              Math.abs(xm[xb + 4]) * aabb[ab + 4] +
+              Math.abs(xm[xb + 5]) * aabb[ab + 5];
+            if (wCyM - halfYM <= 0.004) {
+              supported = true;
+            }
+          }
           const isHero = geomContype ? geomContype[s.colliderHandle] === 4 : true;
           const collidesWithBlocks =
             isHero || (geomConaffinity ? (geomConaffinity[s.colliderHandle] & 2) !== 0 : false);
-          let supported = false;
-          if (collidesWithBlocks) {
+          if (!supported && collidesWithBlocks) {
             for (let j = 0; j < phys.blocks.length; j++) {
               const sb = phys.blocks[j];
               if (sb.shattered || sb.extracted) continue;
@@ -730,6 +786,24 @@ export async function createFuzzSuite(deps) {
           `Passive settle net window mean energy grew: ${firstWindowAvgJ.toFixed(6)} J -> ${lastWindowAvgJ.toFixed(6)} J`,
           ctx
         );
+      }
+
+      if (
+        !isWorker &&
+        frames >= 24 &&
+        typeof phys.auditSettledPlausibilityTwoGate === 'function' &&
+        phys.activeBlockId === null &&
+        phys.turnPhase !== 'EXTRACTED' &&
+        phys.data?.ntree_awake === 0
+      ) {
+        const oracle = phys.auditSettledPlausibilityTwoGate();
+        if (!oracle.pass) {
+          throw new FuzzInvariantError(
+            'SETTLED_PLAUSIBILITY_ORACLE',
+            `Two-Gate settled plausibility oracle failed (maxDy=${oracle.maxAbsDyMm}mm, maxPos=${oracle.maxDPosMm}mm, maxTheta=${oracle.maxDThetaDeg}deg, gateA=${JSON.stringify(oracle.gateAViolations.slice(0, 3))}, gateB=${JSON.stringify(oracle.gateBViolations.slice(0, 3))})`,
+            ctx
+          );
+        }
       }
 
       return prevSimTime;
@@ -1130,7 +1204,68 @@ export async function createFuzzSuite(deps) {
           }
 
           case 'collapsed_rubble_interact': {
-            if (phys.shards.length > 0 && typeof phys.nudgeShard === 'function') {
+            const intactRubbleBlocks = phys.blocks.filter(
+              (b) =>
+                !b.shattered &&
+                !b.extracted &&
+                b.position[1] > -0.05 &&
+                Math.hypot(b.position[0], b.position[2]) < TABLE_RADIUS - 0.15
+            );
+            const useBlockDrag =
+              phys.gameMode === 'sandbox' &&
+              intactRubbleBlocks.length > 0 &&
+              (phys.shards.length === 0 || rng() < 0.5);
+            if (useBlockDrag) {
+              const blk = intactRubbleBlocks[Math.floor(rng() * intactRubbleBlocks.length)];
+              const azRad = rng() * Math.PI * 2;
+              const dirX = Math.cos(azRad);
+              const dirZ = Math.sin(azRad);
+              const localOffX = (rng() - 0.5) * 2.0 * BLOCK_HALF_X * 0.85;
+              const localPt = [localOffX, 0, 0];
+              const offWorld = quatRotateVec3(blk.rotation, localPt);
+              const grabWorld = [
+                blk.position[0] + offWorld[0],
+                blk.position[1] + offWorld[1],
+                blk.position[2] + offWorld[2],
+              ];
+              const dragSteps = 4 + Math.floor(rng() * 4);
+              const stepDistDm = 0.09 + rng() * 0.12;
+              if (isPaired) {
+                syncEngine.physics.startGrabBlock(blk.id, localPt, grabWorld);
+                workerEngine.physics.startGrabBlock(blk.id, localPt, grabWorld);
+                await flushWorker();
+                for (let ds = 1; ds <= dragSteps; ds++) {
+                  const tgt = [
+                    grabWorld[0] + dirX * stepDistDm * ds,
+                    grabWorld[1],
+                    grabWorld[2] + dirZ * stepDistDm * ds,
+                  ];
+                  syncEngine.physics.updateGrabTarget(tgt);
+                  workerEngine.physics.updateGrabTarget(tgt);
+                  await flushWorker();
+                  await stepBoth(1, 1 / 60);
+                }
+                syncEngine.physics.endGrab(false);
+                workerEngine.physics.endGrab(false);
+                await flushWorker();
+              } else {
+                primaryEngine.physics.startGrabBlock(blk.id, localPt, grabWorld);
+                if (isAsyncWorker) await flushWorker();
+                for (let ds = 1; ds <= dragSteps; ds++) {
+                  const tgt = [
+                    grabWorld[0] + dirX * stepDistDm * ds,
+                    grabWorld[1],
+                    grabWorld[2] + dirZ * stepDistDm * ds,
+                  ];
+                  primaryEngine.physics.updateGrabTarget(tgt);
+                  if (isAsyncWorker) await flushWorker();
+                  await stepBoth(1, 1 / 60);
+                }
+                primaryEngine.physics.endGrab(false);
+                if (isAsyncWorker) await flushWorker();
+              }
+              await stepBoth(4, 1 / 60);
+            } else if (phys.shards.length > 0 && typeof phys.nudgeShard === 'function') {
               const shd = phys.shards[Math.floor(rng() * phys.shards.length)];
               const imp = [(rng() - 0.5) * 0.012, 0.006 + rng() * 0.008, (rng() - 0.5) * 0.012];
               const pt = [...shd.position];
@@ -1142,8 +1277,10 @@ export async function createFuzzSuite(deps) {
                 primaryEngine.physics.nudgeShard(shd.id, pt, imp);
                 if (isAsyncWorker) await flushWorker();
               }
+              await stepBoth(5, 1 / 60);
+            } else {
+              await stepBoth(5, 1 / 60);
             }
-            await stepBoth(5, 1 / 60);
             break;
           }
 
@@ -1602,6 +1739,7 @@ async function runCli() {
       { ensureMujocoInitialized },
       constants,
       vecMat,
+      contactEquilibrium,
     ] = await Promise.all([
       vite.ssrLoadModule('/src/engine/GameEngine.ts'),
       vite.ssrLoadModule('/src/audio/GlassAudioEngine.ts'),
@@ -1611,6 +1749,7 @@ async function runCli() {
       vite.ssrLoadModule('/src/physics/mujocoRuntime.ts'),
       vite.ssrLoadModule('/src/physics/constants.ts'),
       vite.ssrLoadModule('/src/math/vecMat.ts'),
+      vite.ssrLoadModule('/src/physics/contactEquilibrium.ts'),
     ]);
 
     const t0 = performance.now();
@@ -1623,6 +1762,7 @@ async function runCli() {
       ensureMujocoInitialized,
       constants,
       vecMat,
+      contactEquilibrium,
     });
 
     if (singleSeedIdx >= 0) {

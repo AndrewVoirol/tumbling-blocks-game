@@ -103,16 +103,54 @@ function normalize3(v: Vec3): Vec3 {
 }
 
 function computePolygonArea(verts: Vec3[]): number {
-  if (verts.length < 3) return 0;
+  const n = verts.length;
+  if (n < 3) return 0;
   let area = 0;
   const v0 = verts[0];
-  for (let i = 1; i < verts.length - 1; i++) {
-    const e1: Vec3 = [verts[i][0] - v0[0], verts[i][1] - v0[1], verts[i][2] - v0[2]];
-    const e2: Vec3 = [verts[i + 1][0] - v0[0], verts[i + 1][1] - v0[1], verts[i + 1][2] - v0[2]];
-    const c = cross3(e1, e2);
-    area += 0.5 * Math.hypot(c[0], c[1], c[2]);
+  const v0x = v0[0];
+  const v0y = v0[1];
+  const v0z = v0[2];
+  for (let i = 1; i < n - 1; i++) {
+    const vi = verts[i];
+    const vj = verts[i + 1];
+    const e1x = vi[0] - v0x;
+    const e1y = vi[1] - v0y;
+    const e1z = vi[2] - v0z;
+    const e2x = vj[0] - v0x;
+    const e2y = vj[1] - v0y;
+    const e2z = vj[2] - v0z;
+    const cx = e1y * e2z - e1z * e2y;
+    const cy = e1z * e2x - e1x * e2z;
+    const cz = e1x * e2y - e1y * e2x;
+    area += 0.5 * Math.hypot(cx, cy, cz);
   }
   return area;
+}
+
+const scratchCapPoints: Vec3[] = [];
+const scratchClipped: Vec3[] = [];
+let scratchCapAngles = new Float64Array(64);
+const scratchCapOrder: number[] = [];
+const scratchVertexDa = new Float64Array(64);
+
+function distExceeds1e4Exact(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
+  const dx = ax - bx;
+  const dy = ay - by;
+  const dz = az - bz;
+  const d2 = dx * dx + dy * dy + dz * dz;
+  if (d2 > 1.0001e-8) return true;
+  if (d2 < 0.9999e-8) return false;
+  return Math.hypot(dx, dy, dz) > 1e-4;
+}
+
+function distBelow2e4Exact(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
+  const dx = ax - bx;
+  const dy = ay - by;
+  const dz = az - bz;
+  const d2 = dx * dx + dy * dy + dz * dz;
+  if (d2 < 3.9999e-8) return true;
+  if (d2 > 4.0001e-8) return false;
+  return Math.hypot(dx, dy, dz) < 2e-4;
 }
 
 /**
@@ -122,18 +160,63 @@ function computePolygonArea(verts: Vec3[]): number {
 function clipConvexPolyhedron(
   faces: PolyFace[],
   planeNormal: Vec3,
-  planeD: number
+  planeD: number,
+  mutateIfUnclipped: boolean = false
 ): PolyFace[] {
+  const pnx = planeNormal[0];
+  const pny = planeNormal[1];
+  const pnz = planeNormal[2];
+  let anyOutsideOrBoundary = false;
+  outer: for (let fIdx = 0; fIdx < faces.length; fIdx++) {
+    const verts = faces[fIdx].verts;
+    for (let i = 0; i < verts.length; i++) {
+      const v = verts[i];
+      if (pnx * v[0] + pny * v[1] + pnz * v[2] - planeD >= -EPS) {
+        anyOutsideOrBoundary = true;
+        break outer;
+      }
+    }
+  }
+  if (!anyOutsideOrBoundary) {
+    if (mutateIfUnclipped) {
+      for (let fIdx = 0; fIdx < faces.length; fIdx++) {
+        const verts = faces[fIdx].verts;
+        const n = verts.length;
+        if (n >= 3) {
+          const v0 = verts[0];
+          for (let i = 0; i < n - 1; i++) verts[i] = verts[i + 1];
+          verts[n - 1] = v0;
+        }
+      }
+      return faces;
+    }
+    const copyFaces: PolyFace[] = new Array(faces.length);
+    for (let fIdx = 0; fIdx < faces.length; fIdx++) {
+      const face = faces[fIdx];
+      const verts = face.verts;
+      const n = verts.length;
+      const rotVerts: Vec3[] = new Array(n);
+      for (let i = 0; i < n - 1; i++) rotVerts[i] = verts[i + 1];
+      rotVerts[n - 1] = verts[0];
+      copyFaces[fIdx] = { verts: rotVerts, normal: face.normal, isOuter: face.isOuter };
+    }
+    return copyFaces;
+  }
+
   const nextFaces: PolyFace[] = [];
-  const capPoints: Vec3[] = [];
+  const capPoints = scratchCapPoints;
+  capPoints.length = 0;
 
   const addCapPoint = (p: Vec3) => {
+    const px = p[0];
+    const py = p[1];
+    const pz = p[2];
     for (let i = 0; i < capPoints.length; i++) {
       const q = capPoints[i];
       if (
-        Math.abs(p[0] - q[0]) < 1e-4 &&
-        Math.abs(p[1] - q[1]) < 1e-4 &&
-        Math.abs(p[2] - q[2]) < 1e-4
+        Math.abs(px - q[0]) < 1e-4 &&
+        Math.abs(py - q[1]) < 1e-4 &&
+        Math.abs(pz - q[2]) < 1e-4
       ) {
         return;
       }
@@ -141,18 +224,54 @@ function clipConvexPolyhedron(
     capPoints.push(p);
   };
 
+  let daBuf = scratchVertexDa;
+
   for (let fIdx = 0; fIdx < faces.length; fIdx++) {
     const face = faces[fIdx];
     const verts = face.verts;
     const count = verts.length;
     if (count < 3) continue;
 
-    const clipped: Vec3[] = [];
+    if (daBuf.length < count) {
+      daBuf = new Float64Array(Math.max(64, count * 2));
+    }
+    let allStrictlyInside = true;
+    let allStrictlyOutside = true;
     for (let i = 0; i < count; i++) {
+      const v = verts[i];
+      const d = pnx * v[0] + pny * v[1] + pnz * v[2] - planeD;
+      daBuf[i] = d;
+      if (d >= -EPS) allStrictlyInside = false;
+      if (d <= EPS) allStrictlyOutside = false;
+    }
+    if (allStrictlyOutside) continue;
+    if (allStrictlyInside) {
+      if (mutateIfUnclipped) {
+        const v0 = verts[0];
+        for (let i = 0; i < count - 1; i++) verts[i] = verts[i + 1];
+        verts[count - 1] = v0;
+        nextFaces.push(face);
+      } else {
+        const rotVerts: Vec3[] = new Array(count);
+        for (let i = 0; i < count - 1; i++) rotVerts[i] = verts[i + 1];
+        rotVerts[count - 1] = verts[0];
+        nextFaces.push({
+          verts: rotVerts,
+          normal: face.normal,
+          isOuter: face.isOuter,
+        });
+      }
+      continue;
+    }
+
+    const clipped = scratchClipped;
+    clipped.length = 0;
+    for (let i = 0; i < count; i++) {
+      const nextIdx = i + 1 === count ? 0 : i + 1;
       const a = verts[i];
-      const b = verts[(i + 1) % count];
-      const da = dot3(planeNormal, a) - planeD;
-      const db = dot3(planeNormal, b) - planeD;
+      const b = verts[nextIdx];
+      const da = daBuf[i];
+      const db = daBuf[nextIdx];
 
       const aIn = da <= EPS;
       const bIn = db <= EPS;
@@ -187,23 +306,21 @@ function clipConvexPolyhedron(
     const clean: Vec3[] = [];
     for (let i = 0; i < clipped.length; i++) {
       const cur = clipped[i];
-      const prev = clean.length > 0 ? clean[clean.length - 1] : clipped[clipped.length - 1];
-      if (
-        clean.length === 0 ||
-        Math.hypot(cur[0] - prev[0], cur[1] - prev[1], cur[2] - prev[2]) > 1e-4
-      ) {
+      if (clean.length === 0) {
         clean.push(cur);
+      } else {
+        const prev = clean[clean.length - 1];
+        if (distExceeds1e4Exact(cur[0], cur[1], cur[2], prev[0], prev[1], prev[2])) {
+          clean.push(cur);
+        }
       }
     }
-    if (
-      clean.length >= 3 &&
-      Math.hypot(
-        clean[0][0] - clean[clean.length - 1][0],
-        clean[0][1] - clean[clean.length - 1][1],
-        clean[0][2] - clean[clean.length - 1][2]
-      ) <= 1e-4
-    ) {
-      clean.pop();
+    if (clean.length >= 3) {
+      const first = clean[0];
+      const last = clean[clean.length - 1];
+      if (!distExceeds1e4Exact(first[0], first[1], first[2], last[0], last[1], last[2])) {
+        clean.pop();
+      }
     }
 
     if (clean.length >= 3) {
@@ -216,33 +333,43 @@ function clipConvexPolyhedron(
   }
 
   // Construct the newly exposed internal fracture cleavage cap face
-  if (capPoints.length >= 3) {
+  const capLen = capPoints.length;
+  if (capLen >= 3) {
     let cx = 0, cy = 0, cz = 0;
-    for (const p of capPoints) {
+    for (let i = 0; i < capLen; i++) {
+      const p = capPoints[i];
       cx += p[0];
       cy += p[1];
       cz += p[2];
     }
-    cx /= capPoints.length;
-    cy /= capPoints.length;
-    cz /= capPoints.length;
+    cx /= capLen;
+    cy /= capLen;
+    cz /= capLen;
 
     // Build orthonormal tangent basis (u, v) on plane such that cross(u, v) == planeNormal
     const ref: Vec3 = Math.abs(planeNormal[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
     const u = normalize3(cross3(ref, planeNormal));
     const v = cross3(planeNormal, u);
 
-    const sortedCap = capPoints
-      .map((p) => {
-        const rx = p[0] - cx;
-        const ry = p[1] - cy;
-        const rz = p[2] - cz;
-        const pu = rx * u[0] + ry * u[1] + rz * u[2];
-        const pv = rx * v[0] + ry * v[1] + rz * v[2];
-        return { p, angle: Math.atan2(pv, pu) };
-      })
-      .sort((a, b) => a.angle - b.angle)
-      .map((item) => item.p);
+    if (scratchCapAngles.length < capLen) {
+      scratchCapAngles = new Float64Array(capLen * 2);
+    }
+    scratchCapOrder.length = capLen;
+    for (let i = 0; i < capLen; i++) {
+      const p = capPoints[i];
+      const rx = p[0] - cx;
+      const ry = p[1] - cy;
+      const rz = p[2] - cz;
+      const pu = rx * u[0] + ry * u[1] + rz * u[2];
+      const pv = rx * v[0] + ry * v[1] + rz * v[2];
+      scratchCapAngles[i] = Math.atan2(pv, pu);
+      scratchCapOrder[i] = i;
+    }
+    scratchCapOrder.sort((a, b) => scratchCapAngles[a] - scratchCapAngles[b]);
+    const sortedCap: Vec3[] = new Array(capLen);
+    for (let i = 0; i < capLen; i++) {
+      sortedCap[i] = capPoints[scratchCapOrder[i]];
+    }
 
     nextFaces.push({
       verts: sortedCap,
@@ -298,11 +425,17 @@ function buildShardGeometryFromFaces(
   if (faces.length < 4) return null;
 
   const uniqueVerts: Vec3[] = [];
-  for (const f of faces) {
-    for (const v of f.verts) {
+  for (let fi = 0; fi < faces.length; fi++) {
+    const fv = faces[fi].verts;
+    for (let vi = 0; vi < fv.length; vi++) {
+      const v = fv[vi];
+      const vx = v[0];
+      const vy = v[1];
+      const vz = v[2];
       let exists = false;
-      for (const u of uniqueVerts) {
-        if (Math.hypot(v[0] - u[0], v[1] - u[1], v[2] - u[2]) < 2e-4) {
+      for (let ui = 0; ui < uniqueVerts.length; ui++) {
+        const u = uniqueVerts[ui];
+        if (distBelow2e4Exact(vx, vy, vz, u[0], u[1], u[2])) {
           exists = true;
           break;
         }
@@ -313,7 +446,8 @@ function buildShardGeometryFromFaces(
   if (uniqueVerts.length < 4) return null;
 
   let refX = 0, refY = 0, refZ = 0;
-  for (const u of uniqueVerts) {
+  for (let ui = 0; ui < uniqueVerts.length; ui++) {
+    const u = uniqueVerts[ui];
     refX += u[0];
     refY += u[1];
     refZ += u[2];
@@ -325,14 +459,15 @@ function buildShardGeometryFromFaces(
   let totalVolume = 0;
   let cx = 0, cy = 0, cz = 0;
 
-  for (const f of faces) {
-    const fv = f.verts;
+  for (let fi = 0; fi < faces.length; fi++) {
+    const fv = faces[fi].verts;
     const v0 = fv[0];
+    const v0x = v0[0], v0y = v0[1], v0z = v0[2];
+    const ax = v0x - refX, ay = v0y - refY, az = v0z - refZ;
     for (let t = 1; t < fv.length - 1; t++) {
       const v1 = fv[t];
       const v2 = fv[t + 1];
 
-      const ax = v0[0] - refX, ay = v0[1] - refY, az = v0[2] - refZ;
       const bx = v1[0] - refX, by = v1[1] - refY, bz = v1[2] - refZ;
       const dx = v2[0] - refX, dy = v2[1] - refY, dz = v2[2] - refZ;
 
@@ -342,23 +477,26 @@ function buildShardGeometryFromFaces(
         az * (bx * dy - by * dx);
       const tetVol = Math.abs(det) / 6.0;
       totalVolume += tetVol;
-      cx += tetVol * (refX + v0[0] + v1[0] + v2[0]) * 0.25;
-      cy += tetVol * (refY + v0[1] + v1[1] + v2[1]) * 0.25;
-      cz += tetVol * (refZ + v0[2] + v1[2] + v2[2]) * 0.25;
+      cx += tetVol * (refX + v0x + v1[0] + v2[0]) * 0.25;
+      cy += tetVol * (refY + v0y + v1[1] + v2[1]) * 0.25;
+      cz += tetVol * (refZ + v0z + v1[2] + v2[2]) * 0.25;
     }
   }
 
   if (totalVolume < 1e-6) return null;
-  const localCentroid: Vec3 = [cx / totalVolume, cy / totalVolume, cz / totalVolume];
+  const lc0 = cx / totalVolume;
+  const lc1 = cy / totalVolume;
+  const lc2 = cz / totalVolume;
+  const localCentroid: Vec3 = [lc0, lc1, lc2];
   const impactDist = Math.hypot(
-    localCentroid[0] - clampedImpact[0],
-    localCentroid[1] - clampedImpact[1],
-    localCentroid[2] - clampedImpact[2]
+    lc0 - clampedImpact[0],
+    lc1 - clampedImpact[1],
+    lc2 - clampedImpact[2]
   );
 
   let triCount = 0;
-  for (const f of faces) {
-    triCount += Math.max(0, f.verts.length - 2);
+  for (let fi = 0; fi < faces.length; fi++) {
+    triCount += Math.max(0, faces[fi].verts.length - 2);
   }
   if (triCount < 4) {
     return null;
@@ -367,25 +505,30 @@ function buildShardGeometryFromFaces(
 
   const hullPoints = new Float32Array(uniqueVerts.length * 3);
   for (let k = 0; k < uniqueVerts.length; k++) {
-    hullPoints[k * 3 + 0] = uniqueVerts[k][0] - localCentroid[0];
-    hullPoints[k * 3 + 1] = uniqueVerts[k][1] - localCentroid[1];
-    hullPoints[k * 3 + 2] = uniqueVerts[k][2] - localCentroid[2];
+    const u = uniqueVerts[k];
+    hullPoints[k * 3 + 0] = u[0] - lc0;
+    hullPoints[k * 3 + 1] = u[1] - lc1;
+    hullPoints[k * 3 + 2] = u[2] - lc2;
   }
 
   // Pack up to MAX_SHARD_PLANES (12) bounding half-space planes sorted by face area descending
-  const sortedFacesForPlanes = faces
-    .map((f) => ({ f, area: computePolygonArea(f.verts) }))
-    .sort((a, b) => b.area - a.area);
-  const planeCount = Math.min(MAX_SHARD_PLANES, sortedFacesForPlanes.length);
+  const faceCount = faces.length;
+  const sortedFacesForPlanes: Array<{ f: PolyFace; area: number }> = new Array(faceCount);
+  for (let fi = 0; fi < faceCount; fi++) {
+    const f = faces[fi];
+    sortedFacesForPlanes[fi] = { f, area: computePolygonArea(f.verts) };
+  }
+  sortedFacesForPlanes.sort((a, b) => b.area - a.area);
+  const planeCount = Math.min(MAX_SHARD_PLANES, faceCount);
   const planes = new Float32Array(MAX_SHARD_PLANES * 4);
   for (let pIdx = 0; pIdx < planeCount; pIdx++) {
     const f = sortedFacesForPlanes[pIdx].f;
     const v0 = f.verts[0];
     const distFromCentroid = Math.max(
       2e-4,
-      f.normal[0] * (v0[0] - localCentroid[0]) +
-        f.normal[1] * (v0[1] - localCentroid[1]) +
-        f.normal[2] * (v0[2] - localCentroid[2])
+      f.normal[0] * (v0[0] - lc0) +
+        f.normal[1] * (v0[1] - lc1) +
+        f.normal[2] * (v0[2] - lc2)
     );
     planes[pIdx * 4 + 0] = f.normal[0];
     planes[pIdx * 4 + 1] = f.normal[1];
@@ -396,31 +539,54 @@ function buildShardGeometryFromFaces(
   const renderVertices = new Float32Array(vertexCount * 10);
   let ptr = 0;
   const maxFloatLen = vertexCount * 10;
-  for (const item of sortedFacesForPlanes) {
+  for (let si = 0; si < faceCount; si++) {
     if (ptr + 30 > maxFloatLen) break;
-    const f = item.f;
+    const f = sortedFacesForPlanes[si].f;
     const fv = f.verts;
     const nx = f.normal[0];
     const ny = f.normal[1];
     const nz = f.normal[2];
     const outerFlag = f.isOuter ? 1.0 : 0.0;
     const v0 = fv[0];
+    const v0x = v0[0], v0y = v0[1], v0z = v0[2];
+    const v0rx = v0x - lc0, v0ry = v0y - lc1, v0rz = v0z - lc2;
 
     for (let t = 1; t < fv.length - 1; t++) {
       if (ptr + 30 > maxFloatLen) break;
-      const tri = [v0, fv[t], fv[t + 1]];
-      for (const v of tri) {
-        renderVertices[ptr++] = v[0] - localCentroid[0];
-        renderVertices[ptr++] = v[1] - localCentroid[1];
-        renderVertices[ptr++] = v[2] - localCentroid[2];
-        renderVertices[ptr++] = nx;
-        renderVertices[ptr++] = ny;
-        renderVertices[ptr++] = nz;
-        renderVertices[ptr++] = v[0];
-        renderVertices[ptr++] = v[1];
-        renderVertices[ptr++] = v[2];
-        renderVertices[ptr++] = outerFlag;
-      }
+      const v1 = fv[t];
+      const v2 = fv[t + 1];
+      renderVertices[ptr++] = v0rx;
+      renderVertices[ptr++] = v0ry;
+      renderVertices[ptr++] = v0rz;
+      renderVertices[ptr++] = nx;
+      renderVertices[ptr++] = ny;
+      renderVertices[ptr++] = nz;
+      renderVertices[ptr++] = v0x;
+      renderVertices[ptr++] = v0y;
+      renderVertices[ptr++] = v0z;
+      renderVertices[ptr++] = outerFlag;
+
+      renderVertices[ptr++] = v1[0] - lc0;
+      renderVertices[ptr++] = v1[1] - lc1;
+      renderVertices[ptr++] = v1[2] - lc2;
+      renderVertices[ptr++] = nx;
+      renderVertices[ptr++] = ny;
+      renderVertices[ptr++] = nz;
+      renderVertices[ptr++] = v1[0];
+      renderVertices[ptr++] = v1[1];
+      renderVertices[ptr++] = v1[2];
+      renderVertices[ptr++] = outerFlag;
+
+      renderVertices[ptr++] = v2[0] - lc0;
+      renderVertices[ptr++] = v2[1] - lc1;
+      renderVertices[ptr++] = v2[2] - lc2;
+      renderVertices[ptr++] = nx;
+      renderVertices[ptr++] = ny;
+      renderVertices[ptr++] = nz;
+      renderVertices[ptr++] = v2[0];
+      renderVertices[ptr++] = v2[1];
+      renderVertices[ptr++] = v2[2];
+      renderVertices[ptr++] = outerFlag;
     }
   }
 
@@ -570,39 +736,54 @@ export function fractureBlockVoronoi(
 
   const shards: GlassShardGeometry[] = [];
 
+  const neighbors: Array<{
+    j: number;
+    dax: number;
+    day: number;
+    daz: number;
+    metricDist2: number;
+  }> = new Array(Math.max(0, seeds.length - 1));
+
   for (let i = 0; i < seeds.length; i++) {
     let faces = createInitialBoxFaces(hx, hy, hz);
     const si = seeds[i];
     const asi = aSeeds[i];
     const qi = quadSeeds[i];
 
-    const neighbors = seeds
-      .map((sj, j) => {
-        const dx = sj[0] - si[0];
-        const dy = sj[1] - si[1];
-        const dz = sj[2] - si[2];
-        const dax = aSeeds[j][0] - asi[0];
-        const day = aSeeds[j][1] - asi[1];
-        const daz = aSeeds[j][2] - asi[2];
-        return {
-          j,
-          dax,
-          day,
-          daz,
-          metricDist2: dx * dax + dy * day + dz * daz,
-        };
-      })
-      .filter((item) => item.j !== i)
-      .sort((a, b) => a.metricDist2 - b.metricDist2);
+    let nbCount = 0;
+    for (let j = 0; j < seeds.length; j++) {
+      if (j === i) continue;
+      const sj = seeds[j];
+      const asj = aSeeds[j];
+      const dx = sj[0] - si[0];
+      const dy = sj[1] - si[1];
+      const dz = sj[2] - si[2];
+      const dax = asj[0] - asi[0];
+      const day = asj[1] - asi[1];
+      const daz = asj[2] - asi[2];
+      neighbors[nbCount++] = {
+        j,
+        dax,
+        day,
+        daz,
+        metricDist2: dx * dax + dy * day + dz * daz,
+      };
+    }
+    neighbors.length = nbCount;
+    neighbors.sort((a, b) => a.metricDist2 - b.metricDist2);
 
-    for (const nb of neighbors) {
+    const normalTmp: Vec3 = [0, 0, 0];
+    for (let nIdx = 0; nIdx < nbCount; nIdx++) {
       if (faces.length < 4) break;
+      const nb = neighbors[nIdx];
       const gLen = Math.hypot(nb.dax, nb.day, nb.daz);
       if (gLen < 1e-6) continue;
 
-      const normal: Vec3 = [nb.dax / gLen, nb.day / gLen, nb.daz / gLen];
+      normalTmp[0] = nb.dax / gLen;
+      normalTmp[1] = nb.day / gLen;
+      normalTmp[2] = nb.daz / gLen;
       const planeD = (0.5 * (quadSeeds[nb.j] - qi)) / gLen;
-      faces = clipConvexPolyhedron(faces, normal, planeD);
+      faces = clipConvexPolyhedron(faces, normalTmp, planeD, true);
     }
 
     const baseGeom = buildShardGeometryFromFaces(faces, clampedImpact);

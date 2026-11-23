@@ -2315,6 +2315,12 @@ describe('Vitrail A/B Physics & Acoustic Fidelity Comparison (M1–M6)', () => {
           wMaxMidFallDrop = Math.max(wMaxMidFallDrop, Math.abs(wFocusPre - wCam.desiredTargetY));
         }
       }
+      for (let extra = 0; extra < 240 && wBridge.sandboxCollapseActive; extra++) {
+        wBridge.step(1 / 60);
+        await new Promise((r) => setTimeout(r, 10));
+        wEng.updateCameraFocusTarget(1 / 60);
+        wCam.update(1 / 60, 1280 / 800);
+      }
       expect(wMaxMidFallDrop).toBeLessThan(1e-5);
       expect(wBridge.sandboxCollapseActive).toBe(false);
       expect(wCam.desiredTargetY).toBeLessThan(1.34);

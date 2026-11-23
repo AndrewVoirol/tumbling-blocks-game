@@ -36,6 +36,7 @@ export class OrbitCamera {
   public invViewProjMatrix: Float32Array = mat4Create();
 
   public isUserOrbiting: boolean = false;
+  private hasUserManualZoom: boolean = false;
   private targetBottomInsetFraction: number = 0;
   private currentBottomInsetFraction: number = 0;
 
@@ -49,10 +50,12 @@ export class OrbitCamera {
   }
 
   public resetView(towerHeightCm: number = 27.0): void {
+    this.hasUserManualZoom = false;
     this.targetAzimuth = 0.64;
     this.targetElevation = 0.36;
-    this.targetDistance = 4.55;
-    this.desiredTargetY = Math.max(1.25, (towerHeightCm / 10.0) * 0.5);
+    const heightDm = towerHeightCm / 10.0;
+    this.targetDistance = Math.min(8.4, 4.55 + Math.max(0.0, heightDm - 3.0) * 1.22);
+    this.desiredTargetY = Math.max(1.25, heightDm * 0.5);
     this.panOffset = [0, 0, 0];
     this.targetPanOffset = [0, 0, 0];
   }
@@ -64,7 +67,22 @@ export class OrbitCamera {
   }
 
   public zoomBy(deltaScale: number): void {
+    this.hasUserManualZoom = true;
     this.targetDistance = Math.max(2.35, Math.min(8.6, this.targetDistance * (1 + deltaScale)));
+  }
+
+  /**
+   * Smoothly widens framing distance when tower exceeds 20 courses (`> 3.0 dm`) and the user
+   * has not manually zoomed, keeping both top placement guides and base courses inside the frustum.
+   */
+  public syncAutoFramingForTowerHeight(topSlotYDm: number, currentLayers: number): void {
+    if (this.hasUserManualZoom) return;
+    if (currentLayers <= 20 && topSlotYDm <= 3.02) {
+      this.targetDistance = 4.55;
+      return;
+    }
+    const excessDm = Math.max(0.0, topSlotYDm - 3.0);
+    this.targetDistance = Math.min(8.4, 4.55 + excessDm * 1.22);
   }
 
   /**
@@ -161,6 +179,7 @@ export class OrbitCamera {
   ): void {
     this.targetBottomInsetFraction = 0;
     this.currentBottomInsetFraction = 0;
+    this.hasUserManualZoom = Math.abs(distance - 4.55) > 0.02;
     this.azimuth = azimuth;
     this.targetAzimuth = azimuth;
     this.elevation = elevation;

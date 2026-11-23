@@ -53,6 +53,18 @@ export const MJ_CONAFFINITY_PARKING = 0x10;
 export const MJ_PARKING_SHELF_TOP_Y_M = -50.0;
 
 /**
+ * Places hidden-shelf parked bodies symmetrically around `±(120 m, 84 m)` (`35°` horizontal azimuth)
+ * so MuJoCo 4.0's `mj_broadphase` covariance PCA (`λ_horiz ≈ 21,456 N >> Σ_yy <= 2,500 N`) always selects
+ * an oblique horizontal `(X, Z)` Sweep-and-Prune axis rather than degenerating onto vertical `Y` (`y = -50 m`)
+ * where all tabletop blocks and shards would overlap in a single `O(N^2)` vertical bucket.
+ */
+export function computeParkedShelfXZ(slotSalt: number): [number, number] {
+  const col = (slotSalt % 32) - 15.5;
+  const row = Math.floor(slotSalt / 32) - 8.0;
+  return [120.0 + col * 0.25, 84.0 + row * 0.25];
+}
+
+/**
  * MuJoCo `geom_group` assignments (`0..5`) for zero-cost C++ BVH filtering in `mj_ray`:
  * - Group 0: Active intact glass blocks (`g_blk_*`)
  * - Group 1: Active Voronoi glass shards (`g_shd_*`)
@@ -242,8 +254,10 @@ export interface MujocoTowerIndexMap {
   tableGeomId: number;
   /** Geom ID of the shard-restitution tabletop (`worldbody` static geom) */
   shardTableGeomId: number;
-  /** Geom ID of the hidden parking shelf at `y = -50 m` */
+  /** Geom ID of the hidden parking shelf (+ pad) at `y = -50 m` */
   parkingShelfGeomId: number;
+  /** Geom ID of the symmetric negative hidden parking shelf (- pad) at `y = -50 m` */
+  parkingShelfNegGeomId: number;
   /** Body ID of the `mocap="true"` hand anchor (`mocapId = 0`) */
   handMocapBodyId: number;
   /** Equality constraint index (`0`) for the soft `<connect>` hand grab */
@@ -469,8 +483,7 @@ export function buildMujocoTowerXml(
     shardDofAdr[s] = nextFreeJointIdx * 6;
     nextFreeJointIdx++;
 
-    const parkXM = ((s % 32) - 15.5) * 0.12;
-    const parkZM = (Math.floor(s / 32) - 8.0) * 0.12;
+    const [parkXM, parkZM] = computeParkedShelfXZ(s);
     const parkYM = MJ_PARKING_SHELF_TOP_Y_M + 0.0055;
     const archIdx = s % cfg.voronoiHullArchetypeCount;
 
@@ -493,8 +506,7 @@ export function buildMujocoTowerXml(
     extraDofAdr[e] = nextFreeJointIdx * 6;
     nextFreeJointIdx++;
 
-    const parkXM = ((e % 10) - 4.5) * 1.25;
-    const parkZM = 3.0 + Math.floor(e / 10) * 1.25;
+    const [parkXM, parkZM] = computeParkedShelfXZ(600 + e);
     const parkYM = MJ_PARKING_SHELF_TOP_Y_M + 0.505;
 
     bodyXmlChunks.push(
@@ -522,7 +534,7 @@ export function buildMujocoTowerXml(
 ${voronoiBank.xmlAssets}  </asset>
   <worldbody>
     <geom name="oak_table" group="${MJ_GEOM_GROUP_TABLE}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="6" friction="${fTable}" solref="${solref}" solimp="${solimp}" contype="${MJ_CONTYPE_TABLE}" conaffinity="${MJ_CONAFFINITY_TABLE}"/>
-    <geom name="parking_shelf" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="12.0 0.05 12.0" condim="3" friction="1.0 0.02 0.01" priority="10" solref="0.008 1.35" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
+    <geom name="parking_shelf" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(MJ_PARKING_SHELF_TOP_Y_M - 0.05).toFixed(4)} 0" size="160.0 0.05 160.0" condim="3" friction="1.0 0.02 0.01" priority="10" solref="0.008 1.35" solimp="${solimp}" contype="${MJ_CONTYPE_PARKING}" conaffinity="0"/>
     <geom name="oak_table_shard" group="${MJ_GEOM_GROUP_PARKED}" type="box" pos="0 ${(-tableHalfThickM).toFixed(5)} 0" size="${tableHalfSpanM.toFixed(4)} ${tableHalfThickM.toFixed(5)} ${tableHalfSpanM.toFixed(4)}" condim="3" priority="1" friction="${fShard}" solref="${shardSolref}" solimp="${shardSolimp}" contype="${MJ_CONTYPE_SHARD_TABLE}" conaffinity="0"/>
     <body name="hand_anchor" mocap="true" pos="0 2.0 0"/>
 ${bodyXmlChunks.join('\n')}
@@ -537,6 +549,7 @@ ${bodyXmlChunks.join('\n')}
     map: {
       tableGeomId: 0,
       parkingShelfGeomId: 1,
+      parkingShelfNegGeomId: -1,
       shardTableGeomId: 2,
       handMocapBodyId: 1,
       grabEqualityId: 0,

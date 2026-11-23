@@ -21,6 +21,10 @@ import {
 } from '../physics/PhysicsWorld';
 import { MujocoWorkerBridge } from '../physics/MujocoWorkerBridge';
 import {
+  analyzeContactPolygon2D,
+  type ContactHull2DMetrics,
+} from '../physics/contactEquilibrium';
+import {
   computeEffectiveGrabClampingLoadN,
   computeGripZoneFromLocalDm,
   countOtherBlocksInLayer,
@@ -732,6 +736,7 @@ export class GameEngine {
     const nominalFocusY = Math.max(1.32, topSlotY * 0.52);
 
     if (this.physics.turnPhase === 'EXTRACTED') {
+      this.camera.syncAutoFramingForTowerHeight(topSlotY, this.physics.currentLayers);
       this.camera.focusTopForPlacement(topSlotY);
       return;
     }
@@ -745,6 +750,7 @@ export class GameEngine {
       this.lastObservedPhysCollapseActive = false;
       this.sandboxCurrentFocusY = nominalFocusY;
       if (this.physics.turnPhase !== 'COLLAPSED') {
+        this.camera.syncAutoFramingForTowerHeight(topSlotY, this.physics.currentLayers);
         this.camera.setFocusHeight(nominalFocusY);
       }
       return;
@@ -800,12 +806,18 @@ export class GameEngine {
       }
 
       let maxOnTableSpeedSim = 0;
+      let maxActiveCascadeSpeedSim = 0;
+      const isFlatRubbleHeap =
+        this.physics.currentLayers <= 2 && this.physics.shatteredCount >= 8;
       for (let i = 0; i < this.physics.blocks.length; i++) {
         const b = this.physics.blocks[i];
         if (b.shattered || b.extracted) continue;
         if (b.position[1] < -0.15 || Math.hypot(b.position[0], b.position[2]) > 4.45) continue;
         const sp = Math.hypot(b.linVel[0], b.linVel[1], b.linVel[2]);
         if (sp > maxOnTableSpeedSim) maxOnTableSpeedSim = sp;
+        if ((!isFlatRubbleHeap || b.position[1] > 0.42 || sp > 0.85) && sp > maxActiveCascadeSpeedSim) {
+          maxActiveCascadeSpeedSim = sp;
+        }
       }
       for (let i = 0; i < this.physics.shards.length; i++) {
         const s = this.physics.shards[i] as {
@@ -818,6 +830,9 @@ export class GameEngine {
         if (sv) {
           const sp = Math.hypot(sv[0], sv[1], sv[2]);
           if (sp > maxOnTableSpeedSim) maxOnTableSpeedSim = sp;
+          if ((!isFlatRubbleHeap || s.position[1] > 0.35 || sp > 0.95) && sp > maxActiveCascadeSpeedSim) {
+            maxActiveCascadeSpeedSim = sp;
+          }
         }
       }
 
@@ -836,8 +851,8 @@ export class GameEngine {
 
       const collapseQuiet =
         this.sandboxToppleHadImpact &&
-        maxOnTableSpeedSim < 0.28 &&
-        this.physics.wobbleSpeedDegPerSec < 8.0;
+        (isFlatRubbleHeap ? maxActiveCascadeSpeedSim < 0.28 : maxOnTableSpeedSim < 0.28) &&
+        (isFlatRubbleHeap || this.physics.wobbleSpeedDegPerSec < 8.0);
       if (collapseQuiet) {
         this.sandboxPostImpactQuietSec += clampedDt;
       } else {
@@ -868,6 +883,9 @@ export class GameEngine {
     }
 
     this.sandboxCurrentFocusY = nominalFocusY;
+    if (this.physics.currentLayers > 0) {
+      this.camera.syncAutoFramingForTowerHeight(topSlotY, this.physics.currentLayers);
+    }
     this.camera.setFocusHeight(nominalFocusY);
   }
 
@@ -2840,17 +2858,35 @@ export class GameEngine {
 
       // Dry-masonry contact-patch check: each unbonded prism in layer `k + 1` only receives upward
       // normal force from blocks in layer `k` whose 2D footprint actually overlaps that prism!
+      // Evaluate exact 2D convex hull signed margin (`-dOutM`) rather than an AABB union so diagonally
+      // offset corner patches never synthesize a phantom support quadrant.
       const minIndivSupportDm = 0.048;
+      const patchPtsU = new Float64Array(32);
+      const patchPtsV = new Float64Array(32);
+      const patchHullOut: ContactHull2DMetrics = {
+        pointCount: 0,
+        hullCount: 0,
+        minorWidthM: 0,
+        majorSpanM: 0,
+        areaM2: 0,
+        effectiveAreaM2: 0,
+        stripTanX: 1,
+        stripTanZ: 0,
+        stripCenterX: 0,
+        stripCenterZ: 0,
+        dOutM: 0,
+        fulcrumX: 0,
+        fulcrumZ: 0,
+        outUnitX: 1,
+        outUnitZ: 0,
+      };
       const evalPrismContactMargin = (
         pU: number,
         pV: number,
         pSpanU: number,
         pSpanV: number
       ): number => {
-        let patchUMin = Infinity;
-        let patchUMax = -Infinity;
-        let patchVMin = Infinity;
-        let patchVMax = -Infinity;
+        let ptCount = 0;
         for (let ci = 0; ci < courseBlocks.length; ci++) {
           const cb = courseBlocks[ci];
           const bx = quatRotateVec3(cb.rotation, [1, 0, 0]);
@@ -2867,15 +2903,24 @@ export class GameEngine {
           const iu1 = Math.min(cU + spanU, pU + pSpanU);
           const iv0 = Math.max(cV - spanV, pV - pSpanV);
           const iv1 = Math.min(cV + spanV, pV + pSpanV);
-          if (iu0 < iu1 && iv0 < iv1) {
-            if (iu0 < patchUMin) patchUMin = iu0;
-            if (iu1 > patchUMax) patchUMax = iu1;
-            if (iv0 < patchVMin) patchVMin = iv0;
-            if (iv1 > patchVMax) patchVMax = iv1;
+          if (iu0 < iu1 && iv0 < iv1 && ptCount + 4 <= patchPtsU.length) {
+            patchPtsU[ptCount] = iu0;
+            patchPtsV[ptCount] = iv0;
+            ptCount++;
+            patchPtsU[ptCount] = iu1;
+            patchPtsV[ptCount] = iv0;
+            ptCount++;
+            patchPtsU[ptCount] = iu1;
+            patchPtsV[ptCount] = iv1;
+            ptCount++;
+            patchPtsU[ptCount] = iu0;
+            patchPtsV[ptCount] = iv1;
+            ptCount++;
           }
         }
-        if (!Number.isFinite(patchUMin)) return -0.5;
-        return Math.min(pU - patchUMin, patchUMax - pU, pV - patchVMin, patchVMax - pV);
+        if (ptCount === 0) return -0.5;
+        analyzeContactPolygon2D(patchPtsU, patchPtsV, ptCount, pU, pV, patchHullOut);
+        return -patchHullOut.dOutM;
       };
 
       const directAbove = k === excludedLayer ? byLayer.get(k + 1) : undefined;
@@ -3456,8 +3501,14 @@ export class GameEngine {
         const blk = this.physics.blocks[c.blockId];
         const surv = this.evaluateCourseSupportMargins(c.blockId);
         const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
+        const topConveyorRiskPen =
+          blk.assignedLayer >= topClampFloorLayer
+            ? c.clampingLoadN > 0.35
+              ? -2.8 - Math.min(1.6, c.clampingLoadN * 0.45)
+              : -0.45
+            : 0;
         const underClampedTopPen =
-          (blk.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
+          topConveyorRiskPen +
           (blk.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
           countCrossHingesBelow(blk.assignedLayer) * 0.48;
         const jammedOrUnsafe =
@@ -3478,7 +3529,7 @@ export class GameEngine {
             ? jammedOrUnsafe
               ? -2.4
               : -0.85
-            : 0.20;
+            : 0.20 - Math.min(F_SLIP, c.clampingLoadN) * 0.14;
         const safeGatePenalty = jammedOrUnsafe ? -3.2 : 0;
         const s =
           safeGatePenalty +
@@ -3525,8 +3576,20 @@ export class GameEngine {
         postEccDm <= maxSafeGlobalEccDm
           ? postEccDm * 2.4
           : maxSafeGlobalEccDm * 2.4 - (postEccDm - maxSafeGlobalEccDm) * 5.5;
+      const candEndPush = extractPlan
+        ? extractPlan.extractionMode === 'end_push'
+        : cand.clampingLoadN > F_SLIP;
+      const candEvalLoadN = extractPlan
+        ? Math.max(cand.clampingLoadN, extractPlan.clampingLoadN ?? 0)
+        : cand.clampingLoadN;
+      const topConveyorRiskPen =
+        blk.assignedLayer >= topClampFloorLayer
+          ? candEvalLoadN > 0.35
+            ? -2.8 - Math.min(1.6, candEvalLoadN * 0.45)
+            : -0.45
+          : 0;
       const underClampedTopPen =
-        (blk.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
+        topConveyorRiskPen +
         (blk.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
         countCrossHingesBelow(blk.assignedLayer) * 0.48;
 
@@ -3535,12 +3598,6 @@ export class GameEngine {
           ? -0.35
           : (cand.twoPlyMasterScore01 ?? cand.safetyScore01) * 0.05;
 
-      const candEndPush = extractPlan
-        ? extractPlan.extractionMode === 'end_push'
-        : cand.clampingLoadN > F_SLIP;
-      const candEvalLoadN = extractPlan
-        ? Math.max(cand.clampingLoadN, extractPlan.clampingLoadN ?? 0)
-        : cand.clampingLoadN;
       const candSlipCheck = evaluateExtractionSlip(
         extractPlan
           ? localDmToMeters(extractPlan.localGrab)
@@ -3554,7 +3611,7 @@ export class GameEngine {
         ? -2.8
         : candEndPush
           ? -0.18
-          : 0.06;
+          : 0.06 - Math.min(F_SLIP, candEvalLoadN) * 0.14;
 
       const score2Ply =
         eccReward +
@@ -3581,9 +3638,14 @@ export class GameEngine {
       const blk = this.physics.blocks[cand.blockId];
       const surv = this.evaluateCourseSupportMargins(cand.blockId);
       const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
+      const fbTopConveyorPen =
+        blk.assignedLayer >= topClampFloorLayer
+          ? cand.clampingLoadN > 0.35
+            ? -2.6 - Math.min(1.6, cand.clampingLoadN * 0.45)
+            : -0.45
+          : 0;
       const underClampedTopPen =
-        (blk.assignedLayer >= topClampFloorLayer ? -1.4 : 0) -
-        countCrossHingesBelow(blk.assignedLayer) * 0.45;
+        fbTopConveyorPen - countCrossHingesBelow(blk.assignedLayer) * 0.45;
       const jamPen = cand.predictedSlideMm < 0.25 ? -1.8 : 0;
       const fbPushReq = cand.clampingLoadN > F_SLIP;
       const fbSlip = evaluateExtractionSlip(
@@ -3591,7 +3653,11 @@ export class GameEngine {
         fbPushReq ? cand.clampingLoadN * 0.65 : cand.clampingLoadN,
         fbPushReq
       );
-      const fbExtractionBias = fbSlip.slipped ? -2.8 : fbPushReq ? -0.15 : 0.12;
+      const fbExtractionBias = fbSlip.slipped
+        ? -2.8
+        : fbPushReq
+          ? -0.15
+          : 0.12 - Math.min(F_SLIP, cand.clampingLoadN) * 0.16;
       const s =
         (cand.collapseTriggered ? -2.5 : 0) +
         (surv.valid ? 0 : -1.8) +
@@ -3693,16 +3759,26 @@ export class GameEngine {
         }
       }
       const survEccDm = Math.hypot(surv.postComXZDm[0], surv.postComXZDm[1]);
-      const underClampedTopPen =
-        (b.assignedLayer >= topClampFloorLayer ? -1.8 : 0) +
-        (b.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
-        crossHinges * 0.48;
       const clampN =
         typeof this.physics.computeBlockClampingLoadN === 'function'
           ? this.physics.computeBlockClampingLoadN(b.id)
           : 0;
+      const topConveyorRiskPen =
+        b.assignedLayer >= topClampFloorLayer
+          ? clampN > 0.35
+            ? -2.8 - Math.min(1.6, clampN * 0.45)
+            : -0.45
+          : 0;
+      const underClampedTopPen =
+        topConveyorRiskPen +
+        (b.assignedLayer >= Math.max(15, this.physics.currentLayers - 5) ? -0.55 : 0) -
+        crossHinges * 0.48;
       const clampSlipPen =
-        clampN * 0.65 > F_PUSH_MAX ? -4.0 : clampN > F_SLIP ? -2.8 : 0.25;
+        clampN * 0.65 > F_PUSH_MAX
+          ? -4.0
+          : clampN > F_SLIP
+            ? -2.8
+            : 0.25 - Math.min(F_SLIP, clampN) * 0.14;
       const rankScore =
         underClampedTopPen +
         clampSlipPen +

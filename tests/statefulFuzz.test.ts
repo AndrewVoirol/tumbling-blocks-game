@@ -3,6 +3,7 @@ import { GlassAudioEngine } from '../src/audio/GlassAudioEngine';
 import { GameEngine } from '../src/engine/GameEngine';
 import * as vecMat from '../src/math/vecMat';
 import * as constants from '../src/physics/constants';
+import * as contactEquilibrium from '../src/physics/contactEquilibrium';
 import { ensureMujocoInitialized } from '../src/physics/mujocoRuntime';
 import { attachMujocoWorkerHost } from '../src/physics/mujocoWorker';
 import { MujocoWorkerBridge } from '../src/physics/MujocoWorkerBridge';
@@ -47,6 +48,7 @@ interface FuzzModuleExports {
     ensureMujocoInitialized: typeof ensureMujocoInitialized;
     constants: typeof constants;
     vecMat: typeof vecMat;
+    contactEquilibrium: typeof contactEquilibrium;
   }) => Promise<FuzzSuiteHandle>;
 }
 
@@ -65,6 +67,7 @@ describe('Stateful Monte Carlo Trajectory Fuzzer (Sync & Worker Parity + Physica
       ensureMujocoInitialized,
       constants,
       vecMat,
+      contactEquilibrium,
     });
   }, 45000);
 

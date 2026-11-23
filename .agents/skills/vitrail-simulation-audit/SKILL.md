@@ -42,7 +42,7 @@ Use this playbook and its executable 10-probe dynamical harness (`scripts/audit-
    ```bash
    node scripts/optical-bench.mjs --scene all --out /tmp/vitrail-bench-all.png
    ```
-5. **Complete `86/86` Vitest Suite (`9` suites: `T1–T9`, `C1–C8`, `14` Faithful-Glass, Sandbox & Realism Checks `M1–M14`, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `6` Mobile Plinth, `13` Acoustics, `15` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
+5. **Complete `93/93` Vitest Suite (`10` suites: `T1–T9`, `C1–C8`, `7` Contact-Hull/Quasi-Static Equilibrium, `M1–M14` Fidelity/Sandbox, `520`-Seed Stateful Fuzzer, `10` iPad Touch/HUD, `6` Mobile Plinth, `13` Acoustics, `15` Multiplayer & `5` `100`-Match Chaos), `17/17` 5-Domain Pre-Ship Eval + Live Two-Browser E2E & Standalone Trajectory Fuzzer**:
    ```bash
    npx vitest run --maxWorkers=3
    npm run eval:preship
@@ -76,9 +76,10 @@ When running a native `swarm` (`workspace: "share"` for concurrent authors, `wor
    - Verify both `uCausticTex.a` Voronoi shard caustic ribbons on the oak table when `intactCount === 0` AND smoked neutral-density crystal refraction (`~30%` passband background visibility on unloaded prisms/shards + `0.11` dark-field trough extinction inside stressed courses)—never pass Polariscope dark-field by crushing transmission into `< 1%` matte-black silhouettes, and never pass negative bases to WGSL `pow()`.
 3. **Outlier-Trimmed `Plumb`, Sandbox `Toppled` Parity & Multiplayer Seed Sync (`App.tsx`, `src/multiplayer/*`)**:
    - Keep internal `solverLeanAngleDeg` separate from HUD `leanAngleDeg` (`standingTilts[tiltLen - 5]` column consensus when stationary, `maxDynamicTipTiltRad` when tipping), assert `isToppled` (`— Toppled`) on collapsed Sandbox heaps (`currentLayers === 0 && shatteredCount > 0`), and preserve sequential `mulberry32` `54/54` Host/Worker/Guest block palette parity.
-4. **Coordinate-Free `360°` 2D Contact-Hull Equilibrium & Post-Vitest Dev-Server Hygiene**:
-   - Audit resting blocks against the 2D `d.contact` convex-hull equilibrium oracle across `360°` partial pushes/pulls/side-shoves/diagonal corners and post-collapse piles (`0/100` unpropped CoM violations; never bypass `angAccSi` torque-balance gates in `postCollapseRubble`, and include `mj_energyPos` elastic contact potential in passivity checks).
-   - Always restart `npx vite --host 127.0.0.1 --port 5174 --strictPort --force` *after* the final `vitest` run and verify `0` `504 Outdated Optimize Dep` errors in Chrome DevTools MCP before asking the user to test.
+4. **Coordinate-Free `360°` Contact-Hull Statics, Quasi-Static Edge Yield & Two-Gate Verification**:
+   - Enforce resting/cantilever equilibrium across all `360°` orientations and `1L..36L+` stacks via `src/physics/contactEquilibrium.ts`: `< 2.4 mm` knife-edge chamfer hull-width release (`59°` longitudinal, `79°` upright-end, 8-corner saddles), true rounded-bevel lip escape (`L_tail <= 6.5 mm` or steep bevel slip, never arbitrary `62%` overhang cutoffs), and quasi-static Griffith edge crazing/fracture under concentrated tall-tower corner loads at `v ≈ 0` (`>= 5x` margin above centered `36L` `+` crosses).
+   - Never bypass `angAccSi`/`linAccSi` or contact-hull gates in post-collapse brakes or sleep latches, restore `model.opt` on `ntree_awake === 0` early-return, compute active-scene contact potential from `d.contact` (`0.5 * sum(fn * max(0, -dist))` — never `d.energy[0]`/`mj_energyPos`, which has `0.0 J` contact potential and `-1,319 J` of `-50 m` shelf bodies), and verify settled states with **both** (A) `0.30 s` ablated raw `mj_step` (`600 Hz / 50 iters`, `|Δy| <= 2 mm`, `Δθ <= 4°`) and (B) the 3D contact-hull/knife-edge invariant (`0/100` violations).
+   - Leave sibling port `5173` untouched; restart `npx vite --host 127.0.0.1 --port 5174 --strictPort --force` *after* the final `vitest` run and verify `0` `504 Outdated Optimize Dep` errors in Chrome DevTools MCP before asking the user to test.
 
 ---
 

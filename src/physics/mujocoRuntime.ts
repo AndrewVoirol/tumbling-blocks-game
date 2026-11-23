@@ -82,6 +82,11 @@ export function getMujocoRuntimeSync(): LoadedMujocoRuntime {
  */
 export function attachMujocoThreadPoolIfAvailable(data: MjData): number {
   if (!loadedRuntime || loadedRuntime.mode !== 'mt') return 1;
+  // Guard against leaking duplicate OS pthreads when resetting an MjData that already owns a threadpool
+  const existingPool = (data as unknown as { threadpool?: number }).threadpool;
+  if (typeof existingPool === 'number' && existingPool !== 0) {
+    return loadedRuntime.threadCount;
+  }
   const mjAny = loadedRuntime.mj as unknown as {
     mju_threadpool?: (d: MjData, nthreads: number) => void;
   };
